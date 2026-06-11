@@ -138,16 +138,40 @@ async def _post(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) ->
         return None
 
 def _threshold_map() -> Dict[str, float]:
-    thr = {m: meta["default_threshold"] for m, meta in config.METRICS_REGISTRY.items()}
+    """
+    Construit la table des seuils utilisée pour calculer is_violation
+    dans les historiques.
+    - Pour les métriques primaires : seuil métier fixe (registry)
+    - Pour les autres : seuil du SLO actif si présent, sinon
+      utilise une borne très permissive (max) pour éviter de marquer
+      faussement des violations sur métriques non corrélées.
+    """
+    thr = {}
+    for m, meta in config.METRICS_REGISTRY.items():
+        if meta.get("is_primary_objective", False):
+            thr[m] = meta["default_threshold"]
+        else:
+            # Borne permissive — sera écrasée si un SLO secondaire est actif
+            thr[m] = meta["bounds"]["max"]
+
     for slo in state.current_slos:
         if slo.get("metric") in thr:
             thr[slo["metric"]] = float(slo["threshold"])
     return thr
 
 def _is_violation(record: Dict[str, Any], thresholds: Dict[str, float]) -> bool:
+    """
+    Détecte une violation sur l'enregistrement en se basant sur les SLOs
+    réellement actifs (présents dans current_slos).
+    """
+    active_metrics = {s["metric"] for s in state.current_slos}
     for metric, meta in config.METRICS_REGISTRY.items():
+        # Ne considère que les métriques qui ont un SLO actif
+        if metric not in active_metrics:
+            continue
         val = record.get(metric)
-        if val is None: continue
+        if val is None:
+            continue
         thr = thresholds.get(metric, meta["default_threshold"])
         op  = meta["operator"]
         if (op == "<"  and val >= thr) or (op == "<=" and val >  thr) or \
@@ -184,6 +208,34 @@ def _extract_predictions(res: Dict[str, Any]) -> Dict[str, Any]:
         if data and "predictions" in data:
             norm[m] = data
     return norm
+
+
+def _build_bootstrap_slos() -> List[Dict[str, Any]]:
+    """
+    Construit les SLOs initiaux pendant la phase bootstrap.
+
+    Ne génère QUE des SLOs primaires (is_primary_objective=True
+    dans METRICS_REGISTRY) avec leur seuil métier fixe.
+
+    Les métriques non primaires (cpu_usage, ram_usage en autonomous)
+    seront ajoutées dynamiquement par le metrics_manager APRÈS
+    le bootstrap, uniquement si MI détecte une corrélation.
+    """
+    slos = []
+    for metric, meta in config.METRICS_REGISTRY.items():
+        if not meta.get("is_primary_objective", False):
+            continue
+        slos.append({
+            "metric":     metric,
+            "operator":   meta["operator"],
+            "threshold":  meta["default_threshold"],
+            "unit":       meta["unit"],
+            "weight":     1.0,
+            "target":     meta["default_threshold"] * 0.9,
+            "window":     "5m",
+            "is_primary": True,
+        })
+    return slos
 
 
 async def _sync_active_vm(client: httpx.AsyncClient) -> None:
@@ -263,19 +315,15 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
 
             # ── ÉTAPE 1 : SLOs ──────────────────────────────────────────
             if state.cycle_count < state.BOOTSTRAP_MIN:
+                # Bootstrap : SLOs primaires uniquement (objectif métier)
+                # Les SLOs secondaires adaptatifs seront ajoutés par le
+                # metrics_manager une fois l'historique suffisant.
+                state.current_slos = _build_bootstrap_slos()
+                active_metrics = [s["metric"] for s in state.current_slos]
                 logger.info(
                     f"🟡 Phase bootstrap ({state.cycle_count}/{state.BOOTSTRAP_MIN}) "
-                    "— SLOs initiaux appliqués"
+                    f"— SLOs primaires uniquement : {C.GREEN}{active_metrics}{C.RESET}"
                 )
-                state.current_slos = []
-                for metric, meta in config.METRICS_REGISTRY.items():
-                    state.current_slos.append({
-                        "metric": metric, "operator": meta["operator"],
-                        "threshold": meta["default_threshold"], "unit": meta["unit"],
-                        "weight": 1.0 / len(config.METRICS_REGISTRY),
-                        "target": meta["default_threshold"] * 0.9, "window": "5m"
-                    })
-                active_metrics = list(config.METRICS_REGISTRY.keys())
             else:
                 h_res = await _post(client, f"{_URLS['history_loader']}/load", {
                     "vm_id": state.service_vm,
@@ -296,13 +344,19 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                     state.current_slos   = mm_res.get("slos", state.current_slos)
                     active_metrics       = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
                     state.last_mi_scores = mm_res.get("mi_scores", {})
+
+                    # Distinction primaires / secondaires pour le log
+                    primaries   = [s["metric"] for s in state.current_slos if s.get("is_primary")]
+                    secondaries = [s["metric"] for s in state.current_slos if not s.get("is_primary")]
                     logger.info(
                         f"📋 SLOs mis à jour — {C.CYAN}{len(state.current_slos)}{C.RESET} SLO(s) actif(s) "
-                        f"| métriques actives : {C.CYAN}{active_metrics}{C.RESET}"
+                        f"| primaires : {C.GREEN}{primaries}{C.RESET} "
+                        f"| secondaires : {C.YELLOW}{secondaries}{C.RESET}"
                     )
                 else:
-                    active_metrics = list(config.METRICS_REGISTRY.keys())
-                    logger.warning("⚠️  MetricsManager indisponible — métriques par défaut utilisées")
+                    # Fallback : conserver les SLOs courants si metrics_manager indisponible
+                    active_metrics = [s["metric"] for s in state.current_slos]
+                    logger.warning("⚠️  MetricsManager indisponible — SLOs précédents conservés")
 
             # ── ÉTAPE 2 : Persistance SLOs ──────────────────────────────
             await _post(client, f"{_URLS['database']}/store/slos",
@@ -341,7 +395,6 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
             await asyncio.gather(*persist_tasks)
             state.last_collected = new_collected
 
-            # Log récapitulatif des métriques collectées
             for entry in new_collected:
                 vm_id = entry["vm_id"]
                 tag   = f"{C.GREEN}[ACTIVE]{C.RESET}" if vm_id == state.service_vm else f"{C.CYAN}[IDLE]{C.RESET}"
@@ -412,7 +465,6 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                         f"RAM: {C.CYAN}{ram} %{C.RESET}"
                     )
 
-            # Snapshot stable pour GET /data
             state.snapshot_collected   = list(state.last_collected)
             state.snapshot_predictions = dict(state.last_predictions)
 
@@ -473,10 +525,8 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                         f"{'═'*60}"
                     )
 
-                    # ── ÉTAPE 9 : Persistance décision ──────────────────
                     await _post(client, f"{_URLS['database']}/store/decision", di_res)
 
-                    # ── ÉTAPE 10a : Migration kubectl via openstack_client
                     kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
                     if not kubectl_ok:
                         logger.warning(
@@ -485,7 +535,6 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                             f"({C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET})"
                         )
 
-                    # ── ÉTAPE 10b : Mise à jour état interne ────────────
                     state.service_vm        = to_vm
                     state.last_migration_ts = time.monotonic()
                     logger.info(
@@ -513,6 +562,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         f"{'═'*60}"
     )
 
+    # Affichage des objectifs primaires
+    primary_objectives = {
+        m: f"{meta['default_threshold']} {meta['unit']}"
+        for m, meta in config.METRICS_REGISTRY.items()
+        if meta.get("is_primary_objective", False)
+    }
+    logger.info(
+        f"🎯 Objectifs métier primaires : {C.GREEN}{primary_objectives}{C.RESET}"
+    )
+
     success = True
     async with httpx.AsyncClient() as client:
         logger.info("🔍 Vérification de l'état des services dépendants...")
@@ -528,7 +587,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.error(f"  ❌ {C.RED}{name:<25}{C.RESET} injoignable — {e}")
                 success = False
 
-        # Health check openstack_client
         try:
             r = await client.get(f"{OPENSTACK_CLIENT_URL}/health", timeout=3.0)
             if r.status_code == 200:
@@ -544,7 +602,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 "— les migrations ne seront pas exécutées"
             )
 
-        # Synchroniser service_vm avec kubectl au démarrage
         await _sync_active_vm(client)
 
     if not success:
@@ -570,7 +627,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
 
 
-app = FastAPI(title="QoS Orchestrator Core", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="QoS Orchestrator Core", version="2.1.0", lifespan=lifespan)
 
 
 @app.post("/rtt", status_code=status.HTTP_200_OK)

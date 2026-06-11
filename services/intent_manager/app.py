@@ -21,6 +21,7 @@ class C:
     RED    = "\033[91m"
     BLUE   = "\033[94m"
     CYAN   = "\033[96m"
+    WHITE  = "\033[97m" 
 
 
 class PrettyFormatter(logging.Formatter):

@@ -17,6 +17,17 @@ class RTTMeasurement:
 
 @dataclass
 class SLO:
+    """
+    Service Level Objective.
+
+    Champ `is_primary`:
+        True  → objectif métier fixe (défini par l'utilisateur ou par
+                config.METRICS_REGISTRY). Le seuil ne doit JAMAIS être
+                recalculé statistiquement.
+        False → SLO secondaire dérivé d'une corrélation MI. Le seuil
+                est calculé dynamiquement par percentile adaptatif sur
+                l'historique observé.
+    """
     metric:           str
     operator:         str
     threshold:        float
@@ -27,6 +38,7 @@ class SLO:
     budget_remaining: float = 100.0
     violations:       int   = 0
     confidence:       float = 1.0
+    is_primary:       bool  = False
 
     def dict(self) -> Dict[str, Any]:
         return {
@@ -40,6 +52,7 @@ class SLO:
             "budget_remaining": self.budget_remaining,
             "violations":       self.violations,
             "confidence":       self.confidence,
+            "is_primary":       self.is_primary,
         }
 
 

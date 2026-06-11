@@ -13,7 +13,7 @@ CORE_URL:       str = f"http://{HUB_HOST}:{HUB_PORT}"
 
 # ── Ports services ────────────────────────────────────────────
 LATENCY_PORT                 = int(os.getenv("LATENCY_PORT",                 8001))
-LATENCY_MANAGER_PORT         = LATENCY_PORT   # alias
+LATENCY_MANAGER_PORT         = LATENCY_PORT
 INTENT_MANAGER_PORT          = int(os.getenv("INTENT_MANAGER_PORT",          8002))
 ML_PREDICTOR_PORT            = int(os.getenv("ML_PREDICTOR_PORT",            8003))
 METRICS_MANAGER_PORT         = int(os.getenv("METRICS_MANAGER_PORT",         8004))
@@ -24,7 +24,7 @@ DECISION_INTELLIGENCE_PORT   = int(os.getenv("DECISION_INTELLIGENCE_PORT",   800
 OBSERVABILITY_PORT           = int(os.getenv("OBSERVABILITY_PORT",           8009))
 OPENSTACK_CLIENT_PORT        = int(os.getenv("OPENSTACK_CLIENT_PORT",        8024))
 
-# ── URLs services (pour le core et les services) ──────────────
+# ── URLs services ────────────────────────────────────────────
 DATABASE_SERVICE_URL              = f"http://{HUB_HOST}:{DATABASE_PORT}"
 COLLECTOR_SERVICE_URL             = f"http://{HUB_HOST}:{COLLECTOR_PORT}"
 HISTORY_LOADER_SERVICE_URL        = f"http://{HUB_HOST}:{HISTORY_LOADER_PORT}"
@@ -39,9 +39,9 @@ REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB:   int = int(os.getenv("REDIS_DB",   0))
 
 # ── Persistence ───────────────────────────────────────────────
-METRICS_TTL:    int = 300   # secondes
-HISTORY_WINDOW: int = 50    # dernières N valeurs
-DECISIONS_FIFO: int = 50    # dernières N décisions
+METRICS_TTL:    int = 300
+HISTORY_WINDOW: int = 50
+DECISIONS_FIFO: int = 50
 HISTORY_SIZE:   int = int(os.getenv("HISTORY_SIZE", 10))
 
 # ── Orchestration ─────────────────────────────────────────────
@@ -93,7 +93,7 @@ ML_RTT_URL: str = os.getenv("ML_RTT_URL", "http://localhost:5001/predict")
 ML_CPU_URL: str = os.getenv("ML_CPU_URL", "http://localhost:5002/predict")
 ML_RAM_URL: str = os.getenv("ML_RAM_URL", "http://localhost:5003/predict")
 
-# ── VMs OpenStack réelles ─────────────────────────────────────
+# ── VMs OpenStack ─────────────────────────────────────────────
 VM_REGISTRY: Dict[str, Any] = {
     "edge1":  {"ip": "194.199.113.18", "port": 8200},
     "edge2":  {"ip": "194.199.113.28", "port": 8200},
@@ -101,7 +101,6 @@ VM_REGISTRY: Dict[str, Any] = {
     "cloud2": {"ip": "194.199.113.69", "port": 8200},
 }
 
-# ── Cluster kubectl mapping ───────────────────────────────────
 VM_CLUSTER_MAP: Dict[str, str] = {
     "edge1":  "edge-cluster",
     "edge2":  "edge-cluster",
@@ -115,33 +114,52 @@ OPENSTACK_SSH_USER:  str = os.getenv("OPENSTACK_SSH_USER",  "ubuntu")
 OPENSTACK_SSH_KEY:   str = os.getenv("OPENSTACK_SSH_KEY",   "admin_log_2.pem")
 OPENSTACK_STAGE_DIR: str = os.getenv("OPENSTACK_STAGE_DIR", "~/stage")
 
-# ── Metrics Registry — source de vérité extensible ───────────
-# Pour ajouter une métrique : ajouter une entrée ici.
-# Zéro modification du code des services.
+# ─────────────────────────────────────────────────────────────
+# Metrics Registry — architecture primaire/secondaire
+#
+# Sémantique des champs :
+#   • default_threshold      : seuil métier FIXE pour les SLOs primaires.
+#                              Utilisé UNIQUEMENT pour les métriques marquées
+#                              is_primary_objective=True. Pour les autres,
+#                              le seuil est calculé dynamiquement par
+#                              percentile adaptatif quand MI détecte
+#                              une corrélation.
+#   • is_primary_objective   : True  = objectif métier fixe non négociable
+#                                      (ex: latency en mode Autonomous).
+#                              False = candidate pour SLO secondaire
+#                                      adaptatif via Information Mutuelle.
+#   • always_active          : True  = métrique toujours collectée par
+#                                      le collector, indépendamment de MI.
+#   • bounds                 : bornes physiques min/max appliquées par
+#                              clamp à TOUT seuil (fixe ou adaptatif).
+# ─────────────────────────────────────────────────────────────
+
 METRICS_REGISTRY: Dict[str, Any] = {
     "latency": {
-        "payload_key":       "rtt_ms",
-        "unit":              "ms",
-        "operator":          "<",
-        "default_threshold": 200.0,
-        "bounds":            {"min": 5.0, "max": 2000.0},
-        "always_active":     True,
+        "payload_key":          "rtt_ms",
+        "unit":                 "ms",
+        "operator":             "<",
+        "default_threshold":    30.0,
+        "bounds":               {"min": 5.0, "max": 2000.0},
+        "always_active":        True,
+        "is_primary_objective": True,
     },
     "cpu_usage": {
-        "payload_key":       "cpu_usage",
-        "unit":              "%",
-        "operator":          "<",
-        "default_threshold": 80.0,
-        "bounds":            {"min": 1.0, "max": 99.0},
-        "always_active":     False,
+        "payload_key":          "cpu_usage",
+        "unit":                 "%",
+        "operator":             "<",
+        "default_threshold":    80.0,
+        "bounds":               {"min": 1.0, "max": 99.0},
+        "always_active":        False,
+        "is_primary_objective": False,
     },
     "ram_usage": {
-        "payload_key":       "ram_usage",
-        "unit":              "%",
-        "operator":          "<",
-        "default_threshold": 80.0,
-        "bounds":            {"min": 1.0, "max": 99.0},
-        "always_active":     False,
+        "payload_key":          "ram_usage",
+        "unit":                 "%",
+        "operator":             "<",
+        "default_threshold":    80.0,
+        "bounds":               {"min": 1.0, "max": 99.0},
+        "always_active":        False,
+        "is_primary_objective": False,
     },
 }
-

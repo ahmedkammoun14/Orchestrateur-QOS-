@@ -27,6 +27,11 @@ class RAGContextBuilder:
 class LLMHandler:
     """
     Facade for natural language processing with a 3-level fallback cascade.
+
+    Tous les SLOs générés sont marqués is_primary=True car ils représentent
+    les objectifs métier explicites de l'utilisateur. Les SLOs secondaires
+    adaptatifs (basés sur MI) sont ajoutés ensuite par le metrics_manager.
+
     Level 1 : Ollama LLM (qwen2.5) avec contexte RAG résumé
     Level 2 : Regex — patterns explicites (latency < 100ms)
     Level 3 : Keywords — profils sémantiques (streaming, critique, etc.)
@@ -42,13 +47,10 @@ class LLMHandler:
         if not intention:
             return None
 
-        # 0. Context Gathering (RAG)
         context = await self.rag_builder.build()
 
-        # 1. Cascade Level 1: LLM (Ollama)
         result = await self._level1_llm(intention, context)
 
-        # 2. Cascade Level 2: Regex Fallback
         if not result:
             result = self._level2_regex(intention)
             if result:
@@ -57,7 +59,6 @@ class LLMHandler:
                     f"| {len(result)} SLO(s) trouvé(s)"
                 )
 
-        # 3. Cascade Level 3: Keywords Fallback
         if not result:
             result = self._level3_keywords(intention)
             if result:
@@ -70,20 +71,25 @@ class LLMHandler:
             logger.error("❌ Tous les niveaux d'extraction ont échoué — intention non interprétable")
             return None
 
-        # 4. Normalization & Physical Validation
+        # Marque tous les SLOs comme PRIMAIRES (objectifs explicites utilisateur)
+        for r in result:
+            r["is_primary"] = True
+
         normalized = self._normalize_and_validate(result)
 
-        # 5. Merging with History/Active state
         active_slos = [SLO(**s) for s in context.get("active_slos", [])]
         final_slos = self.merger.merge(active_slos, normalized, intention)
 
-        # 6. Update History (FIFO 10)
+        # Garantit que tous les SLOs finaux sont marqués primaires
+        for s in final_slos:
+            s.is_primary = True
+
         self.history.append({"intention": intention, "slos": [s.dict() for s in final_slos]})
         if len(self.history) > config.HISTORY_SIZE:
             self.history.pop(0)
 
         logger.info(
-            f"✅ SLOs extraits et validés — {len(final_slos)} SLO(s) finaux "
+            f"✅ SLOs primaires extraits et validés — {len(final_slos)} SLO(s) "
             f"| métriques : {[s.metric for s in final_slos]}"
         )
         return final_slos
@@ -243,6 +249,7 @@ Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
             r.setdefault("budget_remaining", 100.0)
             r.setdefault("violations",       0)
             r.setdefault("confidence",       0.8)
+            r.setdefault("is_primary",       True)  # objectif explicite utilisateur
 
             try:
                 valid_slos.append(SLO(**r))

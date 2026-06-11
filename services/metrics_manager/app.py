@@ -45,7 +45,6 @@ def setup_logger():
         h = logging.StreamHandler()
         h.setFormatter(PrettyFormatter())
         logger.addHandler(h)
-    # Propagate formatter to MetricsHandler sub-logger
     sub = logging.getLogger("MetricsHandler")
     sub.setLevel(logging.DEBUG)
     if not sub.handlers:
@@ -62,16 +61,26 @@ logger = setup_logger()
 #  Application
 # ─────────────────────────────────────────────
 
+# Récupère le seuil primaire pour l'afficher dans la bannière (objectif métier)
+_primary_objectives = {
+    m: reg["default_threshold"]
+    for m, reg in config.METRICS_REGISTRY.items()
+    if reg.get("is_primary_objective", False)
+}
+
 logger.info(
     f"\n{'═'*60}\n"
     f"  🚀  {C.BOLD}Metrics Manager — Démarrage{C.RESET}\n"
-    f"  {'MI threshold':<18}: {C.CYAN}{config.MI_RELATIVE_THRESHOLD}{C.RESET}\n"
-    f"  {'History window':<18}: {C.CYAN}{config.HISTORY_WINDOW} points{C.RESET}\n"
-    f"  {'Métriques':<18}: {C.CYAN}{list(config.METRICS_REGISTRY.keys())}{C.RESET}\n"
+    f"  {'MI threshold':<20}: {C.CYAN}{config.MI_RELATIVE_THRESHOLD}{C.RESET}\n"
+    f"  {'History window':<20}: {C.CYAN}{config.HISTORY_WINDOW} points{C.RESET}\n"
+    f"  {'Métriques registry':<20}: {C.CYAN}{list(config.METRICS_REGISTRY.keys())}{C.RESET}\n"
+    f"  {'Objectifs primaires':<20}: {C.GREEN}{_primary_objectives}{C.RESET}\n"
+    f"  {'Percentiles':<20}: {C.CYAN}stable=P{config.PERCENTILE_STABLE} "
+    f"normal=P{config.PERCENTILE_NORMAL} volatile=P{config.PERCENTILE_VOLATILE}{C.RESET}\n"
     f"{'═'*60}"
 )
 
-app     = FastAPI(title="Metrics Manager", version="2.2.0")
+app     = FastAPI(title="Metrics Manager", version="2.3.0")
 handler = MetricsHandler()
 
 logger.info(f"✅ Metrics Manager prêt — port {C.CYAN}{config.METRICS_MANAGER_PORT}{C.RESET}")
@@ -83,7 +92,12 @@ logger.info(f"✅ Metrics Manager prêt — port {C.CYAN}{config.METRICS_MANAGER
 
 @app.post("/compute", status_code=status.HTTP_200_OK)
 async def compute(payload: Dict[str, Any] = Body(...)):
-    """Autonomous Mode — sélection dynamique des SLOs via MI."""
+    """
+    Mode AUTONOMOUS — génération automatique des SLOs :
+      • SLO primaire fixe (objectif métier depuis METRICS_REGISTRY)
+      • SLOs secondaires adaptatifs (percentile) sur métriques
+        corrélées via MI.
+    """
     history = payload.get("history", [])
     if len(history) < 5:
         logger.warning(
@@ -93,7 +107,7 @@ async def compute(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="At least 5 history points required")
 
     logger.info(
-        f"⚙️  /compute — Mode autonome "
+        f"⚙️  /compute — Mode {C.BOLD}AUTONOMOUS{C.RESET} "
         f"| historique : {C.CYAN}{len(history)}{C.RESET} points"
     )
 
@@ -115,7 +129,12 @@ async def compute(payload: Dict[str, Any] = Body(...)):
 
 @app.post("/validate", status_code=status.HTTP_200_OK)
 async def validate(payload: Dict[str, Any] = Body(...)):
-    """Enhanced Mode — validation et enrichissement des SLOs existants."""
+    """
+    Mode ENHANCED — enrichissement des SLOs fournis par le LLM :
+      • Les SLOs du LLM deviennent les SLOs primaires (seuils conservés).
+      • Pour les métriques non couvertes mais corrélées via MI,
+        ajout automatique d'un SLO secondaire adaptatif.
+    """
     slos_raw = payload.get("slos", [])
     history  = payload.get("history", [])
 
@@ -127,15 +146,19 @@ async def validate(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=400, detail="SLOs and History are required")
 
     logger.info(
-        f"🔎 /validate — Mode enhanced "
-        f"| {C.CYAN}{len(slos_raw)}{C.RESET} SLO(s) à valider "
+        f"🔎 /validate — Mode {C.BOLD}ENHANCED{C.RESET} "
+        f"| {C.CYAN}{len(slos_raw)}{C.RESET} SLO(s) LLM à valider "
         f"| historique : {C.CYAN}{len(history)}{C.RESET} points"
     )
 
     try:
-        mi_scores  = handler.compute_mi_scores(history)
-        slos       = [SLO(**s) for s in slos_raw]
-        final_slos, active_metrics = handler.validate_and_enrich_slos(slos, mi_scores)
+        mi_scores = handler.compute_mi_scores(history)
+        slos      = [SLO(**s) for s in slos_raw]
+        # Passage de l'historique pour permettre la génération de SLOs
+        # secondaires adaptatifs sur les métriques corrélées non couvertes
+        final_slos, active_metrics = handler.validate_and_enrich_slos(
+            slos, mi_scores, history
+        )
 
         return {
             "slos":           [s.dict() for s in final_slos],
