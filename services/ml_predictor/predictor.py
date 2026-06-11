@@ -1,0 +1,181 @@
+import asyncio
+import re
+import json
+import logging
+import statistics
+import httpx
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional, Tuple
+from shared import config
+
+logger = logging.getLogger("PredictorHandler")
+
+class PredictorHandler:
+    def __init__(self):
+        self.endpoints = {
+            "latency": config.ML_RTT_URL,
+            "cpu": config.ML_CPU_URL,
+            "ram": config.ML_RAM_URL
+        }
+        self.window_sizes = {
+            "latency": config.HISTORY_WINDOW,
+            "cpu": config.HISTORY_WINDOW,
+            "ram": config.HISTORY_WINDOW
+        }
+        self.client = httpx.AsyncClient(timeout=config.POST_TIMEOUT)
+
+    async def fetch_window_sizes(self):
+        tasks = [self._get_hyperparams(metric, url) for metric, url in self.endpoints.items()]
+        results = await asyncio.gather(*tasks)
+        for metric, size in results:
+            if size:
+                self.window_sizes[metric] = size
+                logger.info(f"Hyperparams loaded for {metric}: window_size={size}", extra={"event": "hyperparams_loaded"})
+            else:
+                logger.warning(f"Failed to load hyperparams for {metric}, using fallback", extra={"event": "hyperparams_failed"})
+
+    async def _get_hyperparams(self, metric: str, base_url: str) -> Tuple[str, Optional[int]]:
+        try:
+            url = base_url.replace("/predict", "/hyperparameters")
+            resp = await self.client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                return metric, data.get("window_size")
+        except Exception:
+            pass
+        return metric, None
+
+    async def handle(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        tasks = [
+            self._predict_metric("latency", payload.get("latency_history", [])),
+            self._predict_metric("cpu",     payload.get("cpu_history", [])),
+            self._predict_metric("ram",     payload.get("ram_history", []))
+        ]
+        results = await asyncio.gather(*tasks)
+
+        api_failures = 0
+        prediction_map = {}
+        for metric, result_dict, api_failed in results:
+            prediction_map[metric] = result_dict
+            if api_failed:
+                api_failures += 1
+
+        metrics_requested = sum(
+            1 for k in ["latency", "cpu", "ram"]
+            if prediction_map.get(k) is not None
+        )
+        all_apis_down = (api_failures == metrics_requested) and metrics_requested > 0
+
+        logger.info("Predictions ready for Core", extra={"event": "prediction_ready"})
+        return {
+            "predicted_latency": prediction_map.get("latency"),
+            "predicted_cpu":     prediction_map.get("cpu"),
+            "predicted_ram":     prediction_map.get("ram"),
+            "all_apis_down":     all_apis_down,
+            "timestamp":         datetime.now(timezone.utc).isoformat()
+        }
+
+    async def _predict_metric(
+        self, metric: str, history: List[Dict[str, Any]]
+    ) -> Tuple[str, Optional[Dict[str, Any]], bool]:
+
+        # Si pas d'historique → pas de prédiction (sauf latency obligatoire)
+        if not history:
+            if metric != "latency":
+                return metric, None, False
+            # latency sans historique → fallback level 3
+            return metric, {"predictions": [0.0] * 7, "confidence": 0.5, "uncertainty": 1.0, "model": "no_data"}, True
+
+        last_val    = history[-1]["value"] if history else 0.0
+        window_size = self.window_sizes.get(metric, 10)
+
+        # --- Level 1: predict_sequence ---
+        if len(history) >= window_size:
+            try:
+                sequence = [h["value"] / 100.0 for h in history[-window_size:]]
+                url  = self.endpoints[metric].replace("/predict", "/predict_sequence")
+                resp = await self.client.post(url, json={"sequence": sequence, "horizon": 7})
+                if resp.status_code == 200:
+                    result      = resp.json()
+                    parsed_preds = self._parse_api_list(result.get("predictions", []))
+                    if parsed_preds:
+                        logger.info(f"Sequence success for {metric}", extra={"event": "sequence_success"})
+                        return metric, self._build_response(metric, parsed_preds, result, "sequence_model"), False
+            except Exception as e:
+                logger.warning(f"Sequence failed for {metric}: {e}", extra={"event": "sequence_fallback"})
+
+        # --- Level 2: GET /predict?input_data=X ---
+        try:
+            input_val = last_val / 100.0
+            url  = f"{self.endpoints[metric]}?input_data={input_val}"
+            resp = await self.client.get(url)
+            if resp.status_code == 200:
+                result   = resp.json()
+                raw_pred = result.get("prediction")
+                if raw_pred is not None:
+                    parsed = self._parse_api_list(raw_pred)
+                    if parsed:
+                        logger.info(f"Single point fallback for {metric}", extra={"event": "single_fallback"})
+                        return metric, self._build_response(metric, parsed, {}, "point_model"), False
+        except Exception as e:
+            logger.warning(f"API unreachable for {metric}: {e}", extra={"event": "api_unavailable"})
+
+        # --- Level 3: Last Known Value ---
+        logger.error(f"All API levels failed for {metric}, using last known value", extra={"event": "api_unavailable"})
+        return metric, {
+            "predictions": [last_val] * 7,
+            "confidence": 0.5,
+            "uncertainty": 1.0,
+            "model": "last_value_fallback"
+        }, True
+
+    def _build_response(
+        self, metric: str, preds: List[float], raw_result: Dict[str, Any], model_name: str
+    ) -> Dict[str, Any]:
+        denorm_preds = self._denormalize(metric, preds)
+        return {
+            "predictions": denorm_preds[:7],
+            "confidence":  raw_result.get("confidence", 0.8),
+            "uncertainty": self._calc_uncertainty(raw_result, denorm_preds),
+            "model":       raw_result.get("model", model_name)
+        }
+
+    def _denormalize(self, metric: str, preds: List[float]) -> List[float]:
+        """Dénormalise les prédictions selon la métrique."""
+        if metric in ["cpu", "ram"]:
+            # Si déjà en % (> 1.0) → pas de multiplication
+            if preds and max(preds) > 1.0:
+                return preds
+            return [p * 100.0 for p in preds]
+        if metric == "latency":
+            # Si valeurs < 2.0 → normalisées → dénormaliser
+            if preds and max(preds) < 2.0:
+                return [p * 100.0 for p in preds]
+        return preds
+
+    def _parse_api_list(self, raw: Any) -> List[float]:
+        if isinstance(raw, list):
+            return [float(x) for x in raw]
+        if isinstance(raw, str):
+            try:
+                return [float(x) for x in json.loads(raw)]
+            except Exception:
+                return [float(x) for x in re.findall(r"[\d.]+", raw)]
+        return []
+
+    def _calc_uncertainty(self, result: Dict[str, Any], preds: List[float]) -> float:
+        c_high = result.get("confidence_high")
+        c_low  = result.get("confidence_low")
+        if c_high is not None and c_low is not None and len(preds) > 0:
+            high_list = self._parse_api_list(c_high)
+            low_list  = self._parse_api_list(c_low)
+            if high_list and low_list:
+                mean_h = statistics.mean(high_list)
+                mean_l = statistics.mean(low_list)
+                mean_p = statistics.mean(preds)
+                if mean_p != 0:
+                    return abs(mean_h - mean_l) / mean_p
+        return 1.0
+
+    async def close(self):
+        await self.client.aclose()
