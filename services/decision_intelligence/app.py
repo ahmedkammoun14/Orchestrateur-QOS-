@@ -1,4 +1,3 @@
-import json
 import logging
 import uvicorn
 from fastapi import FastAPI, Body, HTTPException, status
@@ -9,117 +8,106 @@ from shared import config
 from services.decision_intelligence.decision import DecisionHandler
 
 
-# ---------------------------------------------------------------------------
-# Structured JSON logging
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────
+#  ANSI color codes
+# ─────────────────────────────────────────────
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
 
-class _JSONFormatter(logging.Formatter):
-    """Emits every log record as a single-line JSON object."""
+
+class PrettyFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
+        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
+        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
+        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
+        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
+    }
 
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level":     record.levelname,
-            "service":   "decision_intelligence",
-            "event":     getattr(record, "event", "generic"),
-            "message":   record.getMessage(),
-        })
+        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
+        msg   = record.getMessage()
+        return f"{C.CYAN}{ts}{C.RESET}  {level}  {msg}"
 
 
 def _setup_logger() -> logging.Logger:
     """
-    Configure the root logger for this service.
-
-    Uses the name ``"DecisionIntelligence"`` so that child loggers in
-    ``decision.py`` (``"DecisionIntelligence.handler"``) automatically
-    inherit this handler via propagation without a separate setup.
+    Configure le logger parent 'DecisionIntelligence'.
+    Les enfants (decision.py → 'DecisionIntelligence.handler') héritent
+    automatiquement via propagation.
     """
     logger = logging.getLogger("DecisionIntelligence")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     if not logger.handlers:
         h = logging.StreamHandler()
-        h.setFormatter(_JSONFormatter())
+        h.setFormatter(PrettyFormatter())
         logger.addHandler(h)
-    logger.propagate = False   # prevent double-emission to root logger
+    logger.propagate = False
     return logger
 
 
 logger = _setup_logger()
 
+# ─────────────────────────────────────────────
+#  Application
+# ─────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
+logger.info(
+    f"\n{'═'*60}\n"
+    f"  🚀  {C.BOLD}Decision Intelligence — Démarrage{C.RESET}\n"
+    f"  {'Proactive factor':<18}: {C.CYAN}{config.PROACTIVE_FACTOR}{C.RESET}\n"
+    f"  {'Horizon alert':<18}: {C.CYAN}{config.HORIZON_ALERT} pas{C.RESET}\n"
+    f"  {'Métriques':<18}: {C.CYAN}{list(config.METRICS_REGISTRY.keys())}{C.RESET}\n"
+    f"{'═'*60}"
+)
 
-app = FastAPI(title="Decision Intelligence", version="2.0.0")
-
-# Stateless handler — safe to instantiate once at module level.
+app     = FastAPI(title="Decision Intelligence", version="2.0.0")
 handler = DecisionHandler()
 
+logger.info(
+    f"✅ Decision Intelligence prêt — port {C.CYAN}{config.DECISION_INTELLIGENCE_PORT}{C.RESET}"
+)
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+
+# ─────────────────────────────────────────────
+#  Endpoints
+# ─────────────────────────────────────────────
 
 @app.post("/decide", status_code=status.HTTP_200_OK)
 async def decide(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """
-    Evaluate SLO violations and return the optimal VM action.
-
-    Called **exclusively** by the orchestrator core.
-    Pure computation — zero Redis, zero DB, zero OpenStack calls.
-
-    Expected payload::
-
-        {
-            "current_data":       List[{vm_id, rtt_ms, ...}],   # mandatory
-            "slos":               List[{metric, operator,
-                                        threshold, weight}],     # mandatory
-            "service_vm":         str,                           # mandatory
-            "predictions_map":    {vm_id: {metric: {...}}},
-            "cooldown_active":    bool,
-            "migration_costs":    {vm_id: int},
-            "reliability_scores": {vm_id: float}
-        }
-
-    Fast path: if ``cooldown_active`` is ``True``, returns immediately
-    without invoking the violation detector or TOPSIS.
-
-    Returns
-    -------
-    200
-        ``{"decision", "from_vm", "to_vm", "reason",
-           "topsis_score", "breach_type", "timestamp"}``
-    400
-        If ``current_data``, ``slos``, or ``service_vm`` are missing.
-    500
-        On unexpected engine error.
-    """
     if (
         not payload.get("current_data")
         or not payload.get("slos")
         or not payload.get("service_vm")
     ):
+        logger.warning(
+            "⚠️  /decide — payload incomplet "
+            "| champs requis : current_data, slos, service_vm"
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="current_data, slos and service_vm are mandatory",
         )
 
+    service_vm  = payload.get("service_vm")
+    candidates  = [v["vm_id"] for v in payload.get("current_data", [])]
+    slo_metrics = [s["metric"] for s in payload.get("slos", [])]
     logger.info(
-        f"Decision requested — service_vm={payload.get('service_vm')!r} "
-        f"candidates={[v['vm_id'] for v in payload.get('current_data', [])]} "
-        f"slos={[s['metric'] for s in payload.get('slos', [])]}",
-        extra={"event": "decision_requested"},
+        f"📥 /decide — service_vm : {C.CYAN}{service_vm}{C.RESET} "
+        f"| candidats : {C.CYAN}{candidates}{C.RESET} "
+        f"| SLOs : {C.CYAN}{slo_metrics}{C.RESET}"
     )
 
-    # ------------------------------------------------------------------
-    # Fast cooldown path — no computation needed
-    # ------------------------------------------------------------------
+    # Fast path cooldown
     if payload.get("cooldown_active"):
-        logger.info(
-            "Cooldown active — returning stay immediately",
-            extra={"event": "cooldown_active"},
-        )
+        logger.info("⏳ Cooldown actif — retour STAY immédiat (fast path)")
         return {
             "decision":     "stay",
             "from_vm":      None,
@@ -130,27 +118,27 @@ async def decide(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             "timestamp":    datetime.now(timezone.utc).isoformat(),
         }
 
-    # ------------------------------------------------------------------
-    # Standard decision path
-    # ------------------------------------------------------------------
     try:
         result: Dict[str, Any] = handler.decide(payload)
 
-        event = (
-            "decision_migrate" if result["decision"] == "migrate"
-            else "decision_stay"
-        )
-        logger.info(
-            f"Decision: {result['decision']!r} | "
-            f"breach={result.get('breach_type')!r} | "
-            f"to_vm={result.get('to_vm')!r} | "
-            f"score={result.get('topsis_score')}",
-            extra={"event": event},
-        )
+        decision = result["decision"]
+        if decision == "migrate":
+            logger.info(
+                f"✅ /decide → {C.YELLOW}{C.BOLD}MIGRATE{C.RESET} "
+                f"| {result['from_vm']} → {C.GREEN}{result['to_vm']}{C.RESET} "
+                f"| score TOPSIS : {C.CYAN}{result.get('topsis_score')}{C.RESET} "
+                f"| breach : {result.get('breach_type')}"
+            )
+        else:
+            logger.info(
+                f"✅ /decide → {C.GREEN}STAY{C.RESET} "
+                f"| raison : {result.get('reason')}"
+            )
+
         return result
 
     except Exception as exc:
-        logger.error(str(exc), extra={"event": "internal_error"})
+        logger.error(f"❌ /decide — erreur interne : {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal decision engine error",
@@ -159,17 +147,8 @@ async def decide(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
-    """
-    Service liveness check.
-
-    No external dependencies — always healthy while the process is up.
-    """
     return {"status": "healthy", "service": "decision_intelligence"}
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=config.DECISION_INTELLIGENCE_PORT)

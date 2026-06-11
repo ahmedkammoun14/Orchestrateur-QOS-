@@ -1,10 +1,50 @@
 import uvicorn
 import asyncio
 import httpx
+import logging
+from datetime import datetime, timezone
 from fastapi import FastAPI, Body, BackgroundTasks, status, HTTPException
 from typing import Dict, Any
 from shared import config
-from services.collector.collector import CollectorHandler
+from services.collector.collector import CollectorHandler, C
+
+
+# ─────────────────────────────────────────────
+#  Logger (réutilise le même formatter que collector.py)
+# ─────────────────────────────────────────────
+class _PrettyFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
+        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
+        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
+        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
+        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
+        return f"{C.CYAN}{ts}{C.RESET}  {level}  {record.getMessage()}"
+
+
+def _setup_app_logger() -> logging.Logger:
+    log = logging.getLogger("CollectorApp")
+    log.setLevel(logging.DEBUG)
+    if not log.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(_PrettyFormatter())
+        log.addHandler(h)
+    log.propagate = False
+    return log
+
+
+app_logger = _setup_app_logger()
+
+app_logger.info(
+    f"\n{'═'*60}\n"
+    f"  📡  {C.BOLD}Collector Service — Démarrage{C.RESET}\n"
+    f"{'═'*60}"
+)
 
 app = FastAPI(
     title="Advanced Metrics Collector",
@@ -14,21 +54,31 @@ app = FastAPI(
 
 handler = CollectorHandler()
 
+app_logger.info(
+    f"\n{'═'*60}\n"
+    f"  {C.GREEN}✅  Collector Service prêt{C.RESET}\n"
+    f"  {'Port':<16}: {C.CYAN}{config.COLLECTOR_PORT}{C.RESET}\n"
+    f"  {'VMs enregistrées':<16}: {C.CYAN}{len(config.VM_REGISTRY)}{C.RESET} "
+    f"({', '.join(config.VM_REGISTRY.keys())})\n"
+    f"  {'Timeout base':<16}: {C.CYAN}{config.COLLECTOR_TIMEOUT_BASE}s{C.RESET}\n"
+    f"  {'Alpha EMA':<16}: {C.CYAN}{config.COLLECTOR_RELIABILITY_ALPHA}{C.RESET}\n"
+    f"{'═'*60}\n"
+)
+
 
 @app.post("/collect", status_code=status.HTTP_200_OK)
 async def collect(
     background_tasks: BackgroundTasks,
     payload: Dict[str, Any] = Body(...)
 ):
-    """
-    Triggers a collection cycle.
-    Payload: {"active_metrics": List[str], "cycle": int}
-    Storage to database is handled in background — does not block Core response.
-    """
     active_metrics = payload.get("active_metrics")
-    cycle = payload.get("cycle")
+    cycle          = payload.get("cycle")
 
     if not active_metrics or cycle is None:
+        app_logger.warning(
+            f"⚠️  /collect — payload invalide : "
+            f"active_metrics={active_metrics}, cycle={cycle}"
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="active_metrics and cycle are required"
@@ -36,7 +86,6 @@ async def collect(
 
     result = await handler.handle(active_metrics, cycle)
 
-    # Non-blocking background storage via BackgroundTasks (safe reference)
     background_tasks.add_task(
         handler._forward_to_database,
         result["results"],
@@ -48,10 +97,6 @@ async def collect(
 
 @app.get("/health")
 async def health():
-    """
-    Checks service health and parallel availability of all VMs.
-    Uses a single shared httpx.AsyncClient for all VM checks.
-    """
     checks = {"service": "healthy", "vms": {}}
 
     async def check_vm(client: httpx.AsyncClient, vm_id: str, info: Dict[str, Any]):
@@ -67,6 +112,20 @@ async def health():
             check_vm(client, vid, info)
             for vid, info in config.VM_REGISTRY.items()
         ])
+
+    online  = sum(1 for s in checks["vms"].values() if s == "online")
+    total   = len(checks["vms"])
+    offline = [vid for vid, s in checks["vms"].items() if s != "online"]
+
+    if offline:
+        app_logger.warning(
+            f"⚠️  Health check VMs — {C.GREEN}{online}{C.RESET}/{total} en ligne "
+            f"| hors ligne : {C.YELLOW}{offline}{C.RESET}"
+        )
+    else:
+        app_logger.info(
+            f"✅ Health check VMs — {C.GREEN}{online}{C.RESET}/{total} en ligne"
+        )
 
     return checks
 

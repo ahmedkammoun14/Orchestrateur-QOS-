@@ -10,33 +10,40 @@ from shared import config
 
 logger = logging.getLogger("PredictorHandler")
 
+
 class PredictorHandler:
     def __init__(self):
         self.endpoints = {
             "latency": config.ML_RTT_URL,
-            "cpu": config.ML_CPU_URL,
-            "ram": config.ML_RAM_URL
+            "cpu":     config.ML_CPU_URL,
+            "ram":     config.ML_RAM_URL,
         }
         self.window_sizes = {
             "latency": config.HISTORY_WINDOW,
-            "cpu": config.HISTORY_WINDOW,
-            "ram": config.HISTORY_WINDOW
+            "cpu":     config.HISTORY_WINDOW,
+            "ram":     config.HISTORY_WINDOW,
         }
         self.client = httpx.AsyncClient(timeout=config.POST_TIMEOUT)
 
     async def fetch_window_sizes(self):
-        tasks = [self._get_hyperparams(metric, url) for metric, url in self.endpoints.items()]
+        tasks   = [self._get_hyperparams(metric, url) for metric, url in self.endpoints.items()]
         results = await asyncio.gather(*tasks)
         for metric, size in results:
             if size:
                 self.window_sizes[metric] = size
-                logger.info(f"Hyperparams loaded for {metric}: window_size={size}", extra={"event": "hyperparams_loaded"})
+                logger.info(
+                    f"✅ Hyperparamètres chargés — {metric} "
+                    f"| window_size = {size}"
+                )
             else:
-                logger.warning(f"Failed to load hyperparams for {metric}, using fallback", extra={"event": "hyperparams_failed"})
+                logger.warning(
+                    f"⚠️  Hyperparamètres indisponibles pour {metric} "
+                    f"— fenêtre par défaut : {self.window_sizes[metric]}"
+                )
 
     async def _get_hyperparams(self, metric: str, base_url: str) -> Tuple[str, Optional[int]]:
         try:
-            url = base_url.replace("/predict", "/hyperparameters")
+            url  = base_url.replace("/predict", "/hyperparameters")
             resp = await self.client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
@@ -49,11 +56,11 @@ class PredictorHandler:
         tasks = [
             self._predict_metric("latency", payload.get("latency_history", [])),
             self._predict_metric("cpu",     payload.get("cpu_history", [])),
-            self._predict_metric("ram",     payload.get("ram_history", []))
+            self._predict_metric("ram",     payload.get("ram_history", [])),
         ]
         results = await asyncio.gather(*tasks)
 
-        api_failures = 0
+        api_failures   = 0
         prediction_map = {}
         for metric, result_dict, api_failed in results:
             prediction_map[metric] = result_dict
@@ -66,67 +73,102 @@ class PredictorHandler:
         )
         all_apis_down = (api_failures == metrics_requested) and metrics_requested > 0
 
-        logger.info("Predictions ready for Core", extra={"event": "prediction_ready"})
+        # Log récapitulatif des prédictions
+        for metric, pred in prediction_map.items():
+            if pred:
+                preds  = pred.get("predictions", [])
+                model  = pred.get("model", "?")
+                conf   = pred.get("confidence", "?")
+                first  = f"{preds[0]:.2f}" if preds else "N/A"
+                logger.debug(
+                    f"🔍 {metric:<10} modèle : {model:<22} "
+                    f"conf : {conf}  prédiction[0] : {first}"
+                )
+
+        logger.info(
+            f"🤖 Prédictions générées — "
+            f"APIs OK : {metrics_requested - api_failures}/{metrics_requested} "
+            f"| all_apis_down : {all_apis_down}"
+        )
+
         return {
             "predicted_latency": prediction_map.get("latency"),
             "predicted_cpu":     prediction_map.get("cpu"),
             "predicted_ram":     prediction_map.get("ram"),
             "all_apis_down":     all_apis_down,
-            "timestamp":         datetime.now(timezone.utc).isoformat()
+            "timestamp":         datetime.now(timezone.utc).isoformat(),
         }
 
     async def _predict_metric(
         self, metric: str, history: List[Dict[str, Any]]
     ) -> Tuple[str, Optional[Dict[str, Any]], bool]:
 
-        # Si pas d'historique → pas de prédiction (sauf latency obligatoire)
         if not history:
             if metric != "latency":
                 return metric, None, False
-            # latency sans historique → fallback level 3
-            return metric, {"predictions": [0.0] * 7, "confidence": 0.5, "uncertainty": 1.0, "model": "no_data"}, True
+            return metric, {
+                "predictions": [0.0] * 7,
+                "confidence":  0.5,
+                "uncertainty": 1.0,
+                "model":       "no_data",
+            }, True
 
         last_val    = history[-1]["value"] if history else 0.0
         window_size = self.window_sizes.get(metric, 10)
 
-        # --- Level 1: predict_sequence ---
+        # ── Niveau 1 : predict_sequence ─────────────────────────────
         if len(history) >= window_size:
             try:
                 sequence = [h["value"] / 100.0 for h in history[-window_size:]]
-                url  = self.endpoints[metric].replace("/predict", "/predict_sequence")
-                resp = await self.client.post(url, json={"sequence": sequence, "horizon": 7})
+                url      = self.endpoints[metric].replace("/predict", "/predict_sequence")
+                resp     = await self.client.post(url, json={"sequence": sequence, "horizon": 7})
                 if resp.status_code == 200:
-                    result      = resp.json()
+                    result       = resp.json()
                     parsed_preds = self._parse_api_list(result.get("predictions", []))
                     if parsed_preds:
-                        logger.info(f"Sequence success for {metric}", extra={"event": "sequence_success"})
+                        logger.info(
+                            f"✅ Niveau 1 (sequence) — {metric} "
+                            f"| {len(parsed_preds)} valeurs prédites"
+                        )
                         return metric, self._build_response(metric, parsed_preds, result, "sequence_model"), False
             except Exception as e:
-                logger.warning(f"Sequence failed for {metric}: {e}", extra={"event": "sequence_fallback"})
+                logger.warning(
+                    f"⚠️  Niveau 1 échoué pour {metric} : {e} "
+                    "— passage au niveau 2"
+                )
 
-        # --- Level 2: GET /predict?input_data=X ---
+        # ── Niveau 2 : GET /predict?input_data=X ────────────────────
         try:
             input_val = last_val / 100.0
-            url  = f"{self.endpoints[metric]}?input_data={input_val}"
-            resp = await self.client.get(url)
+            url       = f"{self.endpoints[metric]}?input_data={input_val}"
+            resp      = await self.client.get(url)
             if resp.status_code == 200:
                 result   = resp.json()
                 raw_pred = result.get("prediction")
                 if raw_pred is not None:
                     parsed = self._parse_api_list(raw_pred)
                     if parsed:
-                        logger.info(f"Single point fallback for {metric}", extra={"event": "single_fallback"})
+                        logger.info(
+                            f"✅ Niveau 2 (point unique) — {metric} "
+                            f"| valeur d'entrée : {last_val:.2f}"
+                        )
                         return metric, self._build_response(metric, parsed, {}, "point_model"), False
         except Exception as e:
-            logger.warning(f"API unreachable for {metric}: {e}", extra={"event": "api_unavailable"})
+            logger.warning(
+                f"⚠️  Niveau 2 échoué pour {metric} : {e} "
+                "— passage au niveau 3"
+            )
 
-        # --- Level 3: Last Known Value ---
-        logger.error(f"All API levels failed for {metric}, using last known value", extra={"event": "api_unavailable"})
+        # ── Niveau 3 : Last Known Value (fallback final) ─────────────
+        logger.error(
+            f"❌ Niveaux 1 et 2 épuisés pour {metric} "
+            f"— fallback last_value ({last_val:.2f})"
+        )
         return metric, {
             "predictions": [last_val] * 7,
-            "confidence": 0.5,
+            "confidence":  0.5,
             "uncertainty": 1.0,
-            "model": "last_value_fallback"
+            "model":       "last_value_fallback",
         }, True
 
     def _build_response(
@@ -137,18 +179,15 @@ class PredictorHandler:
             "predictions": denorm_preds[:7],
             "confidence":  raw_result.get("confidence", 0.8),
             "uncertainty": self._calc_uncertainty(raw_result, denorm_preds),
-            "model":       raw_result.get("model", model_name)
+            "model":       raw_result.get("model", model_name),
         }
 
     def _denormalize(self, metric: str, preds: List[float]) -> List[float]:
-        """Dénormalise les prédictions selon la métrique."""
         if metric in ["cpu", "ram"]:
-            # Si déjà en % (> 1.0) → pas de multiplication
             if preds and max(preds) > 1.0:
                 return preds
             return [p * 100.0 for p in preds]
         if metric == "latency":
-            # Si valeurs < 2.0 → normalisées → dénormaliser
             if preds and max(preds) < 2.0:
                 return [p * 100.0 for p in preds]
         return preds

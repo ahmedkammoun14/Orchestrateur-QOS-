@@ -1,35 +1,50 @@
 import asyncio
 import httpx
 import logging
-import json
 import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any
 from shared import config
 
-# --- Structured Logging ---
 
-class JSONFormatter(logging.Formatter):
+# ─────────────────────────────────────────────
+#  ANSI color codes
+# ─────────────────────────────────────────────
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+
+
+class _PrettyFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
+        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
+        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
+        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
+        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
+    }
+
     def format(self, record: logging.LogRecord) -> str:
-        log_record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "collector",
-            "event": getattr(record, "event", "generic_log"),
-            "message": record.getMessage()
-        }
-        if hasattr(record, "extra_data"):
-            log_record.update(record.extra_data)
-        return json.dumps(log_record)
+        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
+        return f"{C.CYAN}{ts}{C.RESET}  {level}  {record.getMessage()}"
+
 
 def setup_logger():
     logger = logging.getLogger("CollectorHandler")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(JSONFormatter())
+        handler.setFormatter(_PrettyFormatter())
         logger.addHandler(handler)
+    logger.propagate = False
     return logger
+
 
 logger = setup_logger()
 
@@ -41,21 +56,16 @@ class CollectorHandler:
     """
 
     def __init__(self):
-        self.vm_registry = config.VM_REGISTRY
-        self.alpha = config.COLLECTOR_RELIABILITY_ALPHA
-
-        # Per-VM state tracking (initialized from config)
-        self.vm_timeouts = {vm_id: config.COLLECTOR_TIMEOUT_BASE for vm_id in self.vm_registry}
+        self.vm_registry   = config.VM_REGISTRY
+        self.alpha         = config.COLLECTOR_RELIABILITY_ALPHA
+        self.vm_timeouts   = {vm_id: config.COLLECTOR_TIMEOUT_BASE for vm_id in self.vm_registry}
         self.vm_reliability = {vm_id: 1.0 for vm_id in self.vm_registry}
 
     async def handle(self, active_metrics: List[str], cycle: int) -> Dict[str, Any]:
-        """
-        Orchestrates the collection cycle and returns results to the Core.
-        Background storage is handled by BackgroundTasks in app.py.
-        """
         logger.info(
-            f"Starting collection cycle {cycle}",
-            extra={"event": "collect_requested", "extra_data": {"cycle": cycle, "metrics": active_metrics}}
+            f"📡 Démarrage collecte — cycle #{C.BOLD}{cycle}{C.RESET} "
+            f"| métriques : {C.CYAN}{active_metrics}{C.RESET} "
+            f"| VMs ciblées : {C.CYAN}{len(self.vm_registry)}{C.RESET}"
         )
 
         start_time = time.perf_counter()
@@ -67,20 +77,20 @@ class CollectorHandler:
             ]
             results = await asyncio.gather(*tasks)
 
-        payload = {
-            "results": list(results),
-            "cycle": cycle,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
+        duration = round(time.perf_counter() - start_time, 3)
+        reachable_count = sum(1 for r in results if r.get("reachable"))
 
         logger.info(
-            f"Collection cycle {cycle} done",
-            extra={"event": "collect_done", "extra_data": {
-                "cycle": cycle,
-                "duration": round(time.perf_counter() - start_time, 3)
-            }}
+            f"✅ Collecte terminée — cycle #{C.BOLD}{cycle}{C.RESET} "
+            f"| durée : {C.CYAN}{duration}s{C.RESET} "
+            f"| {C.GREEN}{reachable_count}{C.RESET}/{len(results)} VM(s) joignables"
         )
-        return payload
+
+        return {
+            "results":   list(results),
+            "cycle":     cycle,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
 
     async def _collect_vm(
         self,
@@ -89,16 +99,12 @@ class CollectorHandler:
         info: Dict[str, Any],
         active_metrics: List[str]
     ) -> Dict[str, Any]:
-        """
-        Performs adaptive HTTP GET /metrics on a specific VM.
-        Updates EMA timeout and reliability score.
-        """
-        url = f"http://{info['ip']}:{info['port']}/metrics"
+        url             = f"http://{info['ip']}:{info['port']}/metrics"
         current_timeout = self.vm_timeouts[vm_id]
 
         start_ts = time.perf_counter()
         try:
-            response = await client.get(url, timeout=current_timeout)
+            response    = await client.get(url, timeout=current_timeout)
             actual_time = time.perf_counter() - start_ts
 
             if response.status_code == 200:
@@ -107,21 +113,25 @@ class CollectorHandler:
                 self._update_timeout(vm_id, actual_time)
                 self._update_reliability(vm_id, 1.0)
 
-                filtered_metrics = {
-                    metric: data.get(metric) for metric in active_metrics
-                }
+                filtered_metrics = {metric: data.get(metric) for metric in active_metrics}
+                reliability      = round(self.vm_reliability[vm_id], 3)
 
+                metric_summary = "  ".join(
+                    f"{m}={C.CYAN}{v}{C.RESET}" for m, v in filtered_metrics.items() if v is not None
+                )
                 logger.info(
-                    f"Collected from {vm_id}",
-                    extra={"event": "collect_vm_success", "extra_data": {"vm_id": vm_id}}
+                    f"  ✅ {C.GREEN}{C.BOLD}{vm_id}{C.RESET} — "
+                    f"{metric_summary}  "
+                    f"| fiabilité : {C.GREEN}{reliability}{C.RESET}  "
+                    f"| temps : {C.CYAN}{round(actual_time * 1000, 1)} ms{C.RESET}"
                 )
 
                 return {
                     "vm_id": vm_id,
                     **filtered_metrics,
-                    "reliability": round(self.vm_reliability[vm_id], 3),
-                    "reachable": True,
-                    "timestamp": data.get("timestamp", datetime.now(timezone.utc).isoformat())
+                    "reliability": reliability,
+                    "reachable":   True,
+                    "timestamp":   data.get("timestamp", datetime.now(timezone.utc).isoformat())
                 }
             else:
                 return self._handle_vm_failure(vm_id, active_metrics, f"HTTP_{response.status_code}")
@@ -130,22 +140,22 @@ class CollectorHandler:
             return self._handle_vm_failure(vm_id, active_metrics, str(type(e).__name__))
 
     def _handle_vm_failure(self, vm_id: str, metrics: List[str], reason: str) -> Dict[str, Any]:
-        """Updates reliability and prepares failure payload."""
         self._update_reliability(vm_id, 0.0)
+        reliability = round(self.vm_reliability[vm_id], 3)
         logger.warning(
-            f"Failed to collect from {vm_id}",
-            extra={"event": "collect_vm_failed", "extra_data": {"vm_id": vm_id, "reason": reason}}
+            f"  ⚠️  {C.YELLOW}{C.BOLD}{vm_id}{C.RESET} — injoignable "
+            f"| raison : {C.YELLOW}{reason}{C.RESET} "
+            f"| fiabilité : {C.YELLOW}{reliability}{C.RESET}"
         )
         return {
             "vm_id": vm_id,
             **{m: None for m in metrics},
-            "reliability": round(self.vm_reliability[vm_id], 3),
-            "reachable": False,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "reliability": reliability,
+            "reachable":   False,
+            "timestamp":   datetime.now(timezone.utc).isoformat()
         }
 
     def _update_timeout(self, vm_id: str, actual_time: float):
-        """EMA Timeout: new = alpha * (actual * factor) + (1-alpha) * current"""
         new_val = self.alpha * (actual_time * config.COLLECTOR_TIMEOUT_FACTOR) + \
                   (1 - self.alpha) * self.vm_timeouts[vm_id]
         self.vm_timeouts[vm_id] = max(
@@ -154,34 +164,26 @@ class CollectorHandler:
         )
 
     def _update_reliability(self, vm_id: str, success_val: float):
-        """EMA Reliability: new = alpha * val + (1-alpha) * current"""
         self.vm_reliability[vm_id] = \
             self.alpha * success_val + (1 - self.alpha) * self.vm_reliability[vm_id]
 
     async def _forward_to_database(self, results: List[Dict[str, Any]], cycle: int):
-        """
-        Asynchronous storage forwarding to database service with retry logic.
-        Sends one POST per VM with the correct format expected by database.
-        Called via BackgroundTasks in app.py — never blocks the Core response.
-        """
         async with httpx.AsyncClient() as client:
             for vm_result in results:
                 vm_id = vm_result.get("vm_id")
 
-                # Skip unreachable VMs
                 if not vm_id or not vm_result.get("reachable"):
                     continue
 
-                # Build metrics dict — exclude non-metric fields
                 metrics = {
                     k: v for k, v in vm_result.items()
                     if k not in ("vm_id", "reliability", "reachable", "timestamp")
                 }
 
                 payload = {
-                    "vm_id": vm_id,
-                    "metrics": metrics,
-                    "timestamp": vm_result.get("timestamp"),
+                    "vm_id":       vm_id,
+                    "metrics":     metrics,
+                    "timestamp":   vm_result.get("timestamp"),
                     "reliability": vm_result.get("reliability")
                 }
 
@@ -193,18 +195,22 @@ class CollectorHandler:
                             timeout=5.0
                         )
                         if response.status_code in (200, 201, 202):
-                            logger.info(
-                                f"Stored metrics for {vm_id}",
-                                extra={"event": "stored_to_database", "extra_data": {"vm_id": vm_id, "cycle": cycle}}
+                            logger.debug(
+                                f"🔍 Métriques transmises à Database — "
+                                f"VM : {C.CYAN}{vm_id}{C.RESET} | cycle #{cycle}"
                             )
                             break
                     except Exception:
                         pass
 
                     if attempt < config.POST_RETRY_COUNT:
+                        logger.debug(
+                            f"🔍 Tentative {attempt}/{config.POST_RETRY_COUNT} échouée "
+                            f"pour {C.CYAN}{vm_id}{C.RESET} — nouvelle tentative..."
+                        )
                         await asyncio.sleep(config.POST_RETRY_BACKOFF)
                 else:
                     logger.error(
-                        f"Database storage failed for {vm_id} after all retries",
-                        extra={"event": "storage_failed", "extra_data": {"cycle": cycle, "vm_id": vm_id}}
+                        f"❌ Échec persistance Database pour {C.RED}{vm_id}{C.RESET} "
+                        f"après {config.POST_RETRY_COUNT} tentatives | cycle #{cycle}"
                     )

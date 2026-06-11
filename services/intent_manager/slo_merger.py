@@ -12,11 +12,8 @@ class SLOMerger:
     """
 
     def merge(self, active_slos: List[SLO], new_slos: List[SLO], text: str) -> List[SLO]:
-        """
-        Determines the merge strategy based on the intention text and fuses the SLOs.
-        """
         text_lower = text.lower()
-        
+
         # 1. Determine Strategy
         if any(kw in text_lower for kw in ["plus strict", "moins strict", "affine", "plus de", "moins de"]):
             mode = "REFINE"
@@ -25,7 +22,10 @@ class SLOMerger:
         else:
             mode = "REPLACE"
 
-        logger.info(f"Merge mode identified: {mode}", extra={"event": "merge_mode", "extra_data": {"mode": mode}})
+        logger.info(
+            f"🔀 Stratégie de fusion SLOs : {mode} "
+            f"| SLOs actifs : {len(active_slos)} | nouveaux SLOs : {len(new_slos)}"
+        )
 
         # 2. Execute Strategy
         if mode == "REPLACE":
@@ -39,7 +39,7 @@ class SLOMerger:
 
         # 3. Validation & Conflict Detection
         self._detect_conflicts(result)
-        
+
         # 4. Final Weight Normalization
         return self._normalize_weights(result)
 
@@ -47,19 +47,18 @@ class SLOMerger:
         """Adds new SLOs or updates existing ones if metrics match."""
         merged = {s.metric: s for s in active}
         for n in new:
-            merged[n.metric] = n  # Overwrite or add
+            merged[n.metric] = n
         return list(merged.values())
 
     def _refine_merge(self, active: List[SLO], text: str) -> List[SLO]:
         """Applies factors to existing thresholds."""
         factor = config.REFINE_STRICT if "plus strict" in text else config.REFINE_RELAX
-        
+
         for s in active:
-            # For latency and usage, 'stricter' means a lower threshold
             s.threshold = round(s.threshold * factor, 2)
-            s.target = round(s.target * factor, 2)
-            s.confidence = min(1.0, s.confidence * 0.9) # Slightly reduce confidence on manual refinement
-            
+            s.target    = round(s.target * factor, 2)
+            s.confidence = min(1.0, s.confidence * 0.9)
+
         return active
 
     def _detect_conflicts(self, slos: List[SLO]):
@@ -76,24 +75,20 @@ class SLOMerger:
                     s_old, s_new = group[i], group[j]
                     if s_old.operator != s_new.operator:
                         logger.warning(
-                            f"Contradictory operators for {metric}",
-                            extra={"event": "conflict_operator",
-                                   "extra_data": {"metric": metric,
-                                   "op1": s_old.operator,
-                                   "op2": s_new.operator}}
+                            f"⚠️  Conflit d'opérateurs sur '{metric}' "
+                            f"| op1={s_old.operator} vs op2={s_new.operator}"
                         )
                     if s_old.threshold > 0:
                         gap = abs(s_new.threshold - s_old.threshold) / s_old.threshold
                         if gap > 0.5:
                             logger.warning(
-                                f"Threshold gap > 50% for {metric}",
-                                extra={"event": "conflict_threshold",
-                                       "extra_data": {"metric": metric,
-                                       "gap": round(gap, 2)}}
+                                f"⚠️  Écart de seuil > 50% sur '{metric}' "
+                                f"| gap={round(gap * 100, 1)}%"
                             )
 
     def _normalize_weights(self, slos: List[SLO]) -> List[SLO]:
-        if not slos: return []
+        if not slos:
+            return []
         total = sum(s.weight for s in slos)
         if total > 0:
             for s in slos:

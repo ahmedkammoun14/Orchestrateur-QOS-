@@ -5,29 +5,12 @@ from typing import Any, Dict, List, Optional
 from services.decision_intelligence.violation_detector import ViolationDetector
 from services.decision_intelligence.topsis import TopsisSelector, vm_satisfies_slo
 
-# Child logger — propagates to the "DecisionIntelligence" parent logger
-# configured in app.py, inheriting its JSON formatter automatically.
 logger = logging.getLogger("DecisionIntelligence.handler")
 
 
 class DecisionHandler:
     """
     Orchestrates the full decision pipeline for one evaluation cycle.
-
-    Pipeline
-    --------
-    1. Cooldown guard (defensive, primary check is in app.py).
-    2. ViolationDetector.detect() — analyse service_vm across all SLOs.
-    3. No violations → ``"stay"``.
-    4. Filter candidate VMs:
-
-       a. Exclude service_vm.
-       b. Prefer VMs whose predicted means already satisfy **all** SLOs.
-       c. Fallback to all non-service VMs if none qualify.
-
-    5. TopsisSelector.select() — rank filtered candidates.
-    6. Return ``"migrate"`` to best VM, or ``"stay"`` if no valid target.
-
     Stateless — no Redis, no external calls, no side effects.
     """
 
@@ -35,25 +18,7 @@ class DecisionHandler:
         self._detector = ViolationDetector()
         self._topsis   = TopsisSelector()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def decide(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Evaluate the core payload and emit a migration decision.
-
-        Parameters
-        ----------
-        payload:
-            Full decision payload as sent by the orchestrator core.
-
-        Returns
-        -------
-        dict
-            ``{"decision", "from_vm", "to_vm", "reason",
-               "topsis_score", "breach_type", "timestamp"}``
-        """
         current_data:       List[Dict] = payload["current_data"]
         predictions_map:    Dict       = payload.get("predictions_map", {})
         slos:               List[Dict] = payload.get("slos", [])
@@ -64,35 +29,33 @@ class DecisionHandler:
 
         ts: str = datetime.now(timezone.utc).isoformat()
 
-        # ------------------------------------------------------------------
-        # Step 1: Cooldown guard (defensive — app.py is the primary check)
-        # ------------------------------------------------------------------
+        # ── Étape 1 : Cooldown (défensif) ────────────────────────────
         if cooldown_active:
-            logger.info("Cooldown active — staying", extra={})
+            logger.info("⏳ Cooldown actif — décision STAY immédiate")
             return self._build_stay("cooldown_active", None, None, ts)
 
-        # ------------------------------------------------------------------
-        # Step 2: Violation detection on service_vm
-        # ------------------------------------------------------------------
+        # ── Étape 2 : Détection de violations sur service_vm ─────────
         violations: List[Dict] = self._detector.detect(
             current_data, predictions_map, slos, service_vm
         )
 
-        logger.info(
-            f"Violations detected: {len(violations)} — "
-            f"service_vm={service_vm!r} "
-            f"metrics={[v['metric'] for v in violations]}"
-        )
-
-        # ------------------------------------------------------------------
-        # Step 3: No violations → stay
-        # ------------------------------------------------------------------
-        if not violations:
-            return self._build_stay(
-                "No SLO violation detected", None, None, ts
+        if violations:
+            summary = "  ".join(
+                f"{v['metric']}({v['breach_type']})" for v in violations
+            )
+            logger.info(
+                f"⚠️  {len(violations)} violation(s) détectée(s) "
+                f"sur {service_vm} — {summary}"
+            )
+        else:
+            logger.info(
+                f"✅ Aucune violation SLO sur {service_vm} — décision STAY"
             )
 
-        # Dominant breach type: reactive > proactive
+        # ── Étape 3 : Aucune violation → stay ────────────────────────
+        if not violations:
+            return self._build_stay("No SLO violation detected", None, None, ts)
+
         breach_type: str = (
             "reactive"
             if any(v["breach_type"] == "reactive" for v in violations)
@@ -100,35 +63,30 @@ class DecisionHandler:
         )
         violated_metrics: List[str] = [v["metric"] for v in violations]
 
-        # ------------------------------------------------------------------
-        # Step 4: Filter candidate VMs
-        # ------------------------------------------------------------------
+        # ── Étape 4 : Filtrage des candidats ─────────────────────────
         all_candidates: List[Dict] = [
             v for v in current_data if v["vm_id"] != service_vm
         ]
 
         if not all_candidates:
+            logger.warning(
+                f"⚠️  Violation {breach_type} sur {violated_metrics} "
+                "— aucune VM cible disponible"
+            )
             return self._build_stay(
                 f"{breach_type} violation on {violated_metrics} — "
-                f"no migration targets available",
-                breach_type,
-                None,
-                ts,
+                "no migration targets available",
+                breach_type, None, ts,
             )
 
-        candidates = self._filter_candidates(
-            all_candidates, predictions_map, slos
-        )
-
+        candidates = self._filter_candidates(all_candidates, predictions_map, slos)
+        preferred  = len(candidates) < len(all_candidates)
         logger.info(
-            f"TOPSIS candidates: {[c['vm_id'] for c in candidates]} "
-            f"(preferred={len(candidates) < len(all_candidates)})",
-            extra={}
+            f"🔎 Candidats TOPSIS : {[c['vm_id'] for c in candidates]} "
+            f"| {'SLOs pré-satisfaits' if preferred else 'fallback tous candidats'}"
         )
 
-        # ------------------------------------------------------------------
-        # Step 5: TOPSIS selection
-        # ------------------------------------------------------------------
+        # ── Étape 5 : Sélection TOPSIS ───────────────────────────────
         best_candidate, topsis_score = self._topsis.select(
             candidates         = candidates,
             predictions_map    = predictions_map,
@@ -138,23 +96,26 @@ class DecisionHandler:
         )
 
         if not best_candidate:
+            logger.warning(
+                f"⚠️  TOPSIS n'a retourné aucun candidat "
+                f"— violation {breach_type} non résolue"
+            )
             return self._build_stay(
                 f"{breach_type} violation — TOPSIS returned no candidate",
-                breach_type,
-                None,
-                ts,
+                breach_type, None, ts,
             )
 
         to_vm: str = best_candidate["vm_id"]
-
         logger.info(
-            f"TOPSIS selected {to_vm!r} score={topsis_score} "
-            f"breach={breach_type!r}"
+            f"\n{'─'*50}\n"
+            f"  🎯 TOPSIS — meilleur candidat : {to_vm}\n"
+            f"  {'Score':<14}: {topsis_score}\n"
+            f"  {'Type breach':<14}: {breach_type}\n"
+            f"  {'Métriques':<14}: {', '.join(violated_metrics)}\n"
+            f"{'─'*50}"
         )
 
-        # ------------------------------------------------------------------
-        # Step 6: Emit migrate decision
-        # ------------------------------------------------------------------
+        # ── Étape 6 : Décision MIGRATE ───────────────────────────────
         return {
             "decision":     "migrate",
             "from_vm":      service_vm,
@@ -169,32 +130,12 @@ class DecisionHandler:
             "timestamp":    ts,
         }
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
     def _filter_candidates(
         self,
         all_candidates: List[Dict[str, Any]],
         predictions_map: Dict[str, Any],
         slos: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """
-        Return a prioritised subset of candidate VMs.
-
-        Preference: VMs whose weighted-mean predictions already satisfy
-        **all** active SLOs.  If none qualify, falls back to the full
-        *all_candidates* list so TOPSIS always has at least one option.
-
-        Parameters
-        ----------
-        all_candidates:
-            All VMs except service_vm.
-        predictions_map:
-            Predictions indexed by vm_id.
-        slos:
-            Active SLO list.
-        """
         def _satisfies_all(vm_id: str) -> bool:
             for slo in slos:
                 metric = slo["metric"]
@@ -225,7 +166,6 @@ class DecisionHandler:
         topsis_score: Optional[float],
         ts: str,
     ) -> Dict[str, Any]:
-        """Build a normalised ``"stay"`` response dict."""
         return {
             "decision":     "stay",
             "from_vm":      None,

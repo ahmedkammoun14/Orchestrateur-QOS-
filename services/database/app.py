@@ -1,7 +1,6 @@
-import json
 import logging
 import uvicorn
-from fastapi import FastAPI, Body, HTTPException, status
+from fastapi import FastAPI, Body, HTTPException, status, Request
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -9,44 +8,67 @@ from shared import config
 from services.database.redis_client import RedisClient
 
 
-# ---------------------------------------------------------------------------
-# Structured JSON logging
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────
+#  ANSI color codes
+# ─────────────────────────────────────────────
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+    WHITE  = "\033[97m"
 
-class _JSONFormatter(logging.Formatter):
-    """Emits every log record as a single-line JSON object."""
+
+class PrettyFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
+        "SUCCESS":  f"{C.GREEN}[SUCCESS]{C.RESET}",
+        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
+        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
+        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
+        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
+    }
 
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level":     record.levelname,
-            "service":   "database",
-            "event":     getattr(record, "event", "generic"),
-            "message":   record.getMessage(),
-        })
+        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
+        return f"{C.CYAN}{ts}{C.RESET}  {level}  {record.getMessage()}"
 
 
 def _setup_logger() -> logging.Logger:
-    """Configure and return the shared DatabaseService logger."""
+    # Add SUCCESS level
+    logging.SUCCESS = 25
+    logging.addLevelName(logging.SUCCESS, "SUCCESS")
+
     logger = logging.getLogger("DatabaseService")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        handler.setFormatter(_JSONFormatter())
+        handler.setFormatter(PrettyFormatter())
         logger.addHandler(handler)
+    logger.propagate = False
     return logger
 
 
 logger = _setup_logger()
 
-
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 
+logger.info(
+    f"\n{C.CYAN}═══════════════════════════════════════════════════════{C.RESET}\n"
+    f"  🚀  {C.BOLD}Database Service — Démarrage{C.RESET}\n"
+    f"  Port      : {C.CYAN}{config.DATABASE_PORT}{C.RESET}\n"
+    f"  Redis     : {C.CYAN}{config.REDIS_HOST}:{config.REDIS_PORT}{C.RESET}\n"
+    f"{C.CYAN}═══════════════════════════════════════════════════════{C.RESET}"
+)
+
 app = FastAPI(title="Database Service", version="2.1.0")
 
-# Logger is injected so RedisClient shares the same JSON-formatted handler.
 redis_client = RedisClient(logger)
 
 
@@ -56,24 +78,13 @@ redis_client = RedisClient(logger)
 
 @app.post("/store/metrics", status_code=status.HTTP_200_OK)
 async def store_metrics(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
-    """
-    Persist a per-VM metrics snapshot.
-
-    Expected payload::
-
-        {
-            "vm_id":      str,
-            "metrics":    {"latency": float|null, "cpu_usage": float|null, ...},
-            "timestamp":  str  (ISO-8601),
-            "reliability": float|null
-        }
-
-    Returns 200 on success, 400 on bad payload, 500 on Redis failure.
-    """
     vm_id: str | None = payload.get("vm_id")
     metrics: Any = payload.get("metrics")
 
+    logger.info(f"📥 Réception métriques pour {C.CYAN}{vm_id}{C.RESET} (metrics count: {len(metrics) if isinstance(metrics, dict) else 0})")
+
     if not vm_id or not isinstance(metrics, dict):
+        logger.error(f"❌ /store/metrics — payload invalide : vm_id={vm_id}, metrics={type(metrics).__name__}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="vm_id (str) and metrics (dict) are mandatory",
@@ -86,9 +97,10 @@ async def store_metrics(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
             timestamp=payload.get("timestamp"),
             reliability=payload.get("reliability"),
         )
+        logger.log(logging.SUCCESS, f"✅ Métriques persistées avec succès pour {C.GREEN}{vm_id}{C.RESET}")
         return {"status": "metrics_stored"}
     except Exception as exc:
-        logger.error(str(exc), extra={"event": "internal_error"})
+        logger.error(f"❌ Erreur interne /store/metrics pour {C.CYAN}{vm_id}{C.RESET} : {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Redis write failure",
@@ -97,20 +109,11 @@ async def store_metrics(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
 @app.post("/store/slos", status_code=status.HTTP_200_OK)
 async def store_slos(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
-    """
-    Overwrite the active SLOs entry (permanent, no TTL).
-
-    Expected payload::
-
-        {
-            "slos":      List[dict],
-            "timestamp": str  (ISO-8601)
-        }
-
-    Returns 200 on success, 400 on bad payload, 500 on Redis failure.
-    """
     slos = payload.get("slos")
+    logger.info(f"📥 Réception de nouveaux SLOs (count: {len(slos) if isinstance(slos, list) else 0})")
+
     if slos is None:
+        logger.error("❌ /store/slos — champ 'slos' manquant dans le payload")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="slos is mandatory",
@@ -122,9 +125,10 @@ async def store_slos(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
     try:
         redis_client.store_slos(slos=slos, timestamp=timestamp)
+        logger.log(logging.SUCCESS, f"✅ {C.GREEN}{len(slos)}{C.RESET} SLOs mis à jour en base")
         return {"status": "slos_stored"}
     except Exception as exc:
-        logger.error(str(exc), extra={"event": "internal_error"})
+        logger.error(f"❌ Erreur interne /store/slos : {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Redis write failure",
@@ -133,26 +137,18 @@ async def store_slos(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
 @app.post("/store/decision", status_code=status.HTTP_200_OK)
 async def store_decision(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
-    """
-    Append a migration decision to the FIFO decisions list (permanent).
+    decision = payload.get("decision")
+    from_vm = payload.get("from_vm")
+    to_vm = payload.get("to_vm")
+    
+    logger.info(f"📥 Réception décision : {C.CYAN}{decision}{C.RESET} ({from_vm} → {to_vm})")
 
-    Expected payload::
-
-        {
-            "decision":  str,
-            "from_vm":   str,
-            "to_vm":     str,
-            "reason":    str,
-            "timestamp": str  (ISO-8601)
-        }
-
-    Returns 200 on success, 400 on bad payload, 500 on Redis failure.
-    """
     if (
-        not payload.get("decision")
-        or not payload.get("from_vm")
-        or not payload.get("to_vm")
+        not decision
+        or from_vm is None
+        or to_vm is None
     ):
+        logger.error(f"❌ /store/decision — champs obligatoires manquants")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="decision, from_vm and to_vm are mandatory",
@@ -160,9 +156,10 @@ async def store_decision(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
     try:
         redis_client.store_decision(payload)
+        logger.log(logging.SUCCESS, f"✅ Décision {C.GREEN}{decision}{C.RESET} enregistrée")
         return {"status": "decision_stored"}
     except Exception as exc:
-        logger.error(str(exc), extra={"event": "internal_error"})
+        logger.error(f"❌ Erreur interne /store/decision : {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Redis write failure",
@@ -171,15 +168,11 @@ async def store_decision(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
-    """
-    Return service liveness and Redis reachability.
-
-    The service itself is always ``healthy`` if it can answer HTTP.
-    ``redis`` reflects the PING result.
-    """
+    redis_status = "connected" if redis_client.health_check() else "disconnected"
+    logger.debug(f"🔍 Health check : Redis est {redis_status}")
     return {
         "status": "healthy",
-        "redis": "connected" if redis_client.health_check() else "disconnected",
+        "redis": redis_status,
     }
 
 

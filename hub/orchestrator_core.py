@@ -18,26 +18,43 @@ from shared import config
 from shared.models import IntentToHubPayload, LatencyPayload, RTTMeasurement
 
 
-class JSONFormatter(logging.Formatter):
+# ─────────────────────────────────────────────
+#  ANSI color codes
+# ─────────────────────────────────────────────
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BLUE   = "\033[94m"
+    CYAN   = "\033[96m"
+    WHITE  = "\033[97m"
+
+
+class PrettyFormatter(logging.Formatter):
+    LEVEL_STYLES = {
+        "INFO":    f"{C.BLUE}[INFO]{C.RESET}",
+        "SUCCESS": f"{C.GREEN}[SUCCESS]{C.RESET}",
+        "WARNING": f"{C.YELLOW}[WARNING]{C.RESET}",
+        "ERROR":   f"{C.RED}[ERROR]{C.RESET}",
+        "DEBUG":   f"{C.CYAN}[DEBUG]{C.RESET}",
+        "CRITICAL":f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
+    }
+
     def format(self, record: logging.LogRecord) -> str:
-        log_record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level":     record.levelname,
-            "service":   "orchestrator_core",
-            "event":     getattr(record, "event", "generic"),
-            "message":   record.getMessage(),
-        }
-        if hasattr(record, "extra_data"):
-            log_record.update(record.extra_data)
-        return json.dumps(log_record)
+        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
+        msg   = record.getMessage()
+        return f"{C.CYAN}{ts}{C.RESET}  {level}  {msg}"
 
 
 def setup_logger() -> logging.Logger:
     log = logging.getLogger("OrchestratorCore")
-    log.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG)
     if not log.handlers:
         h = logging.StreamHandler()
-        h.setFormatter(JSONFormatter())
+        h.setFormatter(PrettyFormatter())
         log.addHandler(h)
     log.propagate = False
     return log
@@ -54,7 +71,6 @@ _URLS = {
     "decision_intelligence": f"http://{config.HUB_HOST}:{config.DECISION_INTELLIGENCE_PORT}",
 }
 
-# URL openstack_client — tourne sur le master OpenStack
 OPENSTACK_CLIENT_URL = f"http://{config.OPENSTACK_MASTER_IP}:{config.OPENSTACK_CLIENT_PORT}"
 
 
@@ -118,7 +134,7 @@ async def _post(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) ->
             return resp.json()
         return None
     except Exception as e:
-        logger.error(f"POST {url} failed: {e}", extra={"event": "internal_error"})
+        logger.error(f"❌ POST {C.CYAN}{url}{C.RESET} failed : {e}")
         return None
 
 def _threshold_map() -> Dict[str, float]:
@@ -171,10 +187,6 @@ def _extract_predictions(res: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _sync_active_vm(client: httpx.AsyncClient) -> None:
-    """
-    Synchronise state.service_vm avec le pod réellement actif sur kubectl.
-    Appelé au démarrage pour reprendre l'état réel après un redémarrage du hub.
-    """
     try:
         r = await client.get(f"{OPENSTACK_CLIENT_URL}/active_vm", timeout=5.0)
         if r.status_code == 200:
@@ -183,58 +195,51 @@ async def _sync_active_vm(client: httpx.AsyncClient) -> None:
             if active_vm and active_vm in config.VM_REGISTRY:
                 state.service_vm = active_vm
                 logger.info(
-                    f"service_vm synced from kubectl: {state.service_vm}",
-                    extra={"event": "service_vm_synced",
-                           "extra_data": {"active_vm": active_vm, "cluster": data.get("cluster")}}
+                    f"✅ VM active synchronisée depuis kubectl : "
+                    f"{C.GREEN}{state.service_vm}{C.RESET} "
+                    f"(cluster : {C.CYAN}{data.get('cluster')}{C.RESET})"
                 )
             else:
                 logger.warning(
-                    "No active pod found on kubectl — keeping default service_vm",
-                    extra={"event": "service_vm_sync_no_pod"}
+                    "⚠️  Aucun pod actif trouvé sur kubectl — "
+                    f"service_vm par défaut conservé : {C.YELLOW}{state.service_vm}{C.RESET}"
                 )
         else:
             logger.warning(
-                f"openstack_client /active_vm returned {r.status_code}",
-                extra={"event": "service_vm_sync_failed"}
+                f"⚠️  openstack_client /active_vm a retourné HTTP {r.status_code} "
+                "— synchronisation ignorée"
             )
     except Exception as e:
         logger.warning(
-            f"Could not sync active_vm from openstack_client: {e}",
-            extra={"event": "service_vm_sync_failed"}
+            f"⚠️  Impossible de synchroniser active_vm depuis openstack_client : {e}"
         )
 
 
 async def _execute_kubectl_migration(client: httpx.AsyncClient, from_vm: str, to_vm: str) -> bool:
-    """
-    Appelle openstack_client /migrate pour exécuter la migration kubectl réelle.
-    Retourne True si succès, False sinon.
-    """
     try:
         resp = await client.post(
             f"{OPENSTACK_CLIENT_URL}/migrate",
             json={"from_vm": from_vm, "to_vm": to_vm},
-            timeout=35.0  # kubectl peut prendre du temps
+            timeout=35.0
         )
         if resp.status_code == 200:
             data = resp.json()
             logger.info(
-                f"kubectl migration OK: {from_vm} → {to_vm} on {data.get('cluster')}",
-                extra={"event": "kubectl_migration_ok",
-                       "extra_data": {"from_vm": from_vm, "to_vm": to_vm, "cluster": data.get("cluster")}}
+                f"✅ Migration kubectl réussie : "
+                f"{C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET} "
+                f"| cluster : {C.CYAN}{data.get('cluster')}{C.RESET}"
             )
             return True
         else:
             logger.error(
-                f"kubectl migration failed: HTTP {resp.status_code}",
-                extra={"event": "kubectl_migration_failed",
-                       "extra_data": {"from_vm": from_vm, "to_vm": to_vm, "status": resp.status_code}}
+                f"❌ Échec migration kubectl : HTTP {resp.status_code} "
+                f"| {C.YELLOW}{from_vm}{C.RESET} → {C.RED}{to_vm}{C.RESET}"
             )
             return False
     except Exception as e:
         logger.error(
-            f"kubectl migration error: {e}",
-            extra={"event": "kubectl_migration_failed",
-                   "extra_data": {"from_vm": from_vm, "to_vm": to_vm, "error": str(e)}}
+            f"❌ Erreur lors de la migration kubectl : {e} "
+            f"| {C.YELLOW}{from_vm}{C.RESET} → {C.RED}{to_vm}{C.RESET}"
         )
         return False
 
@@ -244,16 +249,24 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
         return
 
     async with state._lock:
-        logger.info("Flow started", extra={"event": "flow_start",
-                    "extra_data": {"cycle": state.cycle_count, "mode": mode}})
+        logger.info(
+            f"{'═'*60}\n"
+            f"   🔄  Cycle #{C.BOLD}{state.cycle_count}{C.RESET}  |  "
+            f"Mode : {C.CYAN}{mode}{C.RESET}  |  "
+            f"VM active : {C.GREEN}{state.service_vm}{C.RESET}\n"
+            f"{'═'*60}"
+        )
 
         async with httpx.AsyncClient() as client:
             vm_ids  = list(config.VM_REGISTRY.keys())
             now_iso = datetime.now(timezone.utc).isoformat()
 
-            # --- ÉTAPE 1: SLOs ---
+            # ── ÉTAPE 1 : SLOs ──────────────────────────────────────────
             if state.cycle_count < state.BOOTSTRAP_MIN:
-                logger.info("Bootstrap phase", extra={"event": "bootstrap_phase"})
+                logger.info(
+                    f"🟡 Phase bootstrap ({state.cycle_count}/{state.BOOTSTRAP_MIN}) "
+                    "— SLOs initiaux appliqués"
+                )
                 state.current_slos = []
                 for metric, meta in config.METRICS_REGISTRY.items():
                     state.current_slos.append({
@@ -283,22 +296,29 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                     state.current_slos   = mm_res.get("slos", state.current_slos)
                     active_metrics       = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
                     state.last_mi_scores = mm_res.get("mi_scores", {})
-                    logger.info("SLOs updated", extra={"event": "slos_updated"})
+                    logger.info(
+                        f"📋 SLOs mis à jour — {C.CYAN}{len(state.current_slos)}{C.RESET} SLO(s) actif(s) "
+                        f"| métriques actives : {C.CYAN}{active_metrics}{C.RESET}"
+                    )
                 else:
                     active_metrics = list(config.METRICS_REGISTRY.keys())
+                    logger.warning("⚠️  MetricsManager indisponible — métriques par défaut utilisées")
 
-            # --- ÉTAPE 2: Persistance SLOs ---
+            # ── ÉTAPE 2 : Persistance SLOs ──────────────────────────────
             await _post(client, f"{_URLS['database']}/store/slos",
                         {"slos": state.current_slos, "timestamp": now_iso})
 
-            # --- ÉTAPE 3: Collecte métriques — toujours cpu + ram ---
+            # ── ÉTAPE 3 : Collecte métriques ────────────────────────────
             collector_metrics = [m for m in config.METRICS_REGISTRY.keys() if m != "latency"]
             coll_res = await _post(client, f"{_URLS['collector']}/collect",
                                    {"active_metrics": collector_metrics, "cycle": state.cycle_count})
             results  = coll_res.get("results", []) if coll_res else []
-            logger.info("Metrics collected", extra={"event": "metrics_collected"})
+            logger.info(
+                f"📡 Métriques collectées — {C.CYAN}{len(results)}{C.RESET} VM(s) "
+                f"| métriques : {C.CYAN}{collector_metrics}{C.RESET}"
+            )
 
-            # --- ÉTAPE 4: Persistance métriques ---
+            # ── ÉTAPE 4 : Persistance métriques ─────────────────────────
             rtt_lookup = {m.vm_id: m for m in measurements}
             new_collected: List[Dict[str, Any]] = []
 
@@ -321,11 +341,30 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
             await asyncio.gather(*persist_tasks)
             state.last_collected = new_collected
 
-            # --- ÉTAPE 5: Calcul is_violation ---
+            # Log récapitulatif des métriques collectées
+            for entry in new_collected:
+                vm_id = entry["vm_id"]
+                tag   = f"{C.GREEN}[ACTIVE]{C.RESET}" if vm_id == state.service_vm else f"{C.CYAN}[IDLE]{C.RESET}"
+                logger.debug(
+                    f"🔍 {tag} {C.BOLD}{vm_id}{C.RESET} — "
+                    f"RTT: {C.CYAN}{entry.get('latency')} ms{C.RESET}  "
+                    f"CPU: {C.CYAN}{entry.get('cpu_usage')} %{C.RESET}  "
+                    f"RAM: {C.CYAN}{entry.get('ram_usage')} %{C.RESET}  "
+                    f"Fiabilité: {C.CYAN}{entry.get('reliability')}{C.RESET}"
+                )
+
+            # ── ÉTAPE 5 : Vérification violations SLO ───────────────────
             svc_data  = next((r for r in state.last_collected if r["vm_id"] == state.service_vm), None)
             violation = _is_violation(svc_data, _threshold_map()) if svc_data else False
+            if violation:
+                logger.warning(
+                    f"⚠️  Violation SLO détectée sur {C.YELLOW}{state.service_vm}{C.RESET} "
+                    "— analyse de migration initiée"
+                )
+            else:
+                logger.info(f"✅ SLOs respectés sur {C.GREEN}{state.service_vm}{C.RESET}")
 
-            # --- ÉTAPE 6: Historiques pour TOUTES les VMs ---
+            # ── ÉTAPE 6 : Historiques de toutes les VMs ─────────────────
             hist_tasks = [
                 _post(client, f"{_URLS['history_loader']}/load", {
                     "vm_id": vid,
@@ -338,8 +377,12 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                 vid: (res.get("histories", {}) if res else {})
                 for vid, res in zip(vm_ids, hist_responses)
             }
+            logger.info(
+                f"📚 Historiques chargés pour {C.CYAN}{len(vm_ids)}{C.RESET} VM(s) "
+                f"| fenêtre : {C.CYAN}{config.HISTORY_WINDOW}{C.RESET} points"
+            )
 
-            # --- ÉTAPE 7: Prédictions ML — TOUTES les VMs en parallèle ---
+            # ── ÉTAPE 7 : Prédictions ML (toutes VMs en parallèle) ──────
             new_predictions: Dict[str, Dict[str, Any]] = {vid: {} for vid in vm_ids}
 
             p_responses = await asyncio.gather(*[
@@ -352,13 +395,28 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                     new_predictions[vid] = _extract_predictions(res)
 
             state.last_predictions = new_predictions
-            logger.info("Predictions done", extra={"event": "predictions_done"})
+            successful_preds = sum(1 for v in new_predictions.values() if v)
+            logger.info(
+                f"🤖 Prédictions ML générées — "
+                f"{C.GREEN}{successful_preds}{C.RESET}/{len(vm_ids)} VM(s)"
+            )
+            for vid, preds in new_predictions.items():
+                if preds:
+                    lat  = preds.get("latency",   {}).get("predictions", ["N/A"])[0]
+                    cpu  = preds.get("cpu_usage",  {}).get("predictions", ["N/A"])[0]
+                    ram  = preds.get("ram_usage",  {}).get("predictions", ["N/A"])[0]
+                    logger.debug(
+                        f"🔍 Prédiction {C.BOLD}{vid}{C.RESET} — "
+                        f"Latence: {C.CYAN}{lat} ms{C.RESET}  "
+                        f"CPU: {C.CYAN}{cpu} %{C.RESET}  "
+                        f"RAM: {C.CYAN}{ram} %{C.RESET}"
+                    )
 
             # Snapshot stable pour GET /data
             state.snapshot_collected   = list(state.last_collected)
             state.snapshot_predictions = dict(state.last_predictions)
 
-            # --- ÉTAPE 8: Décision ---
+            # ── ÉTAPE 8 : Décision ───────────────────────────────────────
             current_data = []
             for lc in state.last_collected:
                 entry = {"vm_id": lc["vm_id"]}
@@ -379,7 +437,12 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                 }
             }
             if di_payload["cooldown_active"]:
-                logger.info("Cooldown active", extra={"event": "cooldown_active"})
+                elapsed = time.monotonic() - state.last_migration_ts
+                remaining = config.MIGRATION_COOLDOWN_S - elapsed
+                logger.warning(
+                    f"⏳ Cooldown actif — migration bloquée "
+                    f"({C.YELLOW}{remaining:.0f}s{C.RESET} restante(s))"
+                )
 
             if not di_payload["cooldown_active"]:
                 di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
@@ -391,77 +454,120 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
 
             if di_res:
                 state.last_decision = di_res
-                logger.info("Decision made", extra={"event": "decision_made", "extra_data": di_res})
+                decision    = di_res.get("decision", "?")
+                reason      = di_res.get("reason", "—")
+                topsis      = di_res.get("topsis_score")
+                breach      = di_res.get("breach_type", "—")
 
-                if di_res.get("decision") == "migrate":
+                if decision == "migrate":
                     from_vm = di_res["from_vm"]
                     to_vm   = di_res["to_vm"]
+                    logger.info(
+                        f"\n{'═'*60}\n"
+                        f"  🎯 DÉCISION : {C.BOLD}{C.YELLOW}MIGRATION{C.RESET}\n"
+                        f"  {'Source':<16}: {C.RED}{from_vm}{C.RESET}\n"
+                        f"  {'Destination':<16}: {C.GREEN}{to_vm}{C.RESET}\n"
+                        f"  {'Raison':<16}: {C.CYAN}{reason}{C.RESET}\n"
+                        f"  {'Score TOPSIS':<16}: {C.CYAN}{topsis}{C.RESET}\n"
+                        f"  {'Type violation':<16}: {C.YELLOW}{breach}{C.RESET}\n"
+                        f"{'═'*60}"
+                    )
 
-                    # --- ÉTAPE 9: Persistance décision ---
+                    # ── ÉTAPE 9 : Persistance décision ──────────────────
                     await _post(client, f"{_URLS['database']}/store/decision", di_res)
 
-                    # --- ÉTAPE 10a: Migration kubectl réelle via openstack_client ---
+                    # ── ÉTAPE 10a : Migration kubectl via openstack_client
                     kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
                     if not kubectl_ok:
                         logger.warning(
-                            f"kubectl migration failed — state updated anyway",
-                            extra={"event": "kubectl_migration_warning",
-                                   "extra_data": {"from_vm": from_vm, "to_vm": to_vm}}
+                            f"⚠️  Migration kubectl échouée — "
+                            f"état interne mis à jour malgré tout "
+                            f"({C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET})"
                         )
 
-                    # --- ÉTAPE 10b: Mise à jour état interne ---
+                    # ── ÉTAPE 10b : Mise à jour état interne ────────────
                     state.service_vm        = to_vm
                     state.last_migration_ts = time.monotonic()
                     logger.info(
-                        f"Migration complete → {to_vm}",
-                        extra={"event": "migration_executed",
-                               "extra_data": {"from_vm": from_vm, "to_vm": to_vm, "kubectl_ok": kubectl_ok}}
+                        f"✅ Migration effectuée — "
+                        f"nouvelle VM active : {C.GREEN}{C.BOLD}{to_vm}{C.RESET} "
+                        f"| kubectl : {'OK' if kubectl_ok else C.RED+'ÉCHEC'+C.RESET}"
+                    )
+                else:
+                    logger.info(
+                        f"🟢 Décision : {C.GREEN}MAINTIEN{C.RESET} sur {C.CYAN}{state.service_vm}{C.RESET} "
+                        f"| raison : {reason}"
                     )
 
-        logger.info("Flow complete", extra={"event": "flow_complete"})
+        logger.info(
+            f"✅ Cycle #{C.BOLD}{state.cycle_count}{C.RESET} terminé\n"
+            f"{'─'*60}"
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    logger.info(
+        f"\n{'═'*60}\n"
+        f"  🚀  {C.BOLD}QoS Orchestrator Core — Démarrage{C.RESET}\n"
+        f"{'═'*60}"
+    )
+
     success = True
     async with httpx.AsyncClient() as client:
-        # Health check tous les services locaux
+        logger.info("🔍 Vérification de l'état des services dépendants...")
         for name, url in _URLS.items():
             try:
                 r = await client.get(f"{url}/health", timeout=2.0)
                 if r.status_code == 200:
-                    logger.info(f"Service {name} OK", extra={"event": "health_check_ok"})
+                    logger.info(f"  ✅ {C.GREEN}{name:<25}{C.RESET} opérationnel")
                 else:
-                    logger.error(f"Service {name} failed: {r.status_code}",
-                                 extra={"event": "health_check_failed"})
+                    logger.error(f"  ❌ {C.RED}{name:<25}{C.RESET} HTTP {r.status_code}")
                     success = False
             except Exception as e:
-                logger.error(f"Service {name} unreachable: {e}",
-                             extra={"event": "health_check_failed"})
+                logger.error(f"  ❌ {C.RED}{name:<25}{C.RESET} injoignable — {e}")
                 success = False
 
         # Health check openstack_client
         try:
             r = await client.get(f"{OPENSTACK_CLIENT_URL}/health", timeout=3.0)
             if r.status_code == 200:
-                logger.info("Service openstack_client OK", extra={"event": "health_check_ok"})
+                logger.info(f"  ✅ {C.GREEN}{'openstack_client':<25}{C.RESET} opérationnel")
             else:
-                logger.warning("openstack_client unreachable — migrations won't be executed",
-                               extra={"event": "health_check_warning"})
+                logger.warning(
+                    f"  ⚠️  {C.YELLOW}openstack_client{C.RESET} injoignable "
+                    "— les migrations ne seront pas exécutées"
+                )
         except Exception as e:
-            logger.warning(f"openstack_client unreachable: {e} — migrations won't be executed",
-                           extra={"event": "health_check_warning"})
+            logger.warning(
+                f"  ⚠️  {C.YELLOW}openstack_client{C.RESET} injoignable : {e} "
+                "— les migrations ne seront pas exécutées"
+            )
 
         # Synchroniser service_vm avec kubectl au démarrage
         await _sync_active_vm(client)
 
     if not success:
-        logger.warning("Starting with some services down", extra={"event": "startup_warning"})
+        logger.warning(
+            "⚠️  Certains services sont indisponibles au démarrage — "
+            "l'orchestrateur démarre en mode dégradé"
+        )
 
-    logger.info("Core started", extra={"event": "core_started",
-                "extra_data": {"service_vm": state.service_vm, "mode": state._mode}})
+    logger.info(
+        f"\n{'═'*60}\n"
+        f"  {C.GREEN}✅  Orchestrateur prêt{C.RESET}\n"
+        f"  {'Mode':<16}: {C.CYAN}{state._mode}{C.RESET}\n"
+        f"  {'VM active':<16}: {C.GREEN}{state.service_vm}{C.RESET}\n"
+        f"  {'Bootstrap min':<16}: {C.CYAN}{state.BOOTSTRAP_MIN} cycles{C.RESET}\n"
+        f"  {'Cooldown':<16}: {C.CYAN}{config.MIGRATION_COOLDOWN_S}s{C.RESET}\n"
+        f"{'═'*60}\n"
+    )
     yield
-    logger.info("Core shutting down", extra={"event": "shutdown"})
+    logger.info(
+        f"\n{'─'*60}\n"
+        f"  🛑  {C.YELLOW}Arrêt de l'orchestrateur en cours...{C.RESET}\n"
+        f"{'─'*60}"
+    )
 
 
 app = FastAPI(title="QoS Orchestrator Core", version="2.0.0", lifespan=lifespan)
@@ -478,8 +584,14 @@ async def receive_rtt(payload: LatencyPayload):
 async def receive_intent(payload: Dict[str, Any] = Body(...)):
     state.current_slos = payload.get("slos", [])
     state._mode = "enhanced"
-    logger.info("Intent applied", extra={"event": "intent_applied",
-                "extra_data": {"intent_id": payload.get("intent_id")}})
+    intent_id = payload.get("intent_id", "—")
+    logger.info(
+        f"\n{'═'*60}\n"
+        f"  📥 Intent reçu — mode Enhanced activé\n"
+        f"  {'ID':<16}: {C.CYAN}{intent_id}{C.RESET}\n"
+        f"  {'SLOs injectés':<16}: {C.CYAN}{len(state.current_slos)}{C.RESET}\n"
+        f"{'═'*60}"
+    )
     return {"status": "accepted", "mode": state._mode, "slos": len(state.current_slos)}
 
 
