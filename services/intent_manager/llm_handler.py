@@ -35,6 +35,12 @@ class LLMHandler:
     Level 1 : Ollama LLM (qwen2.5) avec contexte RAG résumé
     Level 2 : Regex — patterns explicites (latency < 100ms)
     Level 3 : Keywords — profils sémantiques (streaming, critique, etc.)
+
+    Si le niveau 1 (LLM) produit le résultat, il gère lui-même la cohérence
+    avec les SLOs actifs (active_slos) selon le sens de l'intention — la
+    stratégie REFINE du SLOMerger est alors désactivée pour ne pas écraser
+    son résultat. REFINE reste actif comme filet de sécurité pour les
+    niveaux 2/3, qui n'ont aucune intelligence sémantique.
     """
 
     def __init__(self):
@@ -50,9 +56,11 @@ class LLMHandler:
         context = await self.rag_builder.build()
 
         result = await self._level1_llm(intention, context)
+        source_level = 1
 
         if not result:
             result = self._level2_regex(intention)
+            source_level = 2
             if result:
                 logger.info(
                     f"🔁 Niveau 2 activé — extraction par regex "
@@ -61,6 +69,7 @@ class LLMHandler:
 
         if not result:
             result = self._level3_keywords(intention)
+            source_level = 3
             if result:
                 logger.info(
                     f"🔁 Niveau 3 activé — extraction par mots-clés "
@@ -78,7 +87,13 @@ class LLMHandler:
         normalized = self._normalize_and_validate(result)
 
         active_slos = [SLO(**s) for s in context.get("active_slos", [])]
-        final_slos = self.merger.merge(active_slos, normalized, intention)
+
+        # REFINE désactivé si le LLM (niveau 1) a produit le résultat —
+        # il a déjà géré la cohérence avec l'existant lui-même via le prompt.
+        final_slos = self.merger.merge(
+            active_slos, normalized, intention,
+            allow_refine=(source_level != 1)
+        )
 
         # Garantit que tous les SLOs finaux sont marqués primaires
         for s in final_slos:
@@ -90,6 +105,7 @@ class LLMHandler:
 
         logger.info(
             f"✅ SLOs primaires extraits et validés — {len(final_slos)} SLO(s) "
+            f"| niveau source : {source_level} "
             f"| métriques : {[s.metric for s in final_slos]}"
         )
         return final_slos
@@ -105,6 +121,19 @@ class LLMHandler:
 État actuel du système : {json.dumps(rag_summary, ensure_ascii=False)}
 Convertis cette intention utilisateur en une liste JSON de SLOs réseau.
 Métriques disponibles : latency (ms), cpu_usage (%), ram_usage (%).
+
+RÈGLE IMPORTANTE — cohérence avec l'existant :
+Si l'intention fait référence à une amélioration ou un changement relatif
+par rapport à l'état actuel (ex: "plus rapide", "encore mieux", "moins de
+charge CPU", "améliore le streaming") SANS préciser de chiffre exact,
+utilise les SLOs listés dans "active_slos" comme référence pour la ou les
+métriques concernées, et propose un nouveau seuil cohérent avec le sens de
+l'intention (plus strict si on demande mieux, plus permissif si on demande
+moins strict).
+Si l'intention donne un chiffre explicite, utilise-le tel quel.
+Si l'intention ne fait pas référence à l'existant pour une métrique donnée,
+ignore active_slos pour cette métrique et utilise ton jugement d'expert QoS.
+
 Intention : "{text}"
 Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
 [{{"metric": "latency", "operator": "<", "threshold": 100.0, "unit": "ms", "weight": 1.0, "target": 80.0, "window": "5m"}}]
@@ -232,24 +261,42 @@ Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
             m = r.get("metric", "").lower()
             r["metric"] = norm_map.get(m, m)
 
-            if r["metric"] == "latency":
-                r["threshold"] = max(
-                    config.LATENCY_MIN,
-                    min(config.LATENCY_MAX, r.get("threshold", 200.0))
-                )
-            elif r["metric"] in ["cpu_usage", "ram_usage"]:
-                r["threshold"] = max(
-                    config.USAGE_MIN,
-                    min(config.USAGE_MAX, r.get("threshold", 80.0))
-                )
+            # Récupération défensive du threshold — gère à la fois clé absente
+            # ET clé présente avec valeur None (cas où le LLM renvoie un null)
+            raw_threshold = r.get("threshold")
 
-            r.setdefault("target",           r["threshold"] * 0.9)
-            r.setdefault("window",           "5m")
-            r.setdefault("weight",           1.0 / len(raw_list))
+            if r["metric"] == "latency":
+                default_thr = 200.0
+                base = raw_threshold if raw_threshold is not None else default_thr
+                r["threshold"] = max(config.LATENCY_MIN, min(config.LATENCY_MAX, float(base)))
+            elif r["metric"] in ["cpu_usage", "ram_usage"]:
+                default_thr = 80.0
+                base = raw_threshold if raw_threshold is not None else default_thr
+                r["threshold"] = max(config.USAGE_MIN, min(config.USAGE_MAX, float(base)))
+            else:
+                # Métrique inconnue — pas de bornes définies, on garde la valeur
+                # ou on écarte le SLO si threshold est totalement absent/None
+                if raw_threshold is None:
+                    logger.warning(f"⚠️  SLO ignoré — métrique '{r['metric']}' sans threshold valide")
+                    continue
+                r["threshold"] = float(raw_threshold)
+
+            # target : défensif contre target=None explicite
+            raw_target = r.get("target")
+            r["target"] = float(raw_target) if raw_target is not None else r["threshold"] * 0.9
+
+            r.setdefault("window", "5m")
+
+            raw_weight = r.get("weight")
+            r["weight"] = float(raw_weight) if raw_weight is not None else 1.0 / len(raw_list)
+
             r.setdefault("budget_remaining", 100.0)
-            r.setdefault("violations",       0)
-            r.setdefault("confidence",       0.8)
-            r.setdefault("is_primary",       True)  # objectif explicite utilisateur
+            r.setdefault("violations", 0)
+
+            raw_confidence = r.get("confidence")
+            r["confidence"] = float(raw_confidence) if raw_confidence is not None else 0.8
+
+            r.setdefault("is_primary", True)  # objectif explicite utilisateur
 
             try:
                 valid_slos.append(SLO(**r))

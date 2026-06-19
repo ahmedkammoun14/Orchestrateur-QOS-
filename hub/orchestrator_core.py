@@ -82,6 +82,11 @@ class OrchestratorState:
         self.bootstrap_cycles: int = 0
         self.BOOTSTRAP_MIN: int = 5
         self.current_slos: List[Dict[str, Any]] = []
+        # Poids originaux des SLOs primaires issus de la dernière intention
+        # (mode enhanced) — préservés pour éviter la dilution cumulative
+        # du poids cycle après cycle. Réinitialisés à chaque nouvelle
+        # intention reçue via /intent.
+        self.original_intent_weights: Dict[str, float] = {}
         self.cycle_count: int = 0
         self.last_decision: Dict[str, Any] = {}
         self.last_mi_scores: Dict[str, float] = {}
@@ -161,12 +166,14 @@ def _threshold_map() -> Dict[str, float]:
 
 def _is_violation(record: Dict[str, Any], thresholds: Dict[str, float]) -> bool:
     """
-    Détecte une violation sur l'enregistrement en se basant sur les SLOs
-    réellement actifs (présents dans current_slos).
+    Détecte une violation sur l'enregistrement en se basant UNIQUEMENT
+    sur les SLOs primaires (objectif métier courant — fixe en autonomous,
+    défini par l'intention en enhanced), pas sur les SLOs secondaires
+    adaptatifs.
     """
-    active_metrics = {s["metric"] for s in state.current_slos}
+    active_metrics = {s["metric"] for s in state.current_slos if s.get("is_primary", False)}
     for metric, meta in config.METRICS_REGISTRY.items():
-        # Ne considère que les métriques qui ont un SLO actif
+        # Ne considère que les métriques qui ont un SLO primaire actif
         if metric not in active_metrics:
             continue
         val = record.get(metric)
@@ -333,6 +340,15 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                 svc_hists = h_res.get("histories", {}) if h_res else {}
 
                 if mode == "enhanced":
+                    # Restaure les poids originaux de l'intention sur les
+                    # SLOs primaires avant recalcul — évite l'effet cumulatif
+                    # de dilution cycle après cycle (sinon
+                    # weight_LLM × MI × MI × MI... à chaque appel, au lieu
+                    # de toujours weight_LLM_original × MI_courant).
+                    for slo in state.current_slos:
+                        if slo.get("is_primary") and slo["metric"] in state.original_intent_weights:
+                            slo["weight"] = state.original_intent_weights[slo["metric"]]
+
                     mm_payload = {"slos": state.current_slos, "history": _zip_histories(svc_hists, _threshold_map())}
                     mm_url = f"{_URLS['metrics_manager']}/validate"
                 else:
@@ -476,6 +492,11 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                     entry[meta["payload_key"]] = lc.get(m)
                 current_data.append(entry)
 
+            # Lookup explicite par vm_id — évite tout risque de désalignement
+            # positionnel entre vm_ids et state.last_collected (ex. si une VM
+            # est omise par le collector, ou si l'ordre change un jour).
+            collected_lookup = {lc["vm_id"]: lc for lc in state.last_collected}
+
             di_payload = {
                 "current_data":      current_data,
                 "predictions_map":   state.last_predictions,
@@ -484,8 +505,8 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
                 "cooldown_active":   state.check_cooldown(),
                 "migration_costs":   {vid: 0 for vid in vm_ids},
                 "reliability_scores": {
-                    vid: lc.get("reliability", 1.0)
-                    for vid, lc in zip(vm_ids, state.last_collected)
+                    vid: collected_lookup.get(vid, {}).get("reliability", 1.0)
+                    for vid in vm_ids
                 }
             }
             if di_payload["cooldown_active"]:
@@ -640,6 +661,14 @@ async def receive_rtt(payload: LatencyPayload):
 @app.post("/intent", status_code=status.HTTP_200_OK)
 async def receive_intent(payload: Dict[str, Any] = Body(...)):
     state.current_slos = payload.get("slos", [])
+    # Capture les poids originaux du LLM pour chaque SLO primaire — base
+    # fixe utilisée à chaque cycle suivant pour éviter la dilution
+    # cumulative (voir restauration dans _run_flow, étape SLOs).
+    state.original_intent_weights = {
+        s["metric"]: s.get("weight", 1.0)
+        for s in state.current_slos
+        if s.get("is_primary", False)
+    }
     state._mode = "enhanced"
     intent_id = payload.get("intent_id", "—")
     logger.info(
@@ -647,6 +676,7 @@ async def receive_intent(payload: Dict[str, Any] = Body(...)):
         f"  📥 Intent reçu — mode Enhanced activé\n"
         f"  {'ID':<16}: {C.CYAN}{intent_id}{C.RESET}\n"
         f"  {'SLOs injectés':<16}: {C.CYAN}{len(state.current_slos)}{C.RESET}\n"
+        f"  {'Poids originaux':<16}: {C.CYAN}{state.original_intent_weights}{C.RESET}\n"
         f"{'═'*60}"
     )
     return {"status": "accepted", "mode": state._mode, "slos": len(state.current_slos)}
@@ -666,6 +696,7 @@ async def get_status():
         "bootstrap_active": state.cycle_count < state.BOOTSTRAP_MIN,
         "cooldown_active":  state.check_cooldown(),
         "slos_count":       len(state.current_slos),
+        "active_slos":      state.current_slos,
         "last_decision":    state.last_decision.get("decision"),
         "timestamp":        datetime.now(timezone.utc).isoformat(),
     }

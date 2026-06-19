@@ -13,7 +13,9 @@ _RELIABILITY_WEIGHT: float = 0.3
 
 def vm_satisfies_slo(mean: float, slo: Dict[str, Any]) -> bool:
     """Return True if *mean* meets the SLO threshold given its operator."""
-    op, t = slo["operator"], float(slo["threshold"])
+    op = slo["operator"]
+    t_raw = slo.get("threshold")
+    t = float(t_raw) if t_raw is not None else 0.0
     return (
         (op == "<"  and mean <  t) or
         (op == "<=" and mean <= t) or
@@ -63,27 +65,37 @@ class TopsisSelector:
 
             for metric in slo_metrics:
                 meta  = config.METRICS_REGISTRY[metric]
-                preds: List[float] = (
+                preds_raw: List[Any] = (
                     predictions_map
                     .get(vm_id, {})
                     .get(metric, {})
                     .get("predictions", [])
                 )
+                # Filtre toute valeur None résiduelle dans les prédictions
+                preds: List[float] = [p for p in preds_raw if p is not None]
+
                 if preds:
                     row.append(self.calculate_weighted_mean(preds))
                 else:
                     payload_key: str = meta.get("payload_key", metric)
-                    row.append(float(cand.get(payload_key, meta["default_threshold"])))
+                    val = cand.get(payload_key)
+                    row.append(float(val) if val is not None else float(meta["default_threshold"]))
 
             row.append(self._budget_score(vm_id, predictions_map, slos, slo_metrics))
-            row.append(float(migration_costs.get(vm_id, 0)))
-            row.append(1.0 - float(reliability_scores.get(vm_id, 0.0)))
+
+            mig_cost = migration_costs.get(vm_id)
+            row.append(float(mig_cost) if mig_cost is not None else 0.0)
+
+            rel = reliability_scores.get(vm_id)
+            row.append(1.0 - float(rel) if rel is not None else 1.0)
+
             matrix.append(row)
 
         # Steps 2–6
         norm_m  = self._minmax_normalise(matrix, n_vm, n_cr)
         weights = (
-            [float(slo_map[m]["weight"]) for m in slo_metrics]
+            [float(slo_map[m]["weight"]) if slo_map[m].get("weight") is not None else 0.0
+             for m in slo_metrics]
             + [_BUDGET_WEIGHT, _MIGRATION_WEIGHT, _RELIABILITY_WEIGHT]
         )
         w_m = [
@@ -142,12 +154,13 @@ class TopsisSelector:
             if slo is None:
                 continue
             total += 1
-            preds: List[float] = (
+            preds_raw: List[Any] = (
                 predictions_map
                 .get(vm_id, {})
                 .get(metric, {})
                 .get("predictions", [])
             )
+            preds: List[float] = [p for p in preds_raw if p is not None]
             if preds and vm_satisfies_slo(self.calculate_weighted_mean(preds), slo):
                 satisfied += 1
         if total == 0:

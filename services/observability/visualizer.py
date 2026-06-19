@@ -66,6 +66,7 @@ class QoSDashboard:
             vm: {m: deque(maxlen=100) for m in self._metric_keys}
             for vm in self._vm_ids
         }
+        # Historique des poids normalisés des SLOs actifs (somme = 1)
         self._hist_mi: Dict[str, deque] = {
             m: deque(maxlen=100) for m in self._metric_keys
         }
@@ -157,13 +158,18 @@ class QoSDashboard:
                 preds = vm_data.get("predictions", {}).get(metric, [])
                 self._preds[vm][metric] = [float(p) for p in preds]
 
-        mi_raw = data.get("mi_scores", {})
+        # Poids des SLOs réellement actifs et utilisés par TOPSIS (somme = 1)
+        # Remplace les anciens scores MI bruts par les poids normalisés
+        # — une métrique non retenue comme SLO ce cycle a un poids de 0.
+        slos = data.get("slos", [])
+        weights_by_metric: Dict[str, float] = {
+            s["metric"]: s.get("weight") for s in slos if "metric" in s
+        }
+
         for metric in self._metric_keys:
-            score = mi_raw.get(metric)
-            if score is not None:
-                self._hist_mi[metric].append(float(score))
-        if any(mi_raw.get(m) is not None for m in self._metric_keys):
-            self._cycles_mi.append(cycle)
+            weight = weights_by_metric.get(metric)
+            self._hist_mi[metric].append(float(weight) if weight is not None else 0.0)
+        self._cycles_mi.append(cycle)
 
     def _draw(self) -> None:
         data = self._last_data
@@ -303,6 +309,13 @@ class QoSDashboard:
                 ax.set_xlim(x_start, x_end + 0.5)
 
     def _draw_mi_panel(self) -> None:
+        """
+        Affiche les poids normalisés des SLOs actifs (utilisés directement
+        par TOPSIS pour la décision de migration). La somme des poids
+        affichés à un instant donné vaut toujours 1.0 (tant qu'au moins
+        un SLO est actif) — une métrique non retenue comme SLO ce cycle
+        a un poids de 0.
+        """
         ax = self.ax_mi
         ax.cla()
 
@@ -321,18 +334,14 @@ class QoSDashboard:
             ax.plot(x[-1], scores[-1], "o", color=color, markersize=5, zorder=4)
 
         if not has_data:
-            ax.text(0.5, 0.5, "Waiting for MI data…",
+            ax.text(0.5, 0.5, "Waiting for SLO weight data…",
                     ha="center", va="center", fontsize=11, color="#90A4AE",
                     transform=ax.transAxes)
 
-        ax.axhline(config.MI_RELATIVE_THRESHOLD,
-                   color="#C62828", linewidth=1.4, linestyle="--", alpha=0.85,
-                   label=f"Seuil relatif ({config.MI_RELATIVE_THRESHOLD:.2f})", zorder=2)
-
-        ax.set_title("MI Scores — influence sur les SLOs",
+        ax.set_title("Poids des SLOs actifs — pondération TOPSIS (somme = 1)",
                      fontsize=11, fontweight="bold", color="#263238", pad=6)
         ax.set_xlabel("Cycle", fontsize=9, color="#546E7A")
-        ax.set_ylabel("Score MI", fontsize=9, color="#546E7A")
+        ax.set_ylabel("Poids normalisé", fontsize=9, color="#546E7A")
         ax.set_ylim(-0.02, 1.05)
         ax.tick_params(labelsize=8)
         ax.grid(True, alpha=0.4, linestyle="--", linewidth=0.6)

@@ -9,13 +9,19 @@ class SLOMerger:
     """
     Advanced logic for merging new intentions with existing/active SLOs.
     Supports REPLACE, ADDITIVE, and REFINE strategies.
+
+    REFINE n'est autorisé que lorsque allow_refine=True — ce paramètre est
+    mis à False par le LLMHandler quand le résultat provient du niveau 1
+    (LLM), qui a déjà géré lui-même la cohérence avec les SLOs actifs via
+    le prompt. REFINE reste actif pour les niveaux 2/3 (regex/keywords),
+    qui n'ont aucune intelligence sémantique propre.
     """
 
-    def merge(self, active_slos: List[SLO], new_slos: List[SLO], text: str) -> List[SLO]:
+    def merge(self, active_slos: List[SLO], new_slos: List[SLO], text: str, allow_refine: bool = True) -> List[SLO]:
         text_lower = text.lower()
 
         # 1. Determine Strategy
-        if any(kw in text_lower for kw in ["plus strict", "moins strict", "affine", "plus de", "moins de"]):
+        if allow_refine and any(kw in text_lower for kw in ["plus strict", "moins strict", "affine", "plus de", "moins de"]):
             mode = "REFINE"
         elif any(kw in text_lower for kw in ["aussi", "et", "ajoute", "en plus"]):
             mode = "ADDITIVE"
@@ -24,7 +30,8 @@ class SLOMerger:
 
         logger.info(
             f"🔀 Stratégie de fusion SLOs : {mode} "
-            f"| SLOs actifs : {len(active_slos)} | nouveaux SLOs : {len(new_slos)}"
+            f"| SLOs actifs : {len(active_slos)} | nouveaux SLOs : {len(new_slos)} "
+            f"| REFINE autorisé : {allow_refine}"
         )
 
         # 2. Execute Strategy
