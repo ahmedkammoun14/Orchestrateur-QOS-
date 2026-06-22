@@ -1,41 +1,13 @@
 import logging
 import uvicorn
-from fastapi import FastAPI, HTTPException, status, Body
 from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, status, Body
 from typing import Dict, Any
 
 from shared import config
+from shared.logging_utils import C, PrettyFormatter
 from shared.models import SLO
 from services.metrics_manager.metrics_handler import MetricsHandler
-
-
-# ─────────────────────────────────────────────
-#  ANSI color codes
-# ─────────────────────────────────────────────
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-
-
-class PrettyFormatter(logging.Formatter):
-    LEVEL_STYLES = {
-        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
-        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
-        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
-        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
-        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
-        msg   = record.getMessage()
-        return f"{C.CYAN}{ts}{C.RESET}  {level}  {msg}"
 
 
 def setup_logger():

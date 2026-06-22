@@ -1,13 +1,27 @@
 import math
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from shared import config
 
 logger = logging.getLogger("DecisionIntelligence.handler")
 
+
+def _fmt_table(title: str, headers: List[str], rows: List[List[str]]) -> str:
+    """Formate un tableau ASCII avec bordures pour le logging."""
+    col_w = [
+        max(len(h), max((len(r[i]) for r in rows), default=0))
+        for i, h in enumerate(headers)
+    ]
+    top    = "┌" + "┬".join("─" * (w + 2) for w in col_w) + "┐"
+    hdr    = "│" + "│".join(f" {h:<{w}} " for h, w in zip(headers, col_w)) + "│"
+    sep    = "├" + "┼".join("─" * (w + 2) for w in col_w) + "┤"
+    bot    = "└" + "┴".join("─" * (w + 2) for w in col_w) + "┘"
+    data   = ["│" + "│".join(f" {c:<{w}} " for c, w in zip(row, col_w)) + "│" for row in rows]
+    lines  = [top, hdr, sep] + data + [bot]
+    return "\n  " + title + "\n  " + "\n  ".join(lines)
+
 _BUDGET_WEIGHT:      float = 1.0
-_MIGRATION_WEIGHT:   float = 0.5
 _RELIABILITY_WEIGHT: float = 0.3
 
 
@@ -27,6 +41,9 @@ def vm_satisfies_slo(mean: float, slo: Dict[str, Any]) -> bool:
 class TopsisSelector:
     """
     7-step TOPSIS with min-max normalisation for VM candidate ranking.
+    Critères : métriques SLO (latency/cpu/ram), budget de conformité,
+    fiabilité. Le coût de migration a été retiré — non instrumenté,
+    aucune mesure réelle disponible (voir notes de conception).
     Stateless — no I/O, no side effects.
     """
 
@@ -35,7 +52,6 @@ class TopsisSelector:
         candidates: List[Dict[str, Any]],
         predictions_map: Dict[str, Dict[str, Any]],
         slos: List[Dict[str, Any]],
-        migration_costs: Dict[str, int],
         reliability_scores: Dict[str, float],
     ) -> Tuple[Dict[str, Any], float]:
         if not candidates:
@@ -55,7 +71,7 @@ class TopsisSelector:
         slo_metrics: List[str] = list(slo_map.keys())
 
         n_vm: int = len(candidates)
-        n_cr: int = len(slo_metrics) + 3
+        n_cr: int = len(slo_metrics) + 2  # métriques SLO + budget + fiabilité
 
         # Step 1 — Decision matrix
         matrix: List[List[float]] = []
@@ -71,7 +87,6 @@ class TopsisSelector:
                     .get(metric, {})
                     .get("predictions", [])
                 )
-                # Filtre toute valeur None résiduelle dans les prédictions
                 preds: List[float] = [p for p in preds_raw if p is not None]
 
                 if preds:
@@ -83,25 +98,52 @@ class TopsisSelector:
 
             row.append(self._budget_score(vm_id, predictions_map, slos, slo_metrics))
 
-            mig_cost = migration_costs.get(vm_id)
-            row.append(float(mig_cost) if mig_cost is not None else 0.0)
-
             rel = reliability_scores.get(vm_id)
             row.append(1.0 - float(rel) if rel is not None else 1.0)
 
             matrix.append(row)
+
+        # ── Table 1 : Prédictions des candidats ──────────────────────
+        all_headers = slo_metrics + ["budget", "fiabilité"]
+        pred_headers = ["VM"] + [f"{m}" for m in all_headers]
+        pred_rows = [
+            [candidates[i]["vm_id"]] + [f"{matrix[i][j]:.3f}" for j in range(n_cr)]
+            for i in range(n_vm)
+        ]
+        logger.info(_fmt_table("📊 Prédictions des candidats", pred_headers, pred_rows))
 
         # Steps 2–6
         norm_m  = self._minmax_normalise(matrix, n_vm, n_cr)
         weights = (
             [float(slo_map[m]["weight"]) if slo_map[m].get("weight") is not None else 0.0
              for m in slo_metrics]
-            + [_BUDGET_WEIGHT, _MIGRATION_WEIGHT, _RELIABILITY_WEIGHT]
+            + [_BUDGET_WEIGHT, _RELIABILITY_WEIGHT]
         )
+
+        # ── Table 2 : Normalisation min-max ──────────────────────────
+        norm_headers = ["VM"] + [f"{h} norm" for h in all_headers]
+        norm_rows = [
+            [candidates[i]["vm_id"]] + [f"{norm_m[i][j]:.3f}" for j in range(n_cr)]
+            for i in range(n_vm)
+        ]
+        logger.info(_fmt_table("📐 Normalisation min-max", norm_headers, norm_rows))
+
         w_m = [
             [norm_m[i][j] * weights[j] for j in range(n_cr)]
             for i in range(n_vm)
         ]
+
+        # ── Table 3 : Pondération ─────────────────────────────────────
+        w_labels = [
+            f"x{weights[j]:.2f}" for j in range(n_cr)
+        ]
+        pond_headers = ["VM"] + [f"{h} (x{weights[j]:.2f})" for j, h in enumerate(all_headers)]
+        pond_rows = [
+            [candidates[i]["vm_id"]] + [f"{w_m[i][j]:.3f}" for j in range(n_cr)]
+            for i in range(n_vm)
+        ]
+        logger.info(_fmt_table("⚖️  Pondération", pond_headers, pond_rows))
+
         a_plus  = [min(w_m[i][j] for i in range(n_vm)) for j in range(n_cr)]
         a_minus = [max(w_m[i][j] for i in range(n_vm)) for j in range(n_cr)]
         d_plus  = [
@@ -118,14 +160,21 @@ class TopsisSelector:
             for i in range(n_vm)
         ]
 
+        # ── Table 4 : Distances et score ─────────────────────────────
+        dist_rows = [
+            [candidates[i]["vm_id"], f"{d_plus[i]:.4f}", f"{d_minus[i]:.4f}", f"{scores[i]:.4f}"]
+            for i in range(n_vm)
+        ]
+        logger.info(_fmt_table("📏 Distances et score", ["VM", "d+", "d-", "score"], dist_rows))
+
         # Step 7 — classement
         ranking = sorted(
             zip([c["vm_id"] for c in candidates], scores),
             key=lambda x: x[1],
             reverse=True,
         )
-        logger.debug(
-            "🔍 TOPSIS — classement : "
+        logger.info(
+            "🏆 TOPSIS classement : "
             + "  ".join(f"{vm}={score:.4f}" for vm, score in ranking)
         )
 

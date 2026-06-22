@@ -39,10 +39,13 @@ REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB:   int = int(os.getenv("REDIS_DB",   0))
 
 # ── Persistence ───────────────────────────────────────────────
-METRICS_TTL:    int = 300
-HISTORY_WINDOW: int = 50
-DECISIONS_FIFO: int = 50
-HISTORY_SIZE:   int = int(os.getenv("HISTORY_SIZE", 10))
+HISTORY_WINDOW:   int = 50
+DECISIONS_FIFO:   int = 50
+HISTORY_SIZE:     int = int(os.getenv("HISTORY_SIZE", 100))
+
+# ── Excel export ──────────────────────────────────────────────
+EXCEL_PATH:   str = os.getenv("EXCEL_PATH",   "data/qos_history.xlsx")
+EXCEL_MAX_MB: int = int(os.getenv("EXCEL_MAX_MB", 200))
 
 # ── Orchestration ─────────────────────────────────────────────
 COLLECTION_INTERVAL:  float = float(os.getenv("COLLECTION_INTERVAL",  5.0))
@@ -72,7 +75,7 @@ CV_HIGH:              float = float(os.getenv("CV_HIGH",             0.30))
 PERCENTILE_STABLE:    float = float(os.getenv("PERCENTILE_STABLE",   70.0))
 PERCENTILE_NORMAL:    float = float(os.getenv("PERCENTILE_NORMAL",   75.0))
 PERCENTILE_VOLATILE:  float = float(os.getenv("PERCENTILE_VOLATILE", 85.0))
-MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.30))
+MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.00000001))
 
 # ── SLO merger ────────────────────────────────────────────────
 REFINE_STRICT: float = float(os.getenv("REFINE_STRICT", 0.85))
@@ -84,9 +87,14 @@ LATENCY_MAX: float = float(os.getenv("LATENCY_MAX", 2000.0))
 USAGE_MIN:   float = float(os.getenv("USAGE_MIN",   1.0))
 USAGE_MAX:   float = float(os.getenv("USAGE_MAX",   99.0))
 
-# ── Ollama / LLM ──────────────────────────────────────────────
+# ── Ollama / LLM (local fallback) ────────────────────────────
 OLLAMA_URL:   str = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 INTENT_MODEL: str = os.getenv("INTENT_MODEL", "qwen2.5:latest")
+
+# ── LAAS vLLM (primary) ───────────────────────────────────────
+LAAS_LLM_URL:   str = os.getenv("LAAS_LLM_URL",   "https://pfcalcul.laas.fr/vllm/v1/chat/completions")
+LAAS_MODEL:     str = os.getenv("LAAS_MODEL",      "Qwen3/Qwen--Qwen3.6-27B-FP16")
+LAAS_LLM_PROXY: str = os.getenv("LAAS_LLM_PROXY", "")  # e.g. https://user:pass@proxy.laas.fr:443
 
 # ── ML APIs ───────────────────────────────────────────────────
 ML_RTT_URL: str = os.getenv("ML_RTT_URL", "http://localhost:5001/predict")

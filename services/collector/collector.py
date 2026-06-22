@@ -5,34 +5,8 @@ import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any
 from shared import config
-
-
-# ─────────────────────────────────────────────
-#  ANSI color codes
-# ─────────────────────────────────────────────
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-
-
-class _PrettyFormatter(logging.Formatter):
-    LEVEL_STYLES = {
-        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
-        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
-        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
-        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
-        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
-        return f"{C.CYAN}{ts}{C.RESET}  {level}  {record.getMessage()}"
+from shared.logging_utils import C, PrettyFormatter as _PrettyFormatter
+from shared.http_utils import async_post_with_retry
 
 
 def setup_logger():
@@ -187,28 +161,19 @@ class CollectorHandler:
                     "reliability": vm_result.get("reliability")
                 }
 
-                for attempt in range(1, config.POST_RETRY_COUNT + 1):
-                    try:
-                        response = await client.post(
-                            f"{config.DATABASE_SERVICE_URL}/store/metrics",
-                            json=payload,
-                            timeout=5.0
-                        )
-                        if response.status_code in (200, 201, 202):
-                            logger.debug(
-                                f"🔍 Métriques transmises à Database — "
-                                f"VM : {C.CYAN}{vm_id}{C.RESET} | cycle #{cycle}"
-                            )
-                            break
-                    except Exception:
-                        pass
-
-                    if attempt < config.POST_RETRY_COUNT:
-                        logger.debug(
-                            f"🔍 Tentative {attempt}/{config.POST_RETRY_COUNT} échouée "
-                            f"pour {C.CYAN}{vm_id}{C.RESET} — nouvelle tentative..."
-                        )
-                        await asyncio.sleep(config.POST_RETRY_BACKOFF)
+                success = await async_post_with_retry(
+                    f"{config.DATABASE_SERVICE_URL}/store/metrics",
+                    payload,
+                    retry_count=config.POST_RETRY_COUNT,
+                    backoff=config.POST_RETRY_BACKOFF,
+                    timeout=5.0,
+                    logger=logger,
+                )
+                if success:
+                    logger.debug(
+                        f"🔍 Métriques transmises à Database — "
+                        f"VM : {C.CYAN}{vm_id}{C.RESET} | cycle #{cycle}"
+                    )
                 else:
                     logger.error(
                         f"❌ Échec persistance Database pour {C.RED}{vm_id}{C.RESET} "

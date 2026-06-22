@@ -136,3 +136,18 @@ cython_debug/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Project runtime artifacts
+data/
+logs/
+DOCUMENTATION.md
+SYSTEM_OVERVIEW.md
+test_laas_llm.py
+
+# Config sensible / locale
+redis.conf
+*.pem
+*.key
+*.env
+*.secret
+.env*

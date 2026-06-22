@@ -1,7 +1,7 @@
 import logging
-import requests
+import httpx
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -72,6 +72,10 @@ class QoSDashboard:
         }
         self._cycles_mi: deque = deque(maxlen=100)
 
+        self._migration_events: deque = deque(maxlen=50)
+        self._last_migration_ts: str = ""
+        self._paused: bool = False
+
         plt.ion()
         self._setup_figure()
         self._logger.info("Dashboard initialised", extra={"event": "dashboard_started"})
@@ -101,12 +105,15 @@ class QoSDashboard:
         ]
         self.ax_mi: plt.Axes = self.fig.add_subplot(gs[1, :])
 
-        ax_prev = self.fig.add_axes([0.010, 0.895, 0.025, 0.055])
-        ax_next = self.fig.add_axes([0.965, 0.895, 0.025, 0.055])
-        self.btn_prev = Button(ax_prev, "◄", color="#E0E0E0", hovercolor="#BDBDBD")
-        self.btn_next = Button(ax_next, "►", color="#E0E0E0", hovercolor="#BDBDBD")
+        ax_prev  = self.fig.add_axes([0.010, 0.895, 0.025, 0.055])
+        ax_next  = self.fig.add_axes([0.965, 0.895, 0.025, 0.055])
+        ax_pause = self.fig.add_axes([0.455, 0.895, 0.090, 0.055])
+        self.btn_prev  = Button(ax_prev,  "◄",        color="#E0E0E0", hovercolor="#BDBDBD")
+        self.btn_next  = Button(ax_next,  "►",        color="#E0E0E0", hovercolor="#BDBDBD")
+        self.btn_pause = Button(ax_pause, "⏸  Pause", color="#E3F2FD", hovercolor="#BBDEFB")
         self.btn_prev.on_clicked(lambda _e: self.change_view(-1))
         self.btn_next.on_clicked(lambda _e: self.change_view(+1))
+        self.btn_pause.on_clicked(lambda _e: self._toggle_pause())
 
         n = len(self._metric_keys)
         first_title = _VIEW_TITLES.get(self._metric_keys[0], self._metric_keys[0])
@@ -119,7 +126,7 @@ class QoSDashboard:
 
     def fetch_data(self) -> Dict[str, Any]:
         try:
-            resp = requests.get(f"{config.CORE_URL}/data", timeout=3.0)
+            resp = httpx.get(f"{config.CORE_URL}/data", timeout=3.0)
             if resp.status_code == 200:
                 data = resp.json()
                 self._logger.info(f"Data fetched — cycle={data.get('cycle', '?')}",
@@ -170,6 +177,15 @@ class QoSDashboard:
             weight = weights_by_metric.get(metric)
             self._hist_mi[metric].append(float(weight) if weight is not None else 0.0)
         self._cycles_mi.append(cycle)
+
+        decision = data.get("last_decision") or {}
+        if decision.get("decision") == "migrate":
+            ts = decision.get("timestamp", "")
+            if ts and ts != self._last_migration_ts:
+                self._last_migration_ts = ts
+                self._migration_events.append(
+                    (cycle, decision.get("from_vm", "?"), decision.get("to_vm", "?"))
+                )
 
     def _draw(self) -> None:
         data = self._last_data
@@ -308,6 +324,16 @@ class QoSDashboard:
                 x_start = max(min(all_cycles), x_end - 50)
                 ax.set_xlim(x_start, x_end + 0.5)
 
+            # ── Marqueurs de migration ────────────────────────────────
+            y_top = ax.get_ylim()[1]
+            for m_cycle, _m_from, m_to in self._migration_events:
+                ax.axvline(m_cycle, color="#7B1FA2", linewidth=1.8,
+                           linestyle="--", alpha=0.75, zorder=5)
+                ax.annotate(
+                    f"→{m_to}", xy=(m_cycle, y_top * 0.93),
+                    fontsize=7, color="#7B1FA2", ha="center", fontweight="bold",
+                    zorder=6)
+
     def _draw_mi_panel(self) -> None:
         """
         Affiche les poids normalisés des SLOs actifs (utilisés directement
@@ -356,6 +382,15 @@ class QoSDashboard:
         if self._last_data:
             self._draw()
 
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self.btn_pause.label.set_text("▶  Resume" if self._paused else "⏸  Pause")
+        self.btn_pause.color = "#FFF9C4" if self._paused else "#E3F2FD"
+        self._logger.info(
+            f"Dashboard {'paused' if self._paused else 'resumed'}",
+            extra={"event": "pause_toggled"})
+        plt.draw()
+
     def _on_key(self, event: Any) -> None:
         if event.key == "left":
             self.change_view(-1)
@@ -368,9 +403,10 @@ class QoSDashboard:
             extra={"event": "dashboard_started"})
         try:
             while plt.fignum_exists(self.fig.number):
-                data = self.fetch_data()
-                if data:
-                    self.update(data)
+                if not self._paused:
+                    data = self.fetch_data()
+                    if data:
+                        self.update(data)
                 plt.pause(2.0)
         except Exception as exc:
             self._logger.error(f"Dashboard loop terminated: {exc}",

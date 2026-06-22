@@ -2,29 +2,11 @@ import uvicorn
 import asyncio
 import httpx
 import logging
-from datetime import datetime, timezone
 from fastapi import FastAPI, Body, BackgroundTasks, status, HTTPException
 from typing import Dict, Any
 from shared import config
-from services.collector.collector import CollectorHandler, C
-
-
-# ─────────────────────────────────────────────
-#  Logger (réutilise le même formatter que collector.py)
-# ─────────────────────────────────────────────
-class _PrettyFormatter(logging.Formatter):
-    LEVEL_STYLES = {
-        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
-        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
-        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
-        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
-        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
-        return f"{C.CYAN}{ts}{C.RESET}  {level}  {record.getMessage()}"
+from shared.logging_utils import C, PrettyFormatter
+from services.collector.collector import CollectorHandler
 
 
 def _setup_app_logger() -> logging.Logger:
@@ -32,7 +14,7 @@ def _setup_app_logger() -> logging.Logger:
     log.setLevel(logging.DEBUG)
     if not log.handlers:
         h = logging.StreamHandler()
-        h.setFormatter(_PrettyFormatter())
+        h.setFormatter(PrettyFormatter())
         log.addHandler(h)
     log.propagate = False
     return log

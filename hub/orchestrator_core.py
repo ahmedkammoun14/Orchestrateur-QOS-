@@ -3,7 +3,7 @@ hub/orchestrator_core.py — QoS Orchestrator Hub (Hub-and-Spoke).
 """
 
 import asyncio
-import json
+import dataclasses
 import logging
 import time
 import uvicorn
@@ -15,38 +15,8 @@ import httpx
 from fastapi import FastAPI, status, Body
 
 from shared import config
-from shared.models import IntentToHubPayload, LatencyPayload, RTTMeasurement
-
-
-# ─────────────────────────────────────────────
-#  ANSI color codes
-# ─────────────────────────────────────────────
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-    WHITE  = "\033[97m"
-
-
-class PrettyFormatter(logging.Formatter):
-    LEVEL_STYLES = {
-        "INFO":    f"{C.BLUE}[INFO]{C.RESET}",
-        "SUCCESS": f"{C.GREEN}[SUCCESS]{C.RESET}",
-        "WARNING": f"{C.YELLOW}[WARNING]{C.RESET}",
-        "ERROR":   f"{C.RED}[ERROR]{C.RESET}",
-        "DEBUG":   f"{C.CYAN}[DEBUG]{C.RESET}",
-        "CRITICAL":f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
-        msg   = record.getMessage()
-        return f"{C.CYAN}{ts}{C.RESET}  {level}  {msg}"
+from shared.logging_utils import C, PrettyFormatter
+from shared.models import LatencyPayload, RTTMeasurement
 
 
 def setup_logger() -> logging.Logger:
@@ -303,6 +273,294 @@ async def _execute_kubectl_migration(client: httpx.AsyncClient, from_vm: str, to
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Context de cycle — variables locales partagées entre les 8 étapes du flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class _FlowContext:
+    vm_ids:            List[str]
+    now_iso:           str
+    active_metrics:    List[str]            = dataclasses.field(default_factory=list)
+    collector_metrics: List[str]            = dataclasses.field(default_factory=list)
+    results:           List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    new_collected:     List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+    vm_histories:      Dict[str, Any]       = dataclasses.field(default_factory=dict)
+    new_predictions:   Dict[str, Any]       = dataclasses.field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Étapes du flow — chacune correspond à un bloc numéroté de l'ancien _run_flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str) -> None:
+    """Calcule / met à jour les SLOs actifs (bootstrap ou metrics_manager)."""
+    if state.cycle_count < state.BOOTSTRAP_MIN:
+        state.current_slos = _build_bootstrap_slos()
+        ctx.active_metrics = [s["metric"] for s in state.current_slos]
+        logger.info(
+            f"🟡 Phase bootstrap ({state.cycle_count}/{state.BOOTSTRAP_MIN}) "
+            f"— SLOs primaires uniquement : {C.GREEN}{ctx.active_metrics}{C.RESET}"
+        )
+        return
+
+    h_res = await _post(client, f"{_URLS['history_loader']}/load", {
+        "vm_id":   state.service_vm,
+        "metrics": list(config.METRICS_REGISTRY.keys()),
+        "size":    config.HISTORY_WINDOW,
+    })
+    svc_hists = h_res.get("histories", {}) if h_res else {}
+
+    if mode == "enhanced":
+        # Restaure les poids originaux de l'intention sur les SLOs primaires avant
+        # recalcul — évite l'effet cumulatif de dilution cycle après cycle.
+        for slo in state.current_slos:
+            if slo.get("is_primary") and slo["metric"] in state.original_intent_weights:
+                slo["weight"] = state.original_intent_weights[slo["metric"]]
+        mm_payload = {"slos": state.current_slos, "history": _zip_histories(svc_hists, _threshold_map())}
+        mm_url     = f"{_URLS['metrics_manager']}/validate"
+    else:
+        mm_payload = {"history": _zip_histories(svc_hists, _threshold_map()), "all_vals": _all_vals(svc_hists)}
+        mm_url     = f"{_URLS['metrics_manager']}/compute"
+
+    mm_res = await _post(client, mm_url, mm_payload)
+    if mm_res:
+        state.current_slos   = mm_res.get("slos", state.current_slos)
+        ctx.active_metrics   = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
+        state.last_mi_scores = mm_res.get("mi_scores", {})
+
+        primaries   = [s["metric"] for s in state.current_slos if s.get("is_primary")]
+        secondaries = [s["metric"] for s in state.current_slos if not s.get("is_primary")]
+        logger.info(
+            f"📋 SLOs mis à jour — {C.CYAN}{len(state.current_slos)}{C.RESET} SLO(s) actif(s) "
+            f"| primaires : {C.GREEN}{primaries}{C.RESET} "
+            f"| secondaires : {C.YELLOW}{secondaries}{C.RESET}"
+        )
+    else:
+        ctx.active_metrics = [s["metric"] for s in state.current_slos]
+        logger.warning("⚠️  MetricsManager indisponible — SLOs précédents conservés")
+
+
+async def _step2_persist_slos(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+    """Persiste les SLOs courants dans la base de données."""
+    await _post(client, f"{_URLS['database']}/store/slos",
+                {"slos": state.current_slos, "timestamp": ctx.now_iso})
+
+
+async def _step3_collect(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+    """Collecte les métriques (CPU, RAM) via le collector pour toutes les VMs."""
+    ctx.collector_metrics = [m for m in config.METRICS_REGISTRY.keys() if m != "latency"]
+    coll_res   = await _post(client, f"{_URLS['collector']}/collect",
+                             {"active_metrics": ctx.collector_metrics, "cycle": state.cycle_count})
+    ctx.results = coll_res.get("results", []) if coll_res else []
+    logger.info(
+        f"📡 Métriques collectées — {C.CYAN}{len(ctx.results)}{C.RESET} VM(s) "
+        f"| métriques : {C.CYAN}{ctx.collector_metrics}{C.RESET}"
+    )
+
+
+async def _step4_persist_metrics(
+    client: httpx.AsyncClient,
+    ctx: _FlowContext,
+    measurements: List[RTTMeasurement],
+) -> None:
+    """Fusionne RTT + métriques collectées, persiste chaque VM en parallèle."""
+    rtt_lookup    = {m.vm_id: m for m in measurements}
+    new_collected: List[Dict[str, Any]] = []
+    persist_tasks = []
+
+    for r in ctx.results:
+        vm_id   = r["vm_id"]
+        rtt_m   = rtt_lookup.get(vm_id)
+        rtt_val = rtt_m.rtt_ms if rtt_m and rtt_m.reachable else None
+
+        vm_metrics = {**{m: r.get(m) for m in ctx.collector_metrics}, "latency": rtt_val}
+        new_collected.append({
+            "vm_id": vm_id, **vm_metrics,
+            "reliability": r.get("reliability"),
+            "reachable":   r.get("reachable"),
+        })
+        persist_tasks.append(_post(client, f"{_URLS['database']}/store/metrics", {
+            "vm_id": vm_id, "metrics": vm_metrics,
+            "timestamp": ctx.now_iso, "reliability": r.get("reliability"),
+        }))
+
+    await asyncio.gather(*persist_tasks)
+    state.last_collected = new_collected
+    ctx.new_collected    = new_collected
+
+    for entry in new_collected:
+        vm_id = entry["vm_id"]
+        tag   = f"{C.GREEN}[ACTIVE]{C.RESET}" if vm_id == state.service_vm else f"{C.CYAN}[IDLE]{C.RESET}"
+        logger.debug(
+            f"🔍 {tag} {C.BOLD}{vm_id}{C.RESET} — "
+            f"RTT: {C.CYAN}{entry.get('latency')} ms{C.RESET}  "
+            f"CPU: {C.CYAN}{entry.get('cpu_usage')} %{C.RESET}  "
+            f"RAM: {C.CYAN}{entry.get('ram_usage')} %{C.RESET}  "
+            f"Fiabilité: {C.CYAN}{entry.get('reliability')}{C.RESET}"
+        )
+
+
+def _step5_check_violations(ctx: _FlowContext) -> None:
+    """Vérifie si la VM active viole un SLO primaire."""
+    svc_data  = next((r for r in state.last_collected if r["vm_id"] == state.service_vm), None)
+    violation = _is_violation(svc_data, _threshold_map()) if svc_data else False
+    if violation:
+        logger.warning(
+            f"⚠️  Violation SLO détectée sur {C.YELLOW}{state.service_vm}{C.RESET} "
+            "— analyse de migration initiée"
+        )
+    else:
+        logger.info(f"✅ SLOs respectés sur {C.GREEN}{state.service_vm}{C.RESET}")
+
+
+async def _step6_load_histories(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+    """Charge les historiques de toutes les VMs en parallèle."""
+    hist_responses = await asyncio.gather(*[
+        _post(client, f"{_URLS['history_loader']}/load", {
+            "vm_id":   vid,
+            "metrics": list(config.METRICS_REGISTRY.keys()),
+            "size":    config.HISTORY_WINDOW,
+        }) for vid in ctx.vm_ids
+    ])
+    ctx.vm_histories = {
+        vid: (res.get("histories", {}) if res else {})
+        for vid, res in zip(ctx.vm_ids, hist_responses)
+    }
+    logger.info(
+        f"📚 Historiques chargés pour {C.CYAN}{len(ctx.vm_ids)}{C.RESET} VM(s) "
+        f"| fenêtre : {C.CYAN}{config.HISTORY_WINDOW}{C.RESET} points"
+    )
+
+
+async def _step7_predict(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+    """Génère les prédictions ML pour toutes les VMs en parallèle."""
+    new_predictions: Dict[str, Dict[str, Any]] = {vid: {} for vid in ctx.vm_ids}
+
+    p_responses = await asyncio.gather(*[
+        _post(client, f"{_URLS['ml_predictor']}/predict",
+              _ml_payload(ctx.vm_histories.get(vid, {})))
+        for vid in ctx.vm_ids
+    ])
+    for vid, res in zip(ctx.vm_ids, p_responses):
+        if res and not res.get("all_apis_down"):
+            new_predictions[vid] = _extract_predictions(res)
+
+    state.last_predictions = new_predictions
+    ctx.new_predictions    = new_predictions
+
+    successful_preds = sum(1 for v in new_predictions.values() if v)
+    logger.info(
+        f"🤖 Prédictions ML générées — "
+        f"{C.GREEN}{successful_preds}{C.RESET}/{len(ctx.vm_ids)} VM(s)"
+    )
+    for vid, preds in new_predictions.items():
+        if preds:
+            lat = preds.get("latency",   {}).get("predictions", ["N/A"])[0]
+            cpu = preds.get("cpu_usage", {}).get("predictions", ["N/A"])[0]
+            ram = preds.get("ram_usage", {}).get("predictions", ["N/A"])[0]
+            logger.debug(
+                f"🔍 Prédiction {C.BOLD}{vid}{C.RESET} — "
+                f"Latence: {C.CYAN}{lat} ms{C.RESET}  "
+                f"CPU: {C.CYAN}{cpu} %{C.RESET}  "
+                f"RAM: {C.CYAN}{ram} %{C.RESET}"
+            )
+
+    state.snapshot_collected   = list(state.last_collected)
+    state.snapshot_predictions = dict(state.last_predictions)
+
+
+async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+    """Appelle decision_intelligence et exécute la migration si nécessaire."""
+    current_data = []
+    for lc in state.last_collected:
+        entry = {"vm_id": lc["vm_id"]}
+        for m, meta in config.METRICS_REGISTRY.items():
+            entry[meta["payload_key"]] = lc.get(m)
+        current_data.append(entry)
+
+    # Lookup explicite par vm_id — évite tout risque de désalignement positionnel
+    # entre vm_ids et state.last_collected.
+    collected_lookup = {lc["vm_id"]: lc for lc in state.last_collected}
+
+    di_payload = {
+        "current_data":       current_data,
+        "predictions_map":    state.last_predictions,
+        "slos":               state.current_slos,
+        "service_vm":         state.service_vm,
+        "cooldown_active":    state.check_cooldown(),
+        "reliability_scores": {
+            vid: collected_lookup.get(vid, {}).get("reliability", 1.0)
+            for vid in ctx.vm_ids
+        },
+    }
+    if di_payload["cooldown_active"]:
+        elapsed   = time.monotonic() - state.last_migration_ts
+        remaining = config.MIGRATION_COOLDOWN_S - elapsed
+        logger.warning(
+            f"⏳ Cooldown actif — migration bloquée "
+            f"({C.YELLOW}{remaining:.0f}s{C.RESET} restante(s))"
+        )
+
+    if not di_payload["cooldown_active"]:
+        di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
+    else:
+        di_res = {
+            "decision": "stay", "from_vm": None, "to_vm": None,
+            "reason": "Cooldown active", "topsis_score": None, "breach_type": None,
+        }
+
+    if not di_res:
+        return
+
+    state.last_decision = di_res
+    decision = di_res.get("decision", "?")
+    reason   = di_res.get("reason", "—")
+    topsis   = di_res.get("topsis_score")
+    breach   = di_res.get("breach_type", "—")
+
+    if decision == "migrate":
+        from_vm = di_res["from_vm"]
+        to_vm   = di_res["to_vm"]
+        logger.info(
+            f"\n{'═'*60}\n"
+            f"  🎯 DÉCISION : {C.BOLD}{C.YELLOW}MIGRATION{C.RESET}\n"
+            f"  {'Source':<16}: {C.RED}{from_vm}{C.RESET}\n"
+            f"  {'Destination':<16}: {C.GREEN}{to_vm}{C.RESET}\n"
+            f"  {'Raison':<16}: {C.CYAN}{reason}{C.RESET}\n"
+            f"  {'Score TOPSIS':<16}: {C.CYAN}{topsis}{C.RESET}\n"
+            f"  {'Type violation':<16}: {C.YELLOW}{breach}{C.RESET}\n"
+            f"{'═'*60}"
+        )
+
+        await _post(client, f"{_URLS['database']}/store/decision", di_res)
+
+        kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
+        if not kubectl_ok:
+            logger.warning(
+                f"⚠️  Migration kubectl échouée — "
+                f"état interne mis à jour malgré tout "
+                f"({C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET})"
+            )
+
+        state.service_vm        = to_vm
+        state.last_migration_ts = time.monotonic()
+        logger.info(
+            f"✅ Migration effectuée — "
+            f"nouvelle VM active : {C.GREEN}{C.BOLD}{to_vm}{C.RESET} "
+            f"| kubectl : {'OK' if kubectl_ok else C.RED+'ÉCHEC'+C.RESET}"
+        )
+    else:
+        logger.info(
+            f"🟢 Décision : {C.GREEN}MAINTIEN{C.RESET} sur {C.CYAN}{state.service_vm}{C.RESET} "
+            f"| raison : {reason}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Coordinateur du cycle — orchestre les 8 étapes séquentiellement
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
     if state._lock.locked():
         return
@@ -317,257 +575,18 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
         )
 
         async with httpx.AsyncClient() as client:
-            vm_ids  = list(config.VM_REGISTRY.keys())
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            # ── ÉTAPE 1 : SLOs ──────────────────────────────────────────
-            if state.cycle_count < state.BOOTSTRAP_MIN:
-                # Bootstrap : SLOs primaires uniquement (objectif métier)
-                # Les SLOs secondaires adaptatifs seront ajoutés par le
-                # metrics_manager une fois l'historique suffisant.
-                state.current_slos = _build_bootstrap_slos()
-                active_metrics = [s["metric"] for s in state.current_slos]
-                logger.info(
-                    f"🟡 Phase bootstrap ({state.cycle_count}/{state.BOOTSTRAP_MIN}) "
-                    f"— SLOs primaires uniquement : {C.GREEN}{active_metrics}{C.RESET}"
-                )
-            else:
-                h_res = await _post(client, f"{_URLS['history_loader']}/load", {
-                    "vm_id": state.service_vm,
-                    "metrics": list(config.METRICS_REGISTRY.keys()),
-                    "size": config.HISTORY_WINDOW
-                })
-                svc_hists = h_res.get("histories", {}) if h_res else {}
-
-                if mode == "enhanced":
-                    # Restaure les poids originaux de l'intention sur les
-                    # SLOs primaires avant recalcul — évite l'effet cumulatif
-                    # de dilution cycle après cycle (sinon
-                    # weight_LLM × MI × MI × MI... à chaque appel, au lieu
-                    # de toujours weight_LLM_original × MI_courant).
-                    for slo in state.current_slos:
-                        if slo.get("is_primary") and slo["metric"] in state.original_intent_weights:
-                            slo["weight"] = state.original_intent_weights[slo["metric"]]
-
-                    mm_payload = {"slos": state.current_slos, "history": _zip_histories(svc_hists, _threshold_map())}
-                    mm_url = f"{_URLS['metrics_manager']}/validate"
-                else:
-                    mm_payload = {"history": _zip_histories(svc_hists, _threshold_map()), "all_vals": _all_vals(svc_hists)}
-                    mm_url = f"{_URLS['metrics_manager']}/compute"
-
-                mm_res = await _post(client, mm_url, mm_payload)
-                if mm_res:
-                    state.current_slos   = mm_res.get("slos", state.current_slos)
-                    active_metrics       = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
-                    state.last_mi_scores = mm_res.get("mi_scores", {})
-
-                    # Distinction primaires / secondaires pour le log
-                    primaries   = [s["metric"] for s in state.current_slos if s.get("is_primary")]
-                    secondaries = [s["metric"] for s in state.current_slos if not s.get("is_primary")]
-                    logger.info(
-                        f"📋 SLOs mis à jour — {C.CYAN}{len(state.current_slos)}{C.RESET} SLO(s) actif(s) "
-                        f"| primaires : {C.GREEN}{primaries}{C.RESET} "
-                        f"| secondaires : {C.YELLOW}{secondaries}{C.RESET}"
-                    )
-                else:
-                    # Fallback : conserver les SLOs courants si metrics_manager indisponible
-                    active_metrics = [s["metric"] for s in state.current_slos]
-                    logger.warning("⚠️  MetricsManager indisponible — SLOs précédents conservés")
-
-            # ── ÉTAPE 2 : Persistance SLOs ──────────────────────────────
-            await _post(client, f"{_URLS['database']}/store/slos",
-                        {"slos": state.current_slos, "timestamp": now_iso})
-
-            # ── ÉTAPE 3 : Collecte métriques ────────────────────────────
-            collector_metrics = [m for m in config.METRICS_REGISTRY.keys() if m != "latency"]
-            coll_res = await _post(client, f"{_URLS['collector']}/collect",
-                                   {"active_metrics": collector_metrics, "cycle": state.cycle_count})
-            results  = coll_res.get("results", []) if coll_res else []
-            logger.info(
-                f"📡 Métriques collectées — {C.CYAN}{len(results)}{C.RESET} VM(s) "
-                f"| métriques : {C.CYAN}{collector_metrics}{C.RESET}"
+            ctx = _FlowContext(
+                vm_ids=list(config.VM_REGISTRY.keys()),
+                now_iso=datetime.now(timezone.utc).isoformat(),
             )
-
-            # ── ÉTAPE 4 : Persistance métriques ─────────────────────────
-            rtt_lookup = {m.vm_id: m for m in measurements}
-            new_collected: List[Dict[str, Any]] = []
-
-            persist_tasks = []
-            for r in results:
-                vm_id   = r["vm_id"]
-                rtt_m   = rtt_lookup.get(vm_id)
-                rtt_val = rtt_m.rtt_ms if rtt_m and rtt_m.reachable else None
-
-                vm_metrics = {**{m: r.get(m) for m in collector_metrics}, "latency": rtt_val}
-                new_collected.append({
-                    "vm_id": vm_id, **vm_metrics,
-                    "reliability": r.get("reliability"),
-                    "reachable":   r.get("reachable"),
-                })
-                persist_tasks.append(_post(client, f"{_URLS['database']}/store/metrics", {
-                    "vm_id": vm_id, "metrics": vm_metrics,
-                    "timestamp": now_iso, "reliability": r.get("reliability")
-                }))
-            await asyncio.gather(*persist_tasks)
-            state.last_collected = new_collected
-
-            for entry in new_collected:
-                vm_id = entry["vm_id"]
-                tag   = f"{C.GREEN}[ACTIVE]{C.RESET}" if vm_id == state.service_vm else f"{C.CYAN}[IDLE]{C.RESET}"
-                logger.debug(
-                    f"🔍 {tag} {C.BOLD}{vm_id}{C.RESET} — "
-                    f"RTT: {C.CYAN}{entry.get('latency')} ms{C.RESET}  "
-                    f"CPU: {C.CYAN}{entry.get('cpu_usage')} %{C.RESET}  "
-                    f"RAM: {C.CYAN}{entry.get('ram_usage')} %{C.RESET}  "
-                    f"Fiabilité: {C.CYAN}{entry.get('reliability')}{C.RESET}"
-                )
-
-            # ── ÉTAPE 5 : Vérification violations SLO ───────────────────
-            svc_data  = next((r for r in state.last_collected if r["vm_id"] == state.service_vm), None)
-            violation = _is_violation(svc_data, _threshold_map()) if svc_data else False
-            if violation:
-                logger.warning(
-                    f"⚠️  Violation SLO détectée sur {C.YELLOW}{state.service_vm}{C.RESET} "
-                    "— analyse de migration initiée"
-                )
-            else:
-                logger.info(f"✅ SLOs respectés sur {C.GREEN}{state.service_vm}{C.RESET}")
-
-            # ── ÉTAPE 6 : Historiques de toutes les VMs ─────────────────
-            hist_tasks = [
-                _post(client, f"{_URLS['history_loader']}/load", {
-                    "vm_id": vid,
-                    "metrics": list(config.METRICS_REGISTRY.keys()),
-                    "size": config.HISTORY_WINDOW
-                }) for vid in vm_ids
-            ]
-            hist_responses = await asyncio.gather(*hist_tasks)
-            vm_histories = {
-                vid: (res.get("histories", {}) if res else {})
-                for vid, res in zip(vm_ids, hist_responses)
-            }
-            logger.info(
-                f"📚 Historiques chargés pour {C.CYAN}{len(vm_ids)}{C.RESET} VM(s) "
-                f"| fenêtre : {C.CYAN}{config.HISTORY_WINDOW}{C.RESET} points"
-            )
-
-            # ── ÉTAPE 7 : Prédictions ML (toutes VMs en parallèle) ──────
-            new_predictions: Dict[str, Dict[str, Any]] = {vid: {} for vid in vm_ids}
-
-            p_responses = await asyncio.gather(*[
-                _post(client, f"{_URLS['ml_predictor']}/predict",
-                      _ml_payload(vm_histories.get(vid, {})))
-                for vid in vm_ids
-            ])
-            for vid, res in zip(vm_ids, p_responses):
-                if res and not res.get("all_apis_down"):
-                    new_predictions[vid] = _extract_predictions(res)
-
-            state.last_predictions = new_predictions
-            successful_preds = sum(1 for v in new_predictions.values() if v)
-            logger.info(
-                f"🤖 Prédictions ML générées — "
-                f"{C.GREEN}{successful_preds}{C.RESET}/{len(vm_ids)} VM(s)"
-            )
-            for vid, preds in new_predictions.items():
-                if preds:
-                    lat  = preds.get("latency",   {}).get("predictions", ["N/A"])[0]
-                    cpu  = preds.get("cpu_usage",  {}).get("predictions", ["N/A"])[0]
-                    ram  = preds.get("ram_usage",  {}).get("predictions", ["N/A"])[0]
-                    logger.debug(
-                        f"🔍 Prédiction {C.BOLD}{vid}{C.RESET} — "
-                        f"Latence: {C.CYAN}{lat} ms{C.RESET}  "
-                        f"CPU: {C.CYAN}{cpu} %{C.RESET}  "
-                        f"RAM: {C.CYAN}{ram} %{C.RESET}"
-                    )
-
-            state.snapshot_collected   = list(state.last_collected)
-            state.snapshot_predictions = dict(state.last_predictions)
-
-            # ── ÉTAPE 8 : Décision ───────────────────────────────────────
-            current_data = []
-            for lc in state.last_collected:
-                entry = {"vm_id": lc["vm_id"]}
-                for m, meta in config.METRICS_REGISTRY.items():
-                    entry[meta["payload_key"]] = lc.get(m)
-                current_data.append(entry)
-
-            # Lookup explicite par vm_id — évite tout risque de désalignement
-            # positionnel entre vm_ids et state.last_collected (ex. si une VM
-            # est omise par le collector, ou si l'ordre change un jour).
-            collected_lookup = {lc["vm_id"]: lc for lc in state.last_collected}
-
-            di_payload = {
-                "current_data":      current_data,
-                "predictions_map":   state.last_predictions,
-                "slos":              state.current_slos,
-                "service_vm":        state.service_vm,
-                "cooldown_active":   state.check_cooldown(),
-                "migration_costs":   {vid: 0 for vid in vm_ids},
-                "reliability_scores": {
-                    vid: collected_lookup.get(vid, {}).get("reliability", 1.0)
-                    for vid in vm_ids
-                }
-            }
-            if di_payload["cooldown_active"]:
-                elapsed = time.monotonic() - state.last_migration_ts
-                remaining = config.MIGRATION_COOLDOWN_S - elapsed
-                logger.warning(
-                    f"⏳ Cooldown actif — migration bloquée "
-                    f"({C.YELLOW}{remaining:.0f}s{C.RESET} restante(s))"
-                )
-
-            if not di_payload["cooldown_active"]:
-                di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
-            else:
-                di_res = {
-                    "decision": "stay", "from_vm": None, "to_vm": None,
-                    "reason": "Cooldown active", "topsis_score": None, "breach_type": None
-                }
-
-            if di_res:
-                state.last_decision = di_res
-                decision    = di_res.get("decision", "?")
-                reason      = di_res.get("reason", "—")
-                topsis      = di_res.get("topsis_score")
-                breach      = di_res.get("breach_type", "—")
-
-                if decision == "migrate":
-                    from_vm = di_res["from_vm"]
-                    to_vm   = di_res["to_vm"]
-                    logger.info(
-                        f"\n{'═'*60}\n"
-                        f"  🎯 DÉCISION : {C.BOLD}{C.YELLOW}MIGRATION{C.RESET}\n"
-                        f"  {'Source':<16}: {C.RED}{from_vm}{C.RESET}\n"
-                        f"  {'Destination':<16}: {C.GREEN}{to_vm}{C.RESET}\n"
-                        f"  {'Raison':<16}: {C.CYAN}{reason}{C.RESET}\n"
-                        f"  {'Score TOPSIS':<16}: {C.CYAN}{topsis}{C.RESET}\n"
-                        f"  {'Type violation':<16}: {C.YELLOW}{breach}{C.RESET}\n"
-                        f"{'═'*60}"
-                    )
-
-                    await _post(client, f"{_URLS['database']}/store/decision", di_res)
-
-                    kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
-                    if not kubectl_ok:
-                        logger.warning(
-                            f"⚠️  Migration kubectl échouée — "
-                            f"état interne mis à jour malgré tout "
-                            f"({C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET})"
-                        )
-
-                    state.service_vm        = to_vm
-                    state.last_migration_ts = time.monotonic()
-                    logger.info(
-                        f"✅ Migration effectuée — "
-                        f"nouvelle VM active : {C.GREEN}{C.BOLD}{to_vm}{C.RESET} "
-                        f"| kubectl : {'OK' if kubectl_ok else C.RED+'ÉCHEC'+C.RESET}"
-                    )
-                else:
-                    logger.info(
-                        f"🟢 Décision : {C.GREEN}MAINTIEN{C.RESET} sur {C.CYAN}{state.service_vm}{C.RESET} "
-                        f"| raison : {reason}"
-                    )
+            await _step1_slos(client, ctx, mode)
+            await _step2_persist_slos(client, ctx)
+            await _step3_collect(client, ctx)
+            await _step4_persist_metrics(client, ctx, measurements)
+            _step5_check_violations(ctx)
+            await _step6_load_histories(client, ctx)
+            await _step7_predict(client, ctx)
+            await _step8_decide(client, ctx)
 
         logger.info(
             f"✅ Cycle #{C.BOLD}{state.cycle_count}{C.RESET} terminé\n"
@@ -700,6 +719,25 @@ async def get_status():
         "last_decision":    state.last_decision.get("decision"),
         "timestamp":        datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.post("/reset", status_code=status.HTTP_200_OK)
+async def reset():
+    async with state._lock:
+        state._mode                  = "autonomous"
+        state.current_slos           = _build_bootstrap_slos()
+        state.original_intent_weights = {}
+        state.last_decision          = {}
+        state.cycle_count            = 0
+        state.last_migration_ts      = None
+        state.bootstrap_cycles       = 0
+    logger.info(
+        f"\n{'═'*60}\n"
+        f"  🔄  Reset — retour en mode {C.CYAN}autonomous{C.RESET}\n"
+        f"  SLOs bootstrap restaurés : {C.GREEN}{[s['metric'] for s in state.current_slos]}{C.RESET}\n"
+        f"{'═'*60}"
+    )
+    return {"status": "reset", "mode": state._mode, "slos_count": len(state.current_slos)}
 
 
 @app.get("/health")

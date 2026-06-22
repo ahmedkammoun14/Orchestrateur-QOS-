@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from shared import config
 from services.decision_intelligence.violation_detector import ViolationDetector
 from services.decision_intelligence.topsis import TopsisSelector, vm_satisfies_slo
 
@@ -24,7 +25,6 @@ class DecisionHandler:
         slos:               List[Dict] = payload.get("slos", [])
         service_vm:         str        = payload["service_vm"]
         cooldown_active:    bool       = bool(payload.get("cooldown_active", False))
-        migration_costs:    Dict       = payload.get("migration_costs", {})
         reliability_scores: Dict       = payload.get("reliability_scores", {})
 
         ts: str = datetime.now(timezone.utc).isoformat()
@@ -91,7 +91,6 @@ class DecisionHandler:
             candidates         = candidates,
             predictions_map    = predictions_map,
             slos               = slos,
-            migration_costs    = migration_costs,
             reliability_scores = reliability_scores,
         )
 
@@ -139,7 +138,7 @@ class DecisionHandler:
         def _satisfies_all(vm_id: str) -> bool:
             for slo in slos:
                 metric = slo["metric"]
-                if metric not in [s["metric"] for s in slos]:
+                if metric not in config.METRICS_REGISTRY:
                     continue
                 preds: List[float] = (
                     predictions_map

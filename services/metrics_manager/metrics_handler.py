@@ -9,6 +9,19 @@ from shared.models import SLO
 logger = logging.getLogger("MetricsHandler")
 
 
+def _fmt_table(title: str, headers: List[str], rows: List[List[str]]) -> str:
+    col_w = [
+        max(len(h), max((len(r[i]) for r in rows), default=0))
+        for i, h in enumerate(headers)
+    ]
+    top  = "┌" + "┬".join("─" * (w + 2) for w in col_w) + "┐"
+    hdr  = "│" + "│".join(f" {h:<{w}} " for h, w in zip(headers, col_w)) + "│"
+    sep  = "├" + "┼".join("─" * (w + 2) for w in col_w) + "┤"
+    bot  = "└" + "┴".join("─" * (w + 2) for w in col_w) + "┘"
+    data = ["│" + "│".join(f" {c:<{w}} " for c, w in zip(row, col_w)) + "│" for row in rows]
+    return "\n  " + title + "\n  " + "\n  ".join([top, hdr, sep] + data + [bot])
+
+
 class MetricsHandler:
     """
     Gestionnaire statistique avancé pour scores MI, percentiles adaptatifs
@@ -37,6 +50,22 @@ class MetricsHandler:
         mi_results = {}
         y_vals = [1 if p.get("is_violation", False) else 0 for p in history]
 
+        # ── Tableau historique des cycles ────────────────────────────
+        metric_keys = list(self.registry.keys())
+        hist_headers = ["Cycle"] + metric_keys + ["Violation"]
+        hist_rows = []
+        for idx, p in enumerate(history, start=1):
+            row = [str(idx)]
+            for m in metric_keys:
+                v = p.get(m)
+                row.append(f"{v:.1f}" if v is not None else "—")
+            row.append("oui" if p.get("is_violation", False) else "non")
+            hist_rows.append(row)
+        logger.info(_fmt_table(
+            f"📜 Historique des cycles ({len(history)} points)",
+            hist_headers, hist_rows,
+        ))
+
         for metric in self.registry.keys():
             x_vals   = [p.get(metric) for p in history if p.get(metric) is not None]
             synced_y = [y_vals[i] for i, p in enumerate(history) if p.get(metric) is not None]
@@ -49,17 +78,22 @@ class MetricsHandler:
                 mi_results[metric] = 0.0
                 continue
 
-            score = self._compute_mi(x_vals, synced_y)
+            score = self._compute_mi(x_vals, synced_y, metric)
             mi_results[metric] = score
-            logger.debug(f"🔍 MI calculé — {metric} : {score:.4f}")
 
-        logger.info(
-            "📊 Scores MI calculés — "
-            + "  ".join(f"{m} : {v:.3f}" for m, v in mi_results.items())
-        )
+        # ── Tableau récapitulatif MI ─────────────────────────────────
+        mi_rows = [
+            [m, f"{v:.4f}", "✅ retenu" if v > config.MI_RELATIVE_THRESHOLD else "❌ ignoré"]
+            for m, v in mi_results.items()
+        ]
+        logger.info(_fmt_table(
+            f"📊 Scores MI (seuil = {config.MI_RELATIVE_THRESHOLD})",
+            ["Métrique", "MI score", f"Décision (> {config.MI_RELATIVE_THRESHOLD})"],
+            mi_rows,
+        ))
         return mi_results
 
-    def _compute_mi(self, x_vals: List[float], y_vals: List[int]) -> float:
+    def _compute_mi(self, x_vals: List[float], y_vals: List[int], metric: str = "") -> float:
         """MI normalisée via table de contingence 2×2 (discrétisation médiane)."""
         median_x   = statistics.median(x_vals)
         x_discrete = [1 if x > median_x else 0 for x in x_vals]
@@ -78,9 +112,24 @@ class MetricsHandler:
         mi   = h_x + h_y - h_xy
 
         denom = max(h_x, h_y)
-        if denom == 0:
-            return 0.0
-        return max(0.0, min(1.0, mi / denom))
+        score = 0.0 if denom == 0 else max(0.0, min(1.0, mi / denom))
+
+        # Table de contingence 2×2
+        lbl = f"médiane {metric} = {median_x:.1f}" if metric else f"médiane = {median_x:.1f}"
+        rows_ct = [
+            [f"{metric} bas (≤{median_x:.1f})", str(table[0][0]), str(table[0][1])],
+            [f"{metric} haut (>{median_x:.1f})", str(table[1][0]), str(table[1][1])],
+        ]
+        logger.debug(
+            _fmt_table(
+                f"📋 Table de contingence 2×2 ({lbl})",
+                ["", "Violation = non", "Violation = oui"],
+                rows_ct,
+            )
+            + f"\n  → MI normalisée : {score:.4f}"
+        )
+
+        return score
 
     def _entropy(self, probs: List[float]) -> float:
         """Entropie de Shannon."""
@@ -223,19 +272,21 @@ class MetricsHandler:
 
         normalized = self._normalize_weights(final_slos)
 
-        logger.info(
-            f"✅ SLOs sélectionnés (mode AUTONOMOUS) — "
-            f"{len(normalized)} SLO(s) actif(s) "
-            f"| primaires : {primary_metrics} "
-            f"| secondaires adaptatifs : {secondary_metrics}"
-        )
-        for s in normalized:
-            tag = "PRIMAIRE  " if s.is_primary else "SECONDAIRE"
-            logger.debug(
-                f"🔍 [{tag}] {s.metric:<12} "
-                f"seuil : {s.threshold:.2f} {s.unit:<3} "
-                f"| opérateur : {s.operator}  poids : {s.weight:.2f}"
-            )
+        slo_rows = [
+            [
+                s.metric,
+                "PRIMAIRE" if s.is_primary else "SECONDAIRE",
+                s.operator,
+                f"{s.threshold:.2f} {s.unit}",
+                f"{s.weight:.2f}",
+            ]
+            for s in normalized
+        ]
+        logger.info(_fmt_table(
+            f"✅ SLOs sélectionnés (mode AUTONOMOUS) — {len(normalized)} actif(s)",
+            ["Métrique", "Type", "Opérateur", "Seuil", "Poids normalisé"],
+            slo_rows,
+        ))
         return normalized, active_metrics
 
     # ─────────────────────────────────────────────────────────────
@@ -326,19 +377,21 @@ class MetricsHandler:
 
         normalized = self._normalize_weights(final_slos)
 
-        logger.info(
-            f"✅ SLOs validés (mode ENHANCED) — "
-            f"{len(normalized)} SLO(s) actif(s) "
-            f"| primaires (LLM) : {primary_metrics} "
-            f"| secondaires adaptatifs : {secondary_metrics}"
-        )
-        for s in normalized:
-            tag = "PRIMAIRE  " if s.is_primary else "SECONDAIRE"
-            logger.debug(
-                f"🔍 [{tag}] {s.metric:<12} "
-                f"seuil : {s.threshold:.2f} {s.unit:<3} "
-                f"| poids : {s.weight:.2f}  cible : {s.target:.2f}"
-            )
+        slo_rows = [
+            [
+                s.metric,
+                "PRIMAIRE (LLM)" if s.is_primary else "SECONDAIRE",
+                s.operator,
+                f"{s.threshold:.2f} {s.unit}",
+                f"{s.weight:.2f}",
+            ]
+            for s in normalized
+        ]
+        logger.info(_fmt_table(
+            f"✅ SLOs validés (mode ENHANCED) — {len(normalized)} actif(s)",
+            ["Métrique", "Type", "Opérateur", "Seuil", "Poids normalisé"],
+            slo_rows,
+        ))
         return normalized, active_metrics
 
     # ─────────────────────────────────────────────────────────────

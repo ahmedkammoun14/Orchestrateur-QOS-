@@ -26,29 +26,58 @@ class RAGContextBuilder:
 
 class LLMHandler:
     """
-    Facade for natural language processing with a 3-level fallback cascade.
+    Facade for natural language processing — extraction via LLM uniquement.
 
     Tous les SLOs générés sont marqués is_primary=True car ils représentent
     les objectifs métier explicites de l'utilisateur. Les SLOs secondaires
     adaptatifs (basés sur MI) sont ajoutés ensuite par le metrics_manager.
 
-    Level 1 : Ollama LLM (qwen2.5) avec contexte RAG résumé
-    Level 2 : Regex — patterns explicites (latency < 100ms)
-    Level 3 : Keywords — profils sémantiques (streaming, critique, etc.)
-
-    Si le niveau 1 (LLM) produit le résultat, il gère lui-même la cohérence
-    avec les SLOs actifs (active_slos) selon le sens de l'intention — la
-    stratégie REFINE du SLOMerger est alors désactivée pour ne pas écraser
-    son résultat. REFINE reste actif comme filet de sécurité pour les
-    niveaux 2/3, qui n'ont aucune intelligence sémantique.
+    Le LLM (Ollama qwen2.5) gère lui-même la cohérence avec les SLOs actifs
+    via le prompt — REFINE est donc désactivé en permanence, devenu inutile
+    puisqu'il n'existe plus de niveau de repli sans intelligence sémantique.
     """
 
     def __init__(self):
-        self.rag_builder = RAGContextBuilder()
-        self.merger = SLOMerger()
+        self.rag_builder     = RAGContextBuilder()
+        self.merger          = SLOMerger()
         self.history: List[Dict[str, Any]] = []
+        self._history_loaded = False
+
+    async def _ensure_history_loaded(self) -> None:
+        if self._history_loaded:
+            return
+        self._history_loaded = True  # set before await to avoid race on concurrent calls
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{config.DATABASE_SERVICE_URL}/load/llm_history",
+                    params={"size": config.HISTORY_SIZE},
+                    timeout=3.0,
+                )
+                if resp.status_code == 200:
+                    self.history = resp.json().get("history", [])
+                    if self.history:
+                        logger.info(
+                            f"📂 Historique LLM rechargé depuis Redis — "
+                            f"{len(self.history)} intention(s)"
+                        )
+        except Exception as exc:
+            logger.warning(f"⚠️  Chargement historique LLM échoué (dégradation gracieuse) : {exc}")
+
+    async def _persist_intent(self, entry: Dict[str, Any]) -> None:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{config.DATABASE_SERVICE_URL}/store/llm_history",
+                    json=entry,
+                    timeout=3.0,
+                )
+        except Exception as exc:
+            logger.warning(f"⚠️  Persistance historique LLM échouée : {exc}")
 
     async def handle(self, payload: Dict[str, Any]) -> Optional[List[SLO]]:
+        await self._ensure_history_loaded()
+
         intention = payload.get("intention", "")
         if not intention:
             return None
@@ -56,28 +85,9 @@ class LLMHandler:
         context = await self.rag_builder.build()
 
         result = await self._level1_llm(intention, context)
-        source_level = 1
 
         if not result:
-            result = self._level2_regex(intention)
-            source_level = 2
-            if result:
-                logger.info(
-                    f"🔁 Niveau 2 activé — extraction par regex "
-                    f"| {len(result)} SLO(s) trouvé(s)"
-                )
-
-        if not result:
-            result = self._level3_keywords(intention)
-            source_level = 3
-            if result:
-                logger.info(
-                    f"🔁 Niveau 3 activé — extraction par mots-clés "
-                    f"| {len(result)} SLO(s) trouvé(s)"
-                )
-
-        if not result:
-            logger.error("❌ Tous les niveaux d'extraction ont échoué — intention non interprétable")
+            logger.error("❌ Le LLM n'a pas produit de résultat exploitable — intention non interprétable")
             return None
 
         # Marque tous les SLOs comme PRIMAIRES (objectifs explicites utilisateur)
@@ -88,24 +98,25 @@ class LLMHandler:
 
         active_slos = [SLO(**s) for s in context.get("active_slos", [])]
 
-        # REFINE désactivé si le LLM (niveau 1) a produit le résultat —
-        # il a déjà géré la cohérence avec l'existant lui-même via le prompt.
+        # REFINE toujours désactivé — le LLM gère seul la cohérence avec
+        # l'existant via le prompt (RAG context).
         final_slos = self.merger.merge(
             active_slos, normalized, intention,
-            allow_refine=(source_level != 1)
+            allow_refine=False
         )
 
         # Garantit que tous les SLOs finaux sont marqués primaires
         for s in final_slos:
             s.is_primary = True
 
-        self.history.append({"intention": intention, "slos": [s.dict() for s in final_slos]})
+        entry = {"intention": intention, "slos": [s.dict() for s in final_slos]}
+        self.history.append(entry)
         if len(self.history) > config.HISTORY_SIZE:
             self.history.pop(0)
+        await self._persist_intent(entry)
 
         logger.info(
             f"✅ SLOs primaires extraits et validés — {len(final_slos)} SLO(s) "
-            f"| niveau source : {source_level} "
             f"| métriques : {[s.metric for s in final_slos]}"
         )
         return final_slos
@@ -117,28 +128,89 @@ class LLMHandler:
             "cycle":       context.get("cycle", 0),
         }
 
-        prompt = f"""Tu es un expert QoS réseau.
-État actuel du système : {json.dumps(rag_summary, ensure_ascii=False)}
-Convertis cette intention utilisateur en une liste JSON de SLOs réseau.
-Métriques disponibles : latency (ms), cpu_usage (%), ram_usage (%).
+        system_prompt = (
+            "Tu es un expert QoS réseau. Tu convertis des intentions utilisateur "
+            "en SLOs réseau au format JSON.\n\n"
+            "Métriques disponibles (TOUJOURS inclure les 3 sauf si l'intention exclut explicitement une métrique) :\n"
+            "  - latency   : latence réseau en ms  (operator: \"<\")\n"
+            "  - cpu_usage : charge CPU en %        (operator: \"<\")\n"
+            "  - ram_usage : utilisation RAM en %   (operator: \"<\")\n\n"
+            "RÈGLES :\n"
+            "1. Si l'intention donne un chiffre explicite pour une métrique, utilise-le.\n"
+            "2. Si l'intention est vague ou relative (ex: \"aussi bien qu'actuellement\", "
+            "\"sans surcharge\"), utilise les seuils par défaut experts : "
+            "latency=100ms, cpu_usage=80%, ram_usage=80%.\n"
+            "3. Si active_slos contient des SLOs actifs, utilise leurs valeurs comme référence.\n"
+            "4. Les poids (weight) doivent sommer à 1.0.\n\n"
+            "FORMAT DE RÉPONSE OBLIGATOIRE — tableau JSON uniquement, "
+            "sans texte avant ou après, sans markdown :\n"
+            '[{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":80.0,"window":"5m"},'
+            '{"metric":"cpu_usage","operator":"<","threshold":80.0,"unit":"%","weight":0.25,"target":70.0,"window":"5m"},'
+            '{"metric":"ram_usage","operator":"<","threshold":80.0,"unit":"%","weight":0.25,"target":70.0,"window":"5m"}]'
+        )
 
-RÈGLE IMPORTANTE — cohérence avec l'existant :
-Si l'intention fait référence à une amélioration ou un changement relatif
-par rapport à l'état actuel (ex: "plus rapide", "encore mieux", "moins de
-charge CPU", "améliore le streaming") SANS préciser de chiffre exact,
-utilise les SLOs listés dans "active_slos" comme référence pour la ou les
-métriques concernées, et propose un nouveau seuil cohérent avec le sens de
-l'intention (plus strict si on demande mieux, plus permissif si on demande
-moins strict).
-Si l'intention donne un chiffre explicite, utilise-le tel quel.
-Si l'intention ne fait pas référence à l'existant pour une métrique donnée,
-ignore active_slos pour cette métrique et utilise ton jugement d'expert QoS.
+        user_prompt = (
+            f"État actuel du système : {json.dumps(rag_summary, ensure_ascii=False)}\n\n"
+            f"Intention utilisateur : \"{text}\"\n\n"
+            "Génère le tableau JSON des SLOs correspondants. Inclus les 3 métriques sauf exclusion explicite."
+        )
 
-Intention : "{text}"
-Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
-[{{"metric": "latency", "operator": "<", "threshold": 100.0, "unit": "ms", "weight": 1.0, "target": 80.0, "window": "5m"}}]
-"""
+        # ── 1. Try LAAS vLLM (primary) ───────────────────────────────
+        result = await self._call_laas(system_prompt, user_prompt, text)
+        if result is not None:
+            return result
 
+        # ── 2. Fallback: Ollama local ─────────────────────────────────
+        logger.warning("⚠️  LAAS indisponible — fallback vers Ollama local")
+        ollama_prompt = (
+            f"{system_prompt}\n\n"
+            f"{user_prompt}"
+        )
+        return await self._call_ollama(ollama_prompt, text)
+
+    async def _call_laas(self, system_prompt: str, user_prompt: str, text: str) -> Optional[List[Dict[str, Any]]]:
+        proxies = {"https://": config.LAAS_LLM_PROXY} if config.LAAS_LLM_PROXY else None
+        payload = {
+            "model": config.LAAS_MODEL,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "extra_body":           {"enable_thinking": False, "include_thought": False},
+            "thinking":             {"enabled": False},
+            "enable_thinking":      False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        }
+        try:
+            async with httpx.AsyncClient(proxies=proxies) as client:
+                logger.info(
+                    f"🤖 Appel LAAS vLLM — modèle : {config.LAAS_MODEL} "
+                    f"| intention : \"{text[:60]}{'...' if len(text) > 60 else ''}\""
+                )
+                resp = await client.post(
+                    config.LAAS_LLM_URL,
+                    json=payload,
+                    timeout=60.0,
+                )
+                if resp.status_code == 200:
+                    raw_content = resp.json()["choices"][0]["message"]["content"].strip()
+                    logger.debug(f"LAAS raw response: {raw_content[:300]}")
+                    # greedy match to capture the full array including nested objects
+                    match = re.search(r'\[.+\]', raw_content, re.DOTALL)
+                    if match:
+                        parsed = json.loads(match.group())
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            logger.info(f"✅ LAAS LLM — {len(parsed)} SLO(s) extraits")
+                            return parsed
+                    logger.warning(f"⚠️  LAAS LLM — réponse sans JSON exploitable : {raw_content[:300]}")
+                else:
+                    logger.error(f"❌ LAAS LLM a retourné HTTP {resp.status_code} : {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"❌ LAAS LLM indisponible ou erreur d'appel : {e}")
+        return None
+
+    async def _call_ollama(self, prompt: str, text: str) -> Optional[List[Dict[str, Any]]]:
         try:
             async with httpx.AsyncClient() as client:
                 logger.info(
@@ -148,7 +220,7 @@ Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
                 resp = await client.post(
                     f"{config.OLLAMA_URL}/api/generate",
                     json={"model": config.INTENT_MODEL, "prompt": prompt, "stream": False},
-                    timeout=60.0
+                    timeout=60.0,
                 )
                 if resp.status_code == 200:
                     raw_content = resp.json().get("response", "")
@@ -156,91 +228,12 @@ Réponds UNIQUEMENT avec un tableau JSON valide sans texte autour, exemple :
                     if match:
                         parsed = json.loads(match.group())
                         if isinstance(parsed, list) and len(parsed) > 0:
-                            logger.info(
-                                f"✅ LLM — réponse valide reçue "
-                                f"| {len(parsed)} SLO(s) extraits"
-                            )
+                            logger.info(f"✅ Ollama — {len(parsed)} SLO(s) extraits")
                             return parsed
+                else:
+                    logger.error(f"❌ Ollama a retourné HTTP {resp.status_code}")
         except Exception as e:
-            logger.warning(f"⚠️  Ollama indisponible : {e} — passage au niveau 2")
-        return None
-
-    def _level2_regex(self, text: str) -> Optional[List[Dict[str, Any]]]:
-        pattern = r"(latency|latence|ping|cpu|ram|mémoire)\s*(<|<=|>|>=)\s*(\d+)"
-        matches = re.findall(pattern, text.lower())
-        if not matches:
-            return None
-
-        metric_map = {
-            "latency": "latency", "latence": "latency", "ping": "latency",
-            "cpu": "cpu_usage", "ram": "ram_usage", "mémoire": "ram_usage"
-        }
-        unit_map = {
-            "latency": "ms", "cpu_usage": "%", "ram_usage": "%"
-        }
-
-        result = []
-        for m in matches:
-            metric = metric_map.get(m[0], m[0])
-            unit   = unit_map.get(metric, "ms")
-            thr    = float(m[2])
-            result.append({
-                "metric":    metric,
-                "operator":  m[1],
-                "threshold": thr,
-                "unit":      unit,
-                "weight":    1.0,
-                "target":    thr * 0.8,
-                "window":    "5m"
-            })
-        return result if result else None
-
-    def _level3_keywords(self, text: str) -> Optional[List[Dict[str, Any]]]:
-        t = text.lower()
-
-        if any(k in t for k in [
-            "fluide", "coupure", "streaming", "video", "vidéo",
-            "flux", "continu", "interruption", "stable", "qualité"
-        ]):
-            logger.info("📺 Profil détecté : Streaming / Fluidité")
-            return [
-                {"metric": "latency",   "operator": "<", "threshold": 100.0,
-                 "unit": "ms", "weight": 0.6, "target": 80.0,  "window": "5m"},
-                {"metric": "cpu_usage", "operator": "<", "threshold": 70.0,
-                 "unit": "%",  "weight": 0.2, "target": 60.0, "window": "5m"},
-                {"metric": "ram_usage", "operator": "<", "threshold": 70.0,
-                 "unit": "%",  "weight": 0.2, "target": 60.0, "window": "5m"},
-            ]
-
-        if any(k in t for k in [
-            "critique", "edge", "temps réel", "realtime", "urgent", "prioritaire"
-        ]):
-            logger.info("🔴 Profil détecté : Temps réel / Critique")
-            return [
-                {"metric": "latency", "operator": "<", "threshold": 50.0,
-                 "unit": "ms", "weight": 1.0, "target": 40.0, "window": "1m"}
-            ]
-
-        if any(k in t for k in [
-            "sensible", "ux", "utilisateur", "expérience", "confort", "réactif"
-        ]):
-            logger.info("👤 Profil détecté : UX / Expérience utilisateur")
-            return [
-                {"metric": "latency", "operator": "<", "threshold": 150.0,
-                 "unit": "ms", "weight": 0.7, "target": 120.0, "window": "2m"}
-            ]
-
-        if any(k in t for k in [
-            "lourd", "ressources", "calcul", "intensif", "traitement"
-        ]):
-            logger.info("⚙️  Profil détecté : Ressources intensives")
-            return [
-                {"metric": "cpu_usage", "operator": "<", "threshold": 70.0,
-                 "unit": "%", "weight": 0.5, "target": 60.0, "window": "5m"},
-                {"metric": "ram_usage", "operator": "<", "threshold": 75.0,
-                 "unit": "%", "weight": 0.5, "target": 65.0, "window": "5m"},
-            ]
-
+            logger.error(f"❌ Ollama indisponible ou erreur d'appel : {e}")
         return None
 
     def _normalize_and_validate(self, raw_list: List[Dict[str, Any]]) -> List[SLO]:

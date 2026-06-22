@@ -111,7 +111,8 @@ class RedisClient:
                     key = redis_keys.METRICS_KEY.format(vm_id=vm_id, metric=metric)
                     pipe.lpush(key, val)
                     pipe.ltrim(key, 0, config.HISTORY_WINDOW - 1)
-                    pipe.expire(key, config.METRICS_TTL)
+                    # Pas de EXPIRE : les données sont conservées indéfiniment.
+                    # LTRIM borne la mémoire à HISTORY_WINDOW entrées par clé.
 
             # Full history snapshot (all metrics + metadata in one entry)
             hist_key = redis_keys.HISTORY_KEY.format(vm_id=vm_id)
@@ -123,7 +124,6 @@ class RedisClient:
             })
             pipe.lpush(hist_key, snapshot)
             pipe.ltrim(hist_key, 0, config.HISTORY_WINDOW - 1)
-            pipe.expire(hist_key, config.METRICS_TTL)
 
             pipe.execute()
             self._logger.info(
@@ -202,6 +202,39 @@ class RedisClient:
                 extra={"event": "storage_failed"},
             )
             raise
+
+    def store_llm_history(self, entry: Dict[str, Any]) -> None:
+        """
+        Persist one LLM intent entry to Redis.
+        The list is capped at HISTORY_SIZE entries (newest first).
+        """
+        try:
+            pipe = self._r.pipeline()
+            pipe.lpush(redis_keys.LLM_HISTORY_KEY, json.dumps(entry))
+            pipe.ltrim(redis_keys.LLM_HISTORY_KEY, 0, config.HISTORY_SIZE - 1)
+            pipe.execute()
+        except redis.RedisError as exc:
+            self._logger.error(
+                f"store_llm_history failed: {exc}",
+                extra={"event": "storage_failed"},
+            )
+            raise
+
+    def load_llm_history(self, size: int) -> List[Dict[str, Any]]:
+        """
+        Return up to *size* LLM history entries in chronological order (oldest first).
+        Returns an empty list on error to allow graceful degradation.
+        """
+        try:
+            raw_list = self._r.lrange(redis_keys.LLM_HISTORY_KEY, 0, size - 1)
+            # LPUSH stores newest first; reverse to restore chronological order
+            return [json.loads(r) for r in reversed(raw_list)]
+        except redis.RedisError as exc:
+            self._logger.error(
+                f"load_llm_history failed: {exc}",
+                extra={"event": "storage_failed"},
+            )
+            return []
 
     # ------------------------------------------------------------------
     # Health

@@ -1,24 +1,11 @@
 import logging
 import uvicorn
-from fastapi import FastAPI, Request, Response, status
-from datetime import datetime, timezone
+from fastapi import FastAPI, Response, status
 from typing import Dict, Any
 
-from services.latency_manager.latency_handler import LatencyHandler, PrettyFormatter
+from shared.logging_utils import C, PrettyFormatter
+from services.latency_manager.latency_handler import LatencyHandler
 from shared import config
-
-
-# ─────────────────────────────────────────────
-#  ANSI color codes (réutilisés depuis handler)
-# ─────────────────────────────────────────────
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
 
 
 def _setup_app_logger() -> logging.Logger:

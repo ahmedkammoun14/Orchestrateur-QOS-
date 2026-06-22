@@ -1,38 +1,8 @@
-import httpx
-import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Dict, Any
 from shared import config
-
-
-# ─────────────────────────────────────────────
-#  ANSI color codes
-# ─────────────────────────────────────────────
-class C:
-    RESET  = "\033[0m"
-    BOLD   = "\033[1m"
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    BLUE   = "\033[94m"
-    CYAN   = "\033[96m"
-
-
-class PrettyFormatter(logging.Formatter):
-    LEVEL_STYLES = {
-        "INFO":     f"{C.BLUE}[INFO]{C.RESET}",
-        "WARNING":  f"{C.YELLOW}[WARNING]{C.RESET}",
-        "ERROR":    f"{C.RED}[ERROR]{C.RESET}",
-        "CRITICAL": f"{C.RED}{C.BOLD}[CRITICAL]{C.RESET}",
-        "DEBUG":    f"{C.CYAN}[DEBUG]{C.RESET}",
-    }
-
-    def format(self, record: logging.LogRecord) -> str:
-        ts    = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        level = self.LEVEL_STYLES.get(record.levelname, f"[{record.levelname}]")
-        msg   = record.getMessage()
-        return f"{C.CYAN}{ts}{C.RESET}  {level}  {msg}"
+from shared.logging_utils import C, PrettyFormatter
+from shared.http_utils import async_post_with_retry
 
 
 def setup_logger() -> logging.Logger:
@@ -112,47 +82,24 @@ class LatencyHandler:
         return True
 
     async def _forward_with_retry(self, payload: Dict[str, Any]) -> bool:
-        cycle = payload.get("cycle", "?")
-
-        async with httpx.AsyncClient() as client:
-            for attempt in range(1, self.retry_count + 1):
-                try:
-                    response = await client.post(
-                        self.hub_url,
-                        json=payload,
-                        timeout=self.timeout
-                    )
-
-                    if response.status_code in (200, 201, 202):
-                        logger.info(
-                            f"✅ Mesures transmises au Hub — "
-                            f"cycle #{C.CYAN}{cycle}{C.RESET} "
-                            f"| HTTP {C.GREEN}{response.status_code}{C.RESET}"
-                        )
-                        return True
-                    else:
-                        logger.error(
-                            f"❌ Hub a retourné HTTP {response.status_code} "
-                            f"| tentative {attempt}/{self.retry_count}"
-                        )
-
-                except (httpx.RequestError, httpx.TimeoutException) as e:
-                    logger.error(
-                        f"❌ Erreur de connexion au Hub : {type(e).__name__} "
-                        f"| tentative {attempt}/{self.retry_count}"
-                    )
-
-                if attempt < self.retry_count:
-                    logger.warning(
-                        f"⏳ Nouvelle tentative dans {self.retry_backoff}s "
-                        f"({attempt}/{self.retry_count})..."
-                    )
-                    await asyncio.sleep(self.retry_backoff)
-
-        logger.critical(
-            f"🔴 Toutes les tentatives ont échoué — "
-            f"cycle #{cycle} non transmis au Hub "
-            f"({self.retry_count} tentatives épuisées)"
+        cycle   = payload.get("cycle", "?")
+        success = await async_post_with_retry(
+            self.hub_url, payload,
+            retry_count=self.retry_count,
+            backoff=self.retry_backoff,
+            timeout=self.timeout,
+            logger=logger,
         )
-        return False
+        if success:
+            logger.info(
+                f"✅ Mesures transmises au Hub — "
+                f"cycle #{C.CYAN}{cycle}{C.RESET}"
+            )
+        else:
+            logger.critical(
+                f"🔴 Toutes les tentatives ont échoué — "
+                f"cycle #{cycle} non transmis au Hub "
+                f"({self.retry_count} tentatives épuisées)"
+            )
+        return success
     

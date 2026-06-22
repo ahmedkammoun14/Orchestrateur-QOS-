@@ -3,7 +3,7 @@ import logging
 import threading
 import uvicorn
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Dict
 
 from fastapi import FastAPI
 from shared import config
