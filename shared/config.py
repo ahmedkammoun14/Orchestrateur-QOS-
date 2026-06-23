@@ -49,7 +49,7 @@ EXCEL_MAX_MB: int = int(os.getenv("EXCEL_MAX_MB", 200))
 
 # ── Orchestration ─────────────────────────────────────────────
 COLLECTION_INTERVAL:  float = float(os.getenv("COLLECTION_INTERVAL",  5.0))
-MIGRATION_COOLDOWN_S: float = float(os.getenv("MIGRATION_COOLDOWN_S", 60.0))
+MIGRATION_COOLDOWN_S: float = float(os.getenv("MIGRATION_COOLDOWN_S", 5.0))
 BOOTSTRAP_MIN:        int   = int(os.getenv("BOOTSTRAP_MIN",          5))
 RAG_TIMEOUT:          float = float(os.getenv("RAG_TIMEOUT",          2.0))
 
@@ -147,7 +147,7 @@ METRICS_REGISTRY: Dict[str, Any] = {
         "payload_key":          "rtt_ms",
         "unit":                 "ms",
         "operator":             "<",
-        "default_threshold":    30.0,
+        "default_threshold":    300.0,
         "bounds":               {"min": 5.0, "max": 2000.0},
         "always_active":        True,
         "is_primary_objective": True,

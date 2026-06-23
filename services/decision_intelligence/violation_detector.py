@@ -108,4 +108,5 @@ class ViolationDetector:
 
     def _get_current_val(self, vm_data: Dict[str, Any], metric: str) -> float:
         payload_key: str = config.METRICS_REGISTRY[metric].get("payload_key", metric)
-        return float(vm_data.get(payload_key, 0.0))
+        val = vm_data.get(payload_key)
+        return float(val) if val is not None else 0.0

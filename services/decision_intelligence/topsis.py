@@ -71,7 +71,7 @@ class TopsisSelector:
         slo_metrics: List[str] = list(slo_map.keys())
 
         n_vm: int = len(candidates)
-        n_cr: int = len(slo_metrics) + 2  # métriques SLO + budget + fiabilité
+        n_cr: int = len(slo_metrics)  # métriques SLO uniquement
 
         # Step 1 — Decision matrix
         matrix: List[List[float]] = []
@@ -96,15 +96,10 @@ class TopsisSelector:
                     val = cand.get(payload_key)
                     row.append(float(val) if val is not None else float(meta["default_threshold"]))
 
-            row.append(self._budget_score(vm_id, predictions_map, slos, slo_metrics))
-
-            rel = reliability_scores.get(vm_id)
-            row.append(1.0 - float(rel) if rel is not None else 1.0)
-
             matrix.append(row)
 
         # ── Table 1 : Prédictions des candidats ──────────────────────
-        all_headers = slo_metrics + ["budget", "fiabilité"]
+        all_headers = slo_metrics
         pred_headers = ["VM"] + [f"{m}" for m in all_headers]
         pred_rows = [
             [candidates[i]["vm_id"]] + [f"{matrix[i][j]:.3f}" for j in range(n_cr)]
@@ -114,11 +109,10 @@ class TopsisSelector:
 
         # Steps 2–6
         norm_m  = self._minmax_normalise(matrix, n_vm, n_cr)
-        weights = (
-            [float(slo_map[m]["weight"]) if slo_map[m].get("weight") is not None else 0.0
-             for m in slo_metrics]
-            + [_BUDGET_WEIGHT, _RELIABILITY_WEIGHT]
-        )
+        weights = [
+            float(slo_map[m]["weight"]) if slo_map[m].get("weight") is not None else 0.0
+            for m in slo_metrics
+        ]
 
         # ── Table 2 : Normalisation min-max ──────────────────────────
         norm_headers = ["VM"] + [f"{h} norm" for h in all_headers]

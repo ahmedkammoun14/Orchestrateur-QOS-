@@ -63,10 +63,8 @@ class DecisionHandler:
         )
         violated_metrics: List[str] = [v["metric"] for v in violations]
 
-        # ── Étape 4 : Filtrage des candidats ─────────────────────────
-        all_candidates: List[Dict] = [
-            v for v in current_data if v["vm_id"] != service_vm
-        ]
+        # ── Étape 4 : Candidats = toutes les VMs (y compris la VM active) ──
+        all_candidates: List[Dict] = list(current_data)
 
         if not all_candidates:
             logger.warning(
@@ -114,7 +112,19 @@ class DecisionHandler:
             f"{'─'*50}"
         )
 
-        # ── Étape 6 : Décision MIGRATE ───────────────────────────────
+        # ── Étape 6 : Si TOPSIS choisit la VM active → STAY ──────────
+        if to_vm == service_vm:
+            logger.info(
+                f"🟢 TOPSIS confirme {service_vm} comme meilleure VM "
+                f"malgré la violation — décision STAY"
+            )
+            return self._build_stay(
+                f"{breach_type} violation but {service_vm} is still best "
+                f"candidate (score={topsis_score})",
+                breach_type, topsis_score, ts,
+            )
+
+        # ── Étape 7 : Décision MIGRATE ───────────────────────────────
         return {
             "decision":     "migrate",
             "from_vm":      service_vm,
