@@ -39,6 +39,7 @@ _URLS = {
     "ml_predictor":          f"http://{config.HUB_HOST}:{config.ML_PREDICTOR_PORT}",
     "metrics_manager":       f"http://{config.HUB_HOST}:{config.METRICS_MANAGER_PORT}",
     "decision_intelligence": f"http://{config.HUB_HOST}:{config.DECISION_INTELLIGENCE_PORT}",
+    "observability":         f"http://{config.HUB_HOST}:{config.OBSERVABILITY_PORT}",
 }
 
 OPENSTACK_CLIENT_URL = f"http://{config.OPENSTACK_MASTER_IP}:{config.OPENSTACK_CLIENT_PORT}"
@@ -402,13 +403,31 @@ async def _step4_persist_metrics(
 
 
 def _step5_check_violations(ctx: _FlowContext) -> None:
-    """Vérifie si la VM active viole un SLO primaire."""
+    """Log de cohérence : violation courante + signal proactif ML sur la VM active."""
     svc_data  = next((r for r in state.last_collected if r["vm_id"] == state.service_vm), None)
     violation = _is_violation(svc_data, _threshold_map()) if svc_data else False
+
+    # Signal proactif : une prédiction ML dépasse le seuil proactif
+    thresholds   = _threshold_map()
+    svc_preds    = state.last_predictions.get(state.service_vm, {})
+    proactive_signals = []
+    for slo in state.current_slos:
+        metric    = slo["metric"]
+        threshold = thresholds.get(metric, float("inf"))
+        preds     = svc_preds.get(metric, {}).get("predictions", [])
+        if any(p > threshold * config.PROACTIVE_FACTOR for p in preds):
+            proactive_signals.append(metric)
+
     if violation:
         logger.warning(
-            f"⚠️  Violation SLO détectée sur {C.YELLOW}{state.service_vm}{C.RESET} "
-            "— analyse de migration initiée"
+            f"⚠️  Violation SLO réactive sur {C.YELLOW}{state.service_vm}{C.RESET} "
+            "— migration imminente"
+        )
+    elif proactive_signals:
+        logger.warning(
+            f"🟡 Signal proactif ML sur {C.YELLOW}{state.service_vm}{C.RESET} "
+            f"| métriques : {C.CYAN}{proactive_signals}{C.RESET} "
+            "— décision proactive en cours"
         )
     else:
         logger.info(f"✅ SLOs respectés sur {C.GREEN}{state.service_vm}{C.RESET}")
@@ -519,6 +538,31 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
     topsis   = di_res.get("topsis_score")
     breach   = di_res.get("breach_type", "—")
 
+    # ── Audit → observability (toutes les décisions, pas seulement MIGRATE) ──
+    audit_payload = {
+        **di_res,
+        "cycle":            state.cycle_count,
+        "mode":             state._mode,
+        "violated_metrics": [
+            v["metric"] for v in di_res.get("violations", [])
+        ] if "violations" in di_res else (
+            [di_res["reason"].split(" on ")[1].split(" —")[0]]
+            if decision == "migrate" and " on " in (di_res.get("reason") or "") else []
+        ),
+        "slos_active":      state.current_slos,
+        "mi_scores":        state.last_mi_scores,
+        "current_metrics":  {
+            lc["vm_id"]: {
+                "latency":   lc.get("latency"),
+                "cpu_usage": lc.get("cpu_usage"),
+                "ram_usage": lc.get("ram_usage"),
+            } for lc in state.last_collected
+        },
+    }
+    asyncio.create_task(
+        _post(client, f"{_URLS['observability']}/audit", audit_payload)
+    )
+
     if decision == "migrate":
         from_vm = di_res["from_vm"]
         to_vm   = di_res["to_vm"]
@@ -583,9 +627,9 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
             await _step2_persist_slos(client, ctx)
             await _step3_collect(client, ctx)
             await _step4_persist_metrics(client, ctx, measurements)
-            _step5_check_violations(ctx)
             await _step6_load_histories(client, ctx)
             await _step7_predict(client, ctx)
+            _step5_check_violations(ctx)   # après prédictions — log cohérent
             await _step8_decide(client, ctx)
 
         logger.info(

@@ -41,7 +41,8 @@ class DecisionHandler:
 
         if violations:
             summary = "  ".join(
-                f"{v['metric']}({v['breach_type']})" for v in violations
+                f"{v['metric']}({v['breach_type']},sev={v['severity']:.3f})"
+                for v in violations
             )
             logger.info(
                 f"⚠️  {len(violations)} violation(s) détectée(s) "
@@ -56,6 +57,23 @@ class DecisionHandler:
         if not violations:
             return self._build_stay("No SLO violation detected", None, None, ts)
 
+        # Filtrer les violations proactives de faible sévérité (bruit)
+        _PROACTIVE_MIN_SEVERITY: float = 0.05
+        actionable = [
+            v for v in violations
+            if v["breach_type"] == "reactive"
+            or v["severity"] >= _PROACTIVE_MIN_SEVERITY
+        ]
+        if not actionable:
+            logger.info(
+                f"🟡 Violations proactives sous le seuil de sévérité "
+                f"({_PROACTIVE_MIN_SEVERITY}) — décision STAY"
+            )
+            return self._build_stay(
+                "proactive violations below severity threshold", "proactive", None, ts
+            )
+        violations = actionable
+
         breach_type: str = (
             "reactive"
             if any(v["breach_type"] == "reactive" for v in violations)
@@ -63,8 +81,10 @@ class DecisionHandler:
         )
         violated_metrics: List[str] = [v["metric"] for v in violations]
 
-        # ── Étape 4 : Candidats = toutes les VMs (y compris la VM active) ──
-        all_candidates: List[Dict] = list(current_data)
+        # ── Étape 4 : Candidats = toutes les VMs sauf la VM en violation ──
+        all_candidates: List[Dict] = [
+            v for v in current_data if v["vm_id"] != service_vm
+        ]
 
         if not all_candidates:
             logger.warning(
@@ -112,7 +132,7 @@ class DecisionHandler:
             f"{'─'*50}"
         )
 
-        # ── Étape 6 : Si TOPSIS choisit la VM active → STAY ──────────
+        # ── Étape 6 : Filet de sécurité (ne devrait plus se déclencher) ──
         if to_vm == service_vm:
             logger.info(
                 f"🟢 TOPSIS confirme {service_vm} comme meilleure VM "

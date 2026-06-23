@@ -51,7 +51,10 @@ class ViolationDetector:
             )
 
             if breach_type != "none":
-                sev = self._severity(current_val, threshold, slope)
+                # Pour une violation proactive, la sévérité se base sur le pic prédit
+                peak_val = max(preds) if preds else current_val
+                ref_val  = peak_val if breach_type == "proactive" else current_val
+                sev = self._severity(ref_val, threshold, slope)
                 violations.append({
                     "metric":         metric,
                     "breach_type":    breach_type,
@@ -59,6 +62,7 @@ class ViolationDetector:
                     "slope":          slope,
                     "time_to_breach": time_to_breach,
                     "current_val":    current_val,
+                    "predicted_peak": peak_val,
                     "threshold":      threshold,
                 })
                 logger.debug(
@@ -78,19 +82,59 @@ class ViolationDetector:
         proactive_factor: float,
     ) -> Tuple[str, float, int]:
         breach_reactive: bool = current_val > threshold
-        slope: float = (preds[-1] - preds[0]) if len(preds) >= 2 else 0.0
 
-        time_to_breach: int = len(preds)
+        # Slope sur les prédictions (dérivée moyenne par pas)
+        if len(preds) >= 2:
+            slope = (preds[-1] - preds[0]) / (len(preds) - 1)
+        else:
+            slope = 0.0
+
+        # Temps prédit avant breach : index du 1er pred > seuil
+        # Initialiser à len(preds)+1 pour que la condition ≤ HORIZON_ALERT
+        # ne se déclenche PAS si preds est vide ou si aucun pred ne breach.
+        time_to_breach: int = len(preds) + 1
         for idx, p in enumerate(preds):
             if p > threshold:
                 time_to_breach = idx
                 break
 
+        # Temps estimé par la trajectoire courante (dérivée linéaire)
+        if slope > 0 and current_val < threshold:
+            estimated_steps = (threshold - current_val) / slope
+        else:
+            estimated_steps = float("inf")
+
         proactive_threshold: float = threshold * proactive_factor
-        cond1: bool = any(p > proactive_threshold for p in preds)
-        cond2: bool = time_to_breach <= config.HORIZON_ALERT
-        cond3: bool = current_val > threshold * 0.70
-        breach_proactive: bool = (cond1 or cond2) and cond3 and not breach_reactive
+
+        # Condition 1 : une prédiction ML dépasse le seuil proactif (seulement si preds non vide)
+        pred_breach: bool = bool(preds) and any(p > proactive_threshold for p in preds)
+
+        # Condition 2 : breach imminent selon ML ou trajectoire (seulement si preds non vide)
+        time_breach_imminent: bool = bool(preds) and (
+            time_to_breach <= config.HORIZON_ALERT
+            or estimated_steps <= config.HORIZON_ALERT
+        )
+
+        # Condition 3 : tendance montante significative (slope > 5% du seuil par pas)
+        # et déjà au-dessus de 60% du seuil — évite les faux positifs sur fluctuations normales
+        _MIN_SLOPE: float = threshold * 0.05
+        trend_rising: bool = (
+            slope > _MIN_SLOPE
+            and current_val > threshold * 0.60
+        )
+
+        breach_proactive: bool = (
+            (pred_breach or time_breach_imminent or trend_rising)
+            and not breach_reactive
+        )
+
+        logger.debug(
+            f"🔍 _analyze — val={current_val:.2f} seuil={threshold:.2f} "
+            f"slope={slope:.3f}/pas  TTB_ml={time_to_breach}  "
+            f"TTB_traj={estimated_steps:.1f}  "
+            f"pred_breach={pred_breach}  imminent={time_breach_imminent}  "
+            f"trend={trend_rising}"
+        )
 
         if breach_reactive:
             return "reactive", slope, time_to_breach
