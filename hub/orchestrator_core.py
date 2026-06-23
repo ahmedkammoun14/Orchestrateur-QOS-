@@ -313,16 +313,22 @@ async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str) -
     svc_hists = h_res.get("histories", {}) if h_res else {}
 
     if mode == "enhanced":
-        # Restaure les poids originaux de l'intention sur les SLOs primaires avant
-        # recalcul — évite l'effet cumulatif de dilution cycle après cycle.
         for slo in state.current_slos:
             if slo.get("is_primary") and slo["metric"] in state.original_intent_weights:
                 slo["weight"] = state.original_intent_weights[slo["metric"]]
-        mm_payload = {"slos": state.current_slos, "history": _zip_histories(svc_hists, _threshold_map())}
-        mm_url     = f"{_URLS['metrics_manager']}/validate"
+        mm_payload = {
+            "slos":    state.current_slos,
+            "history": _zip_histories(svc_hists, _threshold_map()),
+            "cycle":   state.cycle_count,
+        }
+        mm_url = f"{_URLS['metrics_manager']}/validate"
     else:
-        mm_payload = {"history": _zip_histories(svc_hists, _threshold_map()), "all_vals": _all_vals(svc_hists)}
-        mm_url     = f"{_URLS['metrics_manager']}/compute"
+        mm_payload = {
+            "history":  _zip_histories(svc_hists, _threshold_map()),
+            "all_vals": _all_vals(svc_hists),
+            "cycle":    state.cycle_count,
+        }
+        mm_url = f"{_URLS['metrics_manager']}/compute"
 
     mm_res = await _post(client, mm_url, mm_payload)
     if mm_res:
@@ -512,6 +518,8 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
             vid: collected_lookup.get(vid, {}).get("reliability", 1.0)
             for vid in ctx.vm_ids
         },
+        "cycle":              state.cycle_count,
+        "mi_scores":          state.last_mi_scores,
     }
     if di_payload["cooldown_active"]:
         elapsed   = time.monotonic() - state.last_migration_ts

@@ -3,6 +3,9 @@ import math
 import statistics
 from typing import List, Dict, Any, Tuple, Optional
 
+import numpy as np
+from scipy.special import digamma
+
 from shared import config
 from shared.models import SLO
 
@@ -42,7 +45,7 @@ class MetricsHandler:
     # MI — Information Mutuelle Normalisée
     # ─────────────────────────────────────────────────────────────
 
-    def compute_mi_scores(self, history: List[Dict[str, Any]]) -> Dict[str, float]:
+    def compute_mi_scores(self, history: List[Dict[str, Any]], cycle: int = 0) -> Dict[str, float]:
         """
         Calcule le score MI entre chaque métrique et le signal de violation.
         Retourne un score normalisé dans [0, 1].
@@ -78,7 +81,7 @@ class MetricsHandler:
                 mi_results[metric] = 0.0
                 continue
 
-            score = self._compute_mi(x_vals, synced_y, metric)
+            score = self._compute_mi(x_vals, synced_y, metric, cycle)
             mi_results[metric] = score
 
         # ── Tableau récapitulatif MI ─────────────────────────────────
@@ -93,51 +96,161 @@ class MetricsHandler:
         ))
         return mi_results
 
-    def _compute_mi(self, x_vals: List[float], y_vals: List[int], metric: str = "") -> float:
-        """MI normalisée via table de contingence 2×2 (discrétisation médiane)."""
-        median_x   = statistics.median(x_vals)
-        x_discrete = [1 if x > median_x else 0 for x in x_vals]
-        n          = len(x_discrete)
+    def _compute_mi(
+        self,
+        x_vals: List[float],
+        y_vals: List[int],
+        metric: str = "",
+        cycle: int  = 0,
+    ) -> float:
+        """
+        MI continue (X métrique continue, Y violation binaire).
+        Estimateur différentiel Kozachenko-Leonenko (k-NN).
+        MI(X;Y) = H(X) − H(X|Y),  normalisé par H(Y) → [0, 1].
+        """
+        x = np.array(x_vals, dtype=float)
+        y = np.array(y_vals, dtype=int)
+        n = len(x)
 
-        table = [[0, 0], [0, 0]]
-        for i in range(n):
-            table[x_discrete[i]][y_vals[i]] += 1
+        classes, counts = np.unique(y, return_counts=True)
+        if len(classes) < 2:
+            return 0.0
 
-        p_x  = [sum(table[0]) / n, sum(table[1]) / n]
-        p_y  = [(table[0][0] + table[1][0]) / n, (table[0][1] + table[1][1]) / n]
-        h_x  = self._entropy(p_x)
-        h_y  = self._entropy(p_y)
-        p_xy = [cell / n for row in table for cell in row]
-        h_xy = self._entropy(p_xy)
-        mi   = h_x + h_y - h_xy
+        k = max(3, min(5, n // 10))
 
-        denom = max(h_x, h_y)
-        score = 0.0 if denom == 0 else max(0.0, min(1.0, mi / denom))
+        sep = "═" * 62
 
-        # Table de contingence 2×2
-        lbl = f"médiane {metric} = {median_x:.1f}" if metric else f"médiane = {median_x:.1f}"
-        rows_ct = [
-            [f"{metric} bas (≤{median_x:.1f})", str(table[0][0]), str(table[0][1])],
-            [f"{metric} haut (>{median_x:.1f})", str(table[1][0]), str(table[1][1])],
-        ]
-        logger.debug(
-            _fmt_table(
-                f"📋 Table de contingence 2×2 ({lbl})",
-                ["", "Violation = non", "Violation = oui"],
-                rows_ct,
-            )
-            + f"\n  → MI normalisée : {score:.4f}"
+        # ── Bannière cycle ────────────────────────────────────────
+        logger.info(
+            f"\n  {sep}\n"
+            f"  🔬  MI k-NN — Cycle #{cycle} | Métrique : {metric}\n"
+            f"  n = {n} points   k = {k} voisins (plus proches)\n"
+            f"  {sep}"
         )
 
+        # ── ÉTAPE 1 — H(X) entropie globale ──────────────────────
+        hx, rk_all = self._knn_entropy_ex(x, k)
+        valid_mask = rk_all > 0
+        valid_rk   = rk_all[valid_mask]
+        psi_n      = float(digamma(n))
+        psi_k      = float(digamma(k))
+        mean_log_r = float(np.mean(np.log(valid_rk))) if len(valid_rk) > 0 else 0.0
+
+        if valid_rk.size > 0:
+            max_idx = int(np.argmax(rk_all))
+            min_rk  = float(valid_rk.min())
+            min_idx = int(np.where(rk_all == min_rk)[0][0])
+            tbl1 = _fmt_table(
+                "Points représentatifs",
+                ["Rôle", f"Valeur ({self.registry.get(metric, {}).get('unit','%')})", f"r_{k}", "ln(r_k)"],
+                [
+                    ["max r_k  ← outlier",
+                     f"{x[max_idx]:.1f}",
+                     f"{rk_all[max_idx]:.2f}",
+                     f"{np.log(rk_all[max_idx]):.3f}"],
+                    ["min r_k  ← cluster dense",
+                     f"{x[min_idx]:.1f}",
+                     f"{min_rk:.2f}",
+                     f"{np.log(min_rk):.3f}"],
+                ],
+            )
+        else:
+            tbl1 = ""
+
+        logger.info(
+            f"\n  ÉTAPE 1 — H(X) : Entropie différentielle globale{tbl1}\n"
+            f"  H(X) = ψ({n}) − ψ({k}) + ln(2) + mean(ln r_{k})\n"
+            f"       = {psi_n:.3f} − {psi_k:.3f} + {np.log(2):.3f} + ({mean_log_r:.3f})\n"
+            f"       = {hx:.3f} nats"
+        )
+
+        # ── ÉTAPES 2 & 3 — H(X|Y=c) par classe ──────────────────
+        hx_given_y = 0.0
+        class_info: List[Tuple[int, int, float]] = []  # (c, cnt, h_c)
+
+        # Affiche violation (Y=1) avant normale (Y=0) pour suivre le schéma
+        ordered = sorted(zip(classes, counts), key=lambda t: -t[0])
+        step_num = 2
+        for c, cnt in ordered:
+            label = "violation" if c == 1 else "normale"
+            x_c   = x[y == c]
+            if len(x_c) > k + 1:
+                h_c, rk_c = self._knn_entropy_ex(x_c, k)
+                valid_rk_c = rk_c[rk_c > 0]
+                psi_nc     = float(digamma(len(x_c)))
+                mean_log_rc = float(np.mean(np.log(valid_rk_c))) if len(valid_rk_c) > 0 else 0.0
+                max_c_idx  = int(np.argmax(rk_c))
+                rk_range   = (f"r_{k} ∈ [{valid_rk_c.min():.1f} — {valid_rk_c.max():.1f}]"
+                               if valid_rk_c.size > 0 else "")
+                logger.info(
+                    f"\n  ÉTAPE {step_num} — H(X|Y={c}) : Classe {label} (n={cnt})\n"
+                    f"  Outlier max r_{k} = {rk_c[max_c_idx]:.2f} "
+                    f"à val = {x_c[max_c_idx]:.1f}   {rk_range}\n"
+                    f"  H(X|Y={c}) = ψ({cnt}) − ψ({k}) + ln(2) + mean(ln r_{k})\n"
+                    f"            = {psi_nc:.3f} − {psi_k:.3f} + {np.log(2):.3f} + ({mean_log_rc:.3f})\n"
+                    f"            = {h_c:.3f} nats"
+                )
+            else:
+                h_c = hx
+                logger.info(
+                    f"\n  ÉTAPE {step_num} — H(X|Y={c}) : Classe {label} (n={cnt})\n"
+                    f"  ⚠  n={cnt} ≤ k+1={k+1} → estimation conservatrice "
+                    f"H(X|Y={c}) ← H(X) = {hx:.3f} nats"
+                )
+            hx_given_y += (cnt / n) * h_c
+            class_info.append((c, cnt, h_c))
+            step_num += 1
+
+        # ── ÉTAPE 4 — H(X|Y) pondérée ────────────────────────────
+        terms_str    = " + ".join(
+            f"({cnt}/{n})×{h_c:.3f}" for _, cnt, h_c in class_info
+        )
+        weighted_str = " + ".join(
+            f"{cnt/n:.3f}×{h_c:.3f}" for _, cnt, h_c in class_info
+        )
+        logger.info(
+            f"\n  ÉTAPE 4 — H(X|Y) : Entropie conditionnelle pondérée\n"
+            f"  H(X|Y) = {terms_str}\n"
+            f"         = {weighted_str}\n"
+            f"         = {hx_given_y:.3f} nats"
+        )
+
+        # ── ÉTAPE 5 — Score final ─────────────────────────────────
+        mi_nats = hx - hx_given_y
+        probs   = counts / n
+        hy      = float(-np.sum(probs * np.log(probs + 1e-12)))
+        score   = 0.0 if hy <= 0 else max(0.0, min(1.0, mi_nats / hy))
+        hy_str  = " + ".join(f"{p:.3f}×ln({p:.3f})" for p in probs)
+        verdict = "✅ retenu" if score > config.MI_RELATIVE_THRESHOLD else "❌ ignoré"
+        logger.info(
+            f"\n  ÉTAPE 5 — Score final\n"
+            f"  MI    = H(X) − H(X|Y) = {hx:.3f} − {hx_given_y:.3f} = {mi_nats:.3f} nats\n"
+            f"  H(Y)  = −[{hy_str}] = {hy:.3f} nats\n"
+            f"  Score = MI / H(Y) = {mi_nats:.3f} / {hy:.3f} = {score:.3f}   {verdict}\n"
+            f"  {sep}"
+        )
         return score
 
-    def _entropy(self, probs: List[float]) -> float:
-        """Entropie de Shannon."""
-        ent = 0.0
-        for p in probs:
-            if p > 0:
-                ent -= p * math.log2(p)
-        return ent
+    @staticmethod
+    def _knn_entropy_ex(vals: np.ndarray, k: int) -> Tuple[float, np.ndarray]:
+        """Kozachenko-Leonenko 1-D — retourne (entropie, r_k array)."""
+        n = len(vals)
+        if n <= k + 1:
+            return 0.0, np.zeros(n)
+        dists = np.abs(vals[:, None] - vals[None, :])
+        np.fill_diagonal(dists, np.inf)
+        r_k   = np.partition(dists, k - 1, axis=1)[:, k - 1]
+        valid = r_k > 0
+        if valid.sum() == 0:
+            return 0.0, r_k
+        log_r = np.where(valid, np.log(r_k), 0.0)
+        return float(digamma(n) - digamma(k) + np.log(2) + np.mean(log_r[valid])), r_k
+
+    @staticmethod
+    def _knn_entropy(vals: np.ndarray, k: int) -> float:
+        """Kozachenko-Leonenko 1-D — retourne entropie seule."""
+        h, _ = MetricsHandler._knn_entropy_ex(vals, k)
+        return h
 
     # ─────────────────────────────────────────────────────────────
     # Percentile adaptatif — seuils dynamiques pour SLOs secondaires

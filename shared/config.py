@@ -75,7 +75,7 @@ CV_HIGH:              float = float(os.getenv("CV_HIGH",             0.30))
 PERCENTILE_STABLE:    float = float(os.getenv("PERCENTILE_STABLE",   70.0))
 PERCENTILE_NORMAL:    float = float(os.getenv("PERCENTILE_NORMAL",   75.0))
 PERCENTILE_VOLATILE:  float = float(os.getenv("PERCENTILE_VOLATILE", 85.0))
-MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.00000001))
+MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.15))
 
 # ── SLO merger ────────────────────────────────────────────────
 REFINE_STRICT: float = float(os.getenv("REFINE_STRICT", 0.85))

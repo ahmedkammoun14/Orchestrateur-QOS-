@@ -78,13 +78,16 @@ async def compute(payload: Dict[str, Any] = Body(...)):
         )
         raise HTTPException(status_code=400, detail="At least 5 history points required")
 
+    cycle = int(payload.get("cycle", 0))
     logger.info(
-        f"⚙️  /compute — Mode {C.BOLD}AUTONOMOUS{C.RESET} "
-        f"| historique : {C.CYAN}{len(history)}{C.RESET} points"
+        f"\n{'═'*60}\n"
+        f"  ⚙️  Metrics Manager — Cycle #{C.BOLD}{cycle}{C.RESET} | Mode {C.BOLD}AUTONOMOUS{C.RESET}\n"
+        f"  Historique : {C.CYAN}{len(history)}{C.RESET} points\n"
+        f"{'═'*60}"
     )
 
     try:
-        mi_scores = handler.compute_mi_scores(history)
+        mi_scores = handler.compute_mi_scores(history, cycle=cycle)
         all_vals  = payload.get("all_vals", {})
         final_slos, active_metrics = handler.select_dynamic_slos(mi_scores, all_vals, history)
 
@@ -117,14 +120,16 @@ async def validate(payload: Dict[str, Any] = Body(...)):
         )
         raise HTTPException(status_code=400, detail="SLOs and History are required")
 
+    cycle = int(payload.get("cycle", 0))
     logger.info(
-        f"🔎 /validate — Mode {C.BOLD}ENHANCED{C.RESET} "
-        f"| {C.CYAN}{len(slos_raw)}{C.RESET} SLO(s) LLM à valider "
-        f"| historique : {C.CYAN}{len(history)}{C.RESET} points"
+        f"\n{'═'*60}\n"
+        f"  🔎 Metrics Manager — Cycle #{C.BOLD}{cycle}{C.RESET} | Mode {C.BOLD}ENHANCED{C.RESET}\n"
+        f"  SLOs LLM : {C.CYAN}{len(slos_raw)}{C.RESET}   Historique : {C.CYAN}{len(history)}{C.RESET} points\n"
+        f"{'═'*60}"
     )
 
     try:
-        mi_scores = handler.compute_mi_scores(history)
+        mi_scores = handler.compute_mi_scores(history, cycle=cycle)
         slos      = [SLO(**s) for s in slos_raw]
         # Passage de l'historique pour permettre la génération de SLOs
         # secondaires adaptatifs sur les métriques corrélées non couvertes

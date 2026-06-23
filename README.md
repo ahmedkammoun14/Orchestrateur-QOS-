@@ -88,11 +88,15 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 - **Position-based simulated latency**: `latency_ms = 20 × distance_cm(car, VM)` — the closer the vehicle, the lower the latency.
 - **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM).
 - **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision. If TOPSIS selects it despite a violation → STAY (it remains the best option).
-- **MI Scoring (Mutual Information)**: dynamic SLO weighting by real-time correlation between system metrics (CPU/RAM) and latency violations.
+- **MI k-NN (Kozachenko-Leonenko)**: continuous Mutual Information estimator — replaces the old 2×2 contingency table. No discretization, detects non-linear dependencies, robust from ~15 points per class. Formula: `MI(X;Y) = H(X) − H(X|Y)`, normalized by `H(Y)` → score in [0, 1].
+- **5-step MI visualization**: the `metrics_manager` terminal displays a detailed step-by-step k-NN pipeline (H(X), H(X|Y=1), H(X|Y=0), weighted average, final score) with ASCII tables for each metric at every cycle.
+- **Cycle traceability**: every cycle number is passed from the Hub to both `metrics_manager` and `decision_intelligence`. Both terminals display `[Cycle #N]` headers so MI scores and TOPSIS decisions from the same cycle are visibly linked.
 - **Adaptive thresholds**: automatic percentile (P70/P75/P85) based on coefficient of variation — absorbs signal volatility without manual reconfiguration.
-- **Proactive detection**: anticipation of SLO violations via ML predictions over future cycles, with a prudence factor adjusted to model uncertainty.
+- **ML-driven proactive detection**: the breach type is labeled `"proactive"` whenever ML predictions confirm or anticipate a violation (pred_breach or imminent). The label `"reactive"` only appears when no predictions are available.
+- **Observability dashboard**: real-time SSE dashboard at `http://localhost:8009` — VM cards with metric bars and predictions, latency history chart, SLO weight chart, and full audit log with cycle number, breach type, TOPSIS score, and migration trace.
+- **Audit trail**: every decision is posted to the observability service with full context (cycle, breach_type, SLOs, MI scores, TOPSIS score) and broadcast to all SSE subscribers.
 - **2-level LLM cascade**: SLO extraction from natural language via LAAS vLLM (Qwen3-27B, primary) → local Ollama (Qwen2.5, fallback).
-- **Live dashboard**: HTML simulator at `http://<picar-ip>:8080/` with vehicle trajectory, per-VM latency display, active VM badge, and canvas highlight.
+- **Live PiCar simulator**: HTML canvas at `http://<picar-ip>:8080/` with vehicle trajectory, per-VM latency display, active VM badge, and cyan highlight.
 - **Extensible METRICS_REGISTRY**: add a new metric via a single dictionary in `shared/config.py`, without modifying service code.
 - **Anti-thrashing**: configurable post-migration cooldown (`MIGRATION_COOLDOWN_S`, default 5 s for demo) blocking any new migration during stabilization.
 
@@ -437,10 +441,14 @@ qos-orchestrator/
 - [x] End-to-end QoS pipeline (PiCar → Hub → migration)
 - [x] Real kubectl migrations via OpenStack
 - [x] LLM cascade LAAS vLLM (Qwen3-27B) + Ollama fallback
-- [x] MI scoring + adaptive secondary SLOs
-- [x] Proactive violation detection
+- [x] MI k-NN (Kozachenko-Leonenko) continuous estimator — replaces 2×2 table
+- [x] 5-step MI visualization with ASCII tables in metrics_manager terminal
+- [x] Cycle traceability — same cycle number visible in metrics_manager AND decision_intelligence
+- [x] Adaptive secondary SLOs driven by MI scores
+- [x] ML-driven proactive violation detection (labeled "proactive" when predictions guide the decision)
+- [x] SSE observability dashboard with audit trail (http://localhost:8009)
 - [x] PiCar-X demo with position-based latency simulation
-- [x] Live HTML dashboard with active VM indicator
+- [x] Live HTML PiCar simulator with active VM indicator
 - [x] Unit tests (TOPSIS, MI, violation_detector, LLM handler)
 - [ ] Docker + docker-compose containerization
 - [ ] Multi-user support and intent isolation

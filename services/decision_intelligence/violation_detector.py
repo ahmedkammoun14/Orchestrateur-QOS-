@@ -106,40 +106,38 @@ class ViolationDetector:
 
         proactive_threshold: float = threshold * proactive_factor
 
-        # Condition 1 : une prédiction ML dépasse le seuil proactif (seulement si preds non vide)
+        # Condition ML 1 : une prédiction dépasse le seuil proactif
         pred_breach: bool = bool(preds) and any(p > proactive_threshold for p in preds)
 
-        # Condition 2 : breach imminent selon ML ou trajectoire (seulement si preds non vide)
+        # Condition ML 2 : breach imminent selon les prédictions ou la trajectoire
         time_breach_imminent: bool = bool(preds) and (
             time_to_breach <= config.HORIZON_ALERT
             or estimated_steps <= config.HORIZON_ALERT
         )
 
-        # Condition 3 : tendance montante significative (slope > 5% du seuil par pas)
-        # et déjà au-dessus de 60% du seuil — évite les faux positifs sur fluctuations normales
+        # Condition 3 : tendance montante significative
         _MIN_SLOPE: float = threshold * 0.05
-        trend_rising: bool = (
-            slope > _MIN_SLOPE
-            and current_val > threshold * 0.60
-        )
+        trend_rising: bool = slope > _MIN_SLOPE and current_val > threshold * 0.60
 
-        breach_proactive: bool = (
-            (pred_breach or time_breach_imminent or trend_rising)
-            and not breach_reactive
-        )
+        # La décision est "proactive" dès que les prédictions ML confirment ou anticipent
+        # la violation — même si la valeur courante est déjà réactive.
+        # "réactif" ne s'affiche que si aucune prédiction n'est disponible.
+        ml_driven: bool = pred_breach or time_breach_imminent
 
         logger.debug(
             f"🔍 _analyze — val={current_val:.2f} seuil={threshold:.2f} "
             f"slope={slope:.3f}/pas  TTB_ml={time_to_breach}  "
             f"TTB_traj={estimated_steps:.1f}  "
             f"pred_breach={pred_breach}  imminent={time_breach_imminent}  "
-            f"trend={trend_rising}"
+            f"trend={trend_rising}  ml_driven={ml_driven}"
         )
 
-        if breach_reactive:
-            return "reactive", slope, time_to_breach
-        if breach_proactive:
+        if ml_driven or trend_rising:
+            # ML ou tendance guide la décision → proactif (même si déjà en breach réactif)
             return "proactive", slope, time_to_breach
+        if breach_reactive:
+            # Aucune prédiction disponible, réaction à la mesure brute seulement
+            return "reactive", slope, time_to_breach
         return "none", slope, time_to_breach
 
     @staticmethod

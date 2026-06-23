@@ -26,8 +26,30 @@ class DecisionHandler:
         service_vm:         str        = payload["service_vm"]
         cooldown_active:    bool       = bool(payload.get("cooldown_active", False))
         reliability_scores: Dict       = payload.get("reliability_scores", {})
+        cycle:              int        = int(payload.get("cycle", 0))
+        mi_scores:          Dict       = payload.get("mi_scores", {})
 
         ts: str = datetime.now(timezone.utc).isoformat()
+
+        # ── Bannière traçabilité cycle ────────────────────────────────
+        sep = "═" * 62
+        slo_lines = []
+        for s in slos:
+            mi_val = mi_scores.get(s["metric"])
+            kind   = "PRIMAIRE" if s.get("is_primary") else f"SECONDAIRE MI={mi_val:.3f}" if mi_val is not None else "SECONDAIRE"
+            slo_lines.append(
+                f"    • {s['metric']:<12} seuil={s['threshold']:.1f}{s.get('unit','')}  "
+                f"poids={s['weight']:.2f}  [{kind}]"
+            )
+        slo_block = "\n".join(slo_lines) if slo_lines else "    (aucun SLO reçu)"
+        logger.info(
+            f"\n  {sep}\n"
+            f"  🎯  Decision Intelligence — Cycle #{cycle}\n"
+            f"  VM active : {service_vm}\n"
+            f"  SLOs issus du Cycle #{cycle} (Metrics Manager) :\n"
+            f"{slo_block}\n"
+            f"  {sep}"
+        )
 
         # ── Étape 1 : Cooldown (défensif) ────────────────────────────
         if cooldown_active:
