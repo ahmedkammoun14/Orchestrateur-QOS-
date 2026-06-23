@@ -6,116 +6,190 @@
 ![OpenStack](https://img.shields.io/badge/Infrastructure-OpenStack-gray?logo=openstack)
 ![LLM](https://img.shields.io/badge/LLM-Qwen3--27B%20%7C%20Qwen2.5-purple?logo=openai)
 
-Système d'orchestration de microservices pour la gestion autonome de la Qualité de Service (QoS) dans des environnements de streaming sur infrastructure cloud/edge réelle (OpenStack + Kubernetes).
+An autonomous QoS orchestration system for microservices, enabling adaptive Quality of Service management in real cloud/edge environments (OpenStack + Kubernetes), demonstrated with a position-based PiCar-X robotic vehicle.
 
-## Table des matières
-- [Présentation](#présentation)
-- [Contexte académique](#contexte-académique)
-- [Architecture globale](#architecture-globale)
-- [Points forts techniques](#points-forts-techniques)
-- [Stack technologique](#stack-technologique)
+## Table of Contents
+- [Overview](#overview)
+- [Academic Context](#academic-context)
+- [Architecture](#architecture)
+- [Key Technical Features](#key-technical-features)
+- [PiCar-X Demo — Position-Based Latency](#picar-x-demo--position-based-latency)
+- [Tech Stack](#tech-stack)
 - [Configuration](#configuration)
-- [Infrastructure réelle](#infrastructure-réelle)
+- [Real Infrastructure](#real-infrastructure)
 - [Installation](#installation)
-- [Démarrage des services](#démarrage-des-services)
-- [Ports des services](#ports-des-services)
+- [Starting the Services](#starting-the-services)
+- [Service Ports](#service-ports)
 - [API Reference](#api-reference)
 - [Tests](#tests)
-- [Structure du projet](#structure-du-projet)
+- [Project Structure](#project-structure)
 - [Roadmap](#roadmap)
-- [Auteurs](#auteurs)
+- [Authors](#authors)
 
 ---
 
-## Présentation
+## Overview
 
-Dans les environnements distribués modernes, maintenir une performance constante est un défi. **QoS Orchestrator** résout ce problème en agissant comme un cerveau centralisé qui :
+In modern distributed environments, maintaining consistent performance is a challenge. **QoS Orchestrator** solves this by acting as a centralized brain that:
 
-- Interprète les intentions des utilisateurs en langage naturel via un LLM (Qwen3-27B sur LAAS-CNRS, Qwen2.5 en fallback local).
-- Découvre dynamiquement les métriques critiques via l'Information Mutuelle (MI).
-- Prédit les violations futures grâce à des modèles ML (LSTM/GRU/RNN) sur un horizon de 7 cycles.
-- Prend des décisions de migration optimales vers la meilleure VM (Edge ou Cloud) via l'algorithme multicritères TOPSIS.
+- Interprets user intentions in natural language via an LLM (Qwen3-27B on LAAS-CNRS, Qwen2.5 as local fallback).
+- Dynamically discovers critical metrics via Mutual Information (MI).
+- Predicts future violations using ML models (ARIMA/ETS/Linear) over a configurable horizon.
+- Makes optimal migration decisions toward the best VM (Edge or Cloud) using the multicriteria TOPSIS algorithm.
 
-Le système fonctionne en deux modes :
-- **Autonomous** — objectif métier fixe (latence < 30 ms), SLOs secondaires découverts automatiquement par MI.
-- **Enhanced** — SLOs injectés par l'utilisateur via langage naturel, enrichis par MI.
-
----
-
-## Contexte académique
-
-Ce projet a été développé dans le cadre d'un **Projet de Fin d'Études (PFE)** à l'**ENIS Sfax**, en partenariat avec le laboratoire **LAAS-CNRS Toulouse**.
-
-- **Binôme :** Ahmed Kammoun & Mustapha
-- **Encadrement :** LAAS-CNRS / ENIS Sfax
+The system operates in two modes:
+- **Autonomous** — fixed business objective (latency < 300 ms for the demo), secondary SLOs discovered automatically by MI.
+- **Enhanced** — SLOs injected by the user via natural language, enriched by MI.
 
 ---
 
-## Architecture globale
+## Academic Context
 
-Le système suit un pattern **Hub-and-Spoke** : le `Hub` (Orchestrator Core) centralise la logique de contrôle et délègue les tâches spécifiques à des microservices indépendants.
+This project was developed as a **Final Year Project (PFE)** at **ENIS Sfax**, in partnership with the **LAAS-CNRS laboratory in Toulouse**.
+
+- **Team:** Ahmed Kammoun & Mustapha
+- **Supervision:** LAAS-CNRS / ENIS Sfax
+
+---
+
+## Architecture
+
+The system follows a **Hub-and-Spoke** pattern: the `Hub` (Orchestrator Core) centralizes the control logic and delegates specific tasks to independent microservices.
 
 ```text
-           [ Intent Manager ] <─── User (langage naturel)
+           [ Intent Manager ] <─── User (natural language)
                   │
                   ▼
-[ PiCar ] ──► [ Latency Manager ] ──► [ HUB (Core) ] ──► [ Observability ]
-                                          │
-         ┌──────────┬──────────────┬──────┴──────────────────┐
-         │          │              │                          │
+[ PiCar-X ] ──► [ Latency Manager ] ──► [ HUB (Core) ] ──► [ Observability ]
+                                              │
+         ┌──────────┬──────────────┬──────────┴──────────────────┐
+         │          │              │                              │
    [ Collector ] [ ML Predictor ] [ Metrics Manager ] [ Decision Intelligence ]
-         │          │              │                          │
-         ▼          ▼              ▼                          ▼
-   [ VM Agents ] [ ML APIs ]  [ History Loader ]    [ OpenStack Client ]
-         │                         │                          │
-         └──────────► [ Database (Redis) ] <──────────────────┘
-                                                              └─► [ Kubectl ]
+         │          │              │                              │
+         ▼          ▼              ▼                              ▼
+   [ VM Agents ] [ ML APIs ]  [ History Loader ]      [ OpenStack Client ]
+         │                         │                              │
+         └──────────► [ Database (Redis) ] <────────────────────--┘
+                                                                 └─► [ Kubectl ]
 ```
 
-### Exceptions architecturales validées
+### Validated Architectural Exceptions
 
-Deux exceptions au modèle Hub-and-Spoke pur ont été validées pour des raisons de performance :
+Two exceptions to the pure Hub-and-Spoke model have been validated for performance reasons:
 
-1. **Collector → Database** : le collecteur écrit directement les métriques en base pour éviter de saturer le Hub lors des cycles haute fréquence.
-2. **OpenStack Client** : appelé directement par le Hub pour les migrations, sans passer par un spoke intermédiaire.
-
----
-
-## Points forts techniques
-
-- **Pipeline QoS end-to-end** : flux réel du Raspberry Pi (PiCar) → `latency_manager` → `hub` → décision automatique sur 4 VMs OpenStack.
-- **RTT applicatif réel** : mesure via `HTTP GET /health` sur chaque VM, plus représentatif qu'un simple ping ICMP.
-- **TOPSIS 7 étapes** : sélection multicritères de la VM cible (normalisation Min-Max, pondération, distances euclidiennes aux solutions idéales A⁺ et A⁻). Critères : métriques SLO, budget de conformité, fiabilité EMA.
-- **MI Scoring (Information Mutuelle)** : pondération dynamique des SLOs par corrélation temps réel entre métriques système (CPU/RAM) et violations de latence.
-- **Seuils adaptatifs** : percentile automatique (P70/P75/P85) selon le coefficient de variation — absorbe la volatilité du signal sans reconfiguration manuelle.
-- **Détection proactive** : anticipation des violations SLO via prédictions ML (LSTM/GRU/RNN) sur 7 cycles futurs, avec facteur de prudence ajusté à l'incertitude du modèle.
-- **LLM cascade 2 niveaux** : extraction des SLOs depuis le langage naturel via LAAS vLLM (Qwen3-27B, primaire) → Ollama local (Qwen2.5, fallback). Le LLM gère seul la cohérence avec les SLOs actifs via le contexte RAG injecté dans le prompt.
-- **Dashboard temps réel** : interface Matplotlib avec courbes réelles, prédictions passées (audit de précision), prédictions futures, seuil SLO, **marqueurs de migration** (ligne violette annotée à chaque événement) et **bouton Pause/Resume** pour les démos.
-- **METRICS_REGISTRY extensible** : ajout d'une nouvelle métrique via un unique dictionnaire dans `shared/config.py`, sans modifier le code des services.
-- **Snapshot atomique** : le endpoint `/data` du Hub garantit la cohérence totale (métriques, prédictions, SLOs, décision) pour chaque cycle.
-- **Anti-thrashing** : cooldown post-migration configurable (`MIGRATION_COOLDOWN_S`, défaut 60 s) bloquant toute nouvelle migration pendant la stabilisation.
-- **Fiabilité EMA** : chaque VM dispose d'un score de fiabilité mis à jour par moyenne mobile exponentielle (alpha configurable), intégré comme critère TOPSIS.
+1. **Collector → Database**: the collector writes metrics directly to the database to avoid saturating the Hub during high-frequency cycles.
+2. **OpenStack Client**: called directly by the Hub for migrations, without going through an intermediate spoke.
 
 ---
 
-## Stack technologique
+## Key Technical Features
 
-| Catégorie | Outils |
-|-----------|--------|
-| Langage | Python 3.10+ |
-| APIs | FastAPI, Uvicorn, httpx |
-| Stockage | Redis |
+- **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 4 OpenStack VMs.
+- **Position-based simulated latency**: `latency_ms = 20 × distance_cm(car, VM)` — the closer the vehicle, the lower the latency.
+- **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM).
+- **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision. If TOPSIS selects it despite a violation → STAY (it remains the best option).
+- **MI Scoring (Mutual Information)**: dynamic SLO weighting by real-time correlation between system metrics (CPU/RAM) and latency violations.
+- **Adaptive thresholds**: automatic percentile (P70/P75/P85) based on coefficient of variation — absorbs signal volatility without manual reconfiguration.
+- **Proactive detection**: anticipation of SLO violations via ML predictions over future cycles, with a prudence factor adjusted to model uncertainty.
+- **2-level LLM cascade**: SLO extraction from natural language via LAAS vLLM (Qwen3-27B, primary) → local Ollama (Qwen2.5, fallback).
+- **Live dashboard**: HTML simulator at `http://<picar-ip>:8080/` with vehicle trajectory, per-VM latency display, active VM badge, and canvas highlight.
+- **Extensible METRICS_REGISTRY**: add a new metric via a single dictionary in `shared/config.py`, without modifying service code.
+- **Anti-thrashing**: configurable post-migration cooldown (`MIGRATION_COOLDOWN_S`, default 5 s for demo) blocking any new migration during stabilization.
+
+---
+
+## PiCar-X Demo — Position-Based Latency
+
+The demo replaces traditional network RTT measurement with **distance-based simulated latency**. As the PiCar-X vehicle moves along its track, latency to each VM is computed from the Euclidean distance on a 2D map:
+
+```
+latency_ms = 20.0 × distance_cm(car_position, vm_position)
+```
+
+### VM Positions on the Map
+
+| VM | x (cm) | y (cm) | Type |
+|---|---|---|---|
+| edge1 | -20 | +50 | Edge (blue square) |
+| edge2 | +30 | -10 | Edge (blue square) |
+| cloud1 | -20 | -10 | Cloud (orange diamond) |
+| cloud2 | +30 | +50 | Cloud (orange diamond) |
+
+### Components
+
+**`infrastructure/picar_bridge.py`** — Flask server on the PiCar (port 8080):
+
+| Route | Method | Description |
+|---|---|---|
+| `/` | GET | Serves the HTML simulator |
+| `/Trajectoire.jpg` | GET | Serves the track image |
+| `/tick` | POST | Receives `{x, y}`, pings 4 VMs in parallel, sends RTT to hub |
+| `/vm-status` | GET | Proxies `GET :8000/status` from hub → returns `service_vm` |
+
+**`infrastructure/vm_ping/`** — one script per VM (edge1/edge2/cloud1/cloud2):
+
+| Port | Description |
+|---|---|
+| 5001 | `POST /ping {x,y}` → computes distance, sleeps `latency_ms/1000`, returns latency |
+| 8200 | `GET /metrics` → CPU/RAM via psutil |
+
+**`infrastructure/picarx_sim.html`** — visual trajectory simulator:
+- Animated car on a looped track
+- Real-time latency displayed next to each VM
+- **"Service active on" badge** — shows the VM hosting the service (polls `/vm-status` every 3s)
+- **Cyan highlight** — active VM glows with a halo and `★ [ACTIVE]` label on the canvas
+
+Access: `http://140.93.64.105:8080/`
+
+### Demo Flow
+
+```
+Browser (PC)
+    │  GET http://140.93.64.105:8080/          → HTML simulator
+    │  POST /tick {x,y}  every 2s              → real-time latencies
+    │  GET /vm-status    every 3s              → active VM badge
+    ▼
+picar_bridge.py (PiCar :8080)
+    │  POST /ping {x,y} × 4 VMs in parallel   → simulated latency
+    │  POST /rtt {measurements}                → triggers hub cycle
+    │  GET  http://140.93.89.92:8000/status   → current service_vm
+    ▼
+VMs (port 5001) + Hub (port 8000)
+```
+
+### Starting the Demo
+
+```bash
+# On the PiCar (pi@140.93.64.105)
+cd ~/Projet_PFE/trajectoire
+python picar_bridge.py
+
+# On each VM (e.g. edge1)
+ssh -i ~/projet_PFE/admin_log_2.pem ubuntu@194.199.113.18
+cd ~/projet_PFE/trajectoire
+python edge1_ping.py
+```
+
+---
+
+## Tech Stack
+
+| Category | Tools |
+|---|---|
+| Language | Python 3.10+ |
+| APIs | FastAPI, Uvicorn, Flask, httpx |
+| Storage | Redis |
 | LLM | LAAS vLLM (Qwen3-27B-FP16), Ollama (Qwen2.5) |
-| ML | LSTM / GRU / RNN (APIs séparées) |
+| ML | ARIMA / ETS / Linear regression |
 | Infrastructure | OpenStack, Kubernetes (kubectl), SSH |
-| Visualisation | Matplotlib |
+| Demo | Raspberry Pi (PiCar-X), Flask bridge, HTML5 Canvas |
 | Tests | Pytest |
 
 ---
 
 ## Configuration
 
-Variables d'environnement (toutes optionnelles, valeurs par défaut dans `shared/config.py`) :
+Environment variables (all optional, defaults in `shared/config.py`):
 
 ```ini
 # Hub
@@ -127,7 +201,7 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 
 # Orchestration
-MIGRATION_COOLDOWN_S=60
+MIGRATION_COOLDOWN_S=5        # 5s for demo, 60s recommended for production
 PROACTIVE_FACTOR=0.85
 BOOTSTRAP_MIN=5
 HISTORY_WINDOW=50
@@ -137,12 +211,12 @@ ML_RTT_URL=http://localhost:5001/predict
 ML_CPU_URL=http://localhost:5002/predict
 ML_RAM_URL=http://localhost:5003/predict
 
-# LLM — LAAS (primaire)
+# LLM — LAAS (primary)
 LAAS_LLM_URL=https://pfcalcul.laas.fr/vllm/v1/chat/completions
 LAAS_MODEL=Qwen3/Qwen--Qwen3.6-27B-FP16
 LAAS_LLM_PROXY=
 
-# LLM — Ollama (fallback local)
+# LLM — Ollama (local fallback)
 OLLAMA_URL=http://localhost:11434
 INTENT_MODEL=qwen2.5:latest
 
@@ -154,44 +228,29 @@ OPENSTACK_STAGE_DIR=~/stage
 
 ---
 
-## Infrastructure réelle
+## Real Infrastructure
 
-| Nœud | IP |
-|------|----|
-| Master OpenStack | `194.199.113.8` |
-| Raspberry Pi (PiCar) | `140.93.64.105` |
+| Node | IP |
+|---|---|
+| OpenStack Master | `194.199.113.8` |
+| Raspberry Pi (PiCar-X) | `140.93.64.105` |
 | edge1 | `194.199.113.18` |
 | edge2 | `194.199.113.28` |
 | cloud1 | `194.199.113.66` |
 | cloud2 | `194.199.113.69` |
 
-Clusters Kubernetes : `edge-cluster` & `cloud-cluster`
+Kubernetes clusters: `edge-cluster` & `cloud-cluster`
 
-> **Note WSL** : utiliser `chmod 400` sur la clé PEM depuis WSL. Remplacer `localhost` par l'IP Windows (`140.93.89.92`) pour accéder aux services depuis WSL.
+> **WSL note**: use `chmod 400` on the PEM key from WSL. Replace `localhost` with the Windows IP (`140.93.89.92`) to access services from WSL.
 
-### Démarrer les agents VM
+### Start VM agents
 
 ```bash
 chmod 400 ~/projet_PFE/admin_log_2.pem
 ssh -i ~/projet_PFE/admin_log_2.pem ubuntu@194.199.113.18  # edge1
-nohup python3 ~/projet_PFE/vm_agent.py &
-# Répéter pour edge2 (113.28), cloud1 (113.66), cloud2 (113.69)
-```
-
-### Démarrer les APIs ML
-
-```bash
-# 3 terminaux séparés
-uvicorn app.auto:auto_app --port 5001 --reload  # latency
-uvicorn app.auto:auto_app --port 5002 --reload  # cpu
-uvicorn app.auto:auto_app --port 5003 --reload  # ram
-```
-
-### Démarrer le PiCar
-
-```bash
-# Sur le Raspberry Pi
-HUB_URL=http://140.93.89.92:8001/rtt python3 ~/Projet_PFE/picar_client.py
+cd ~/projet_PFE/trajectoire
+python edge1_ping.py
+# Repeat for edge2 (113.28), cloud1 (113.66), cloud2 (113.69)
 ```
 
 ---
@@ -209,22 +268,22 @@ pip install -r requirements.txt
 
 ---
 
-## Démarrage des services
+## Starting the Services
 
-### Prérequis
+### Prerequisites
 
 ```bash
 # Redis
 sudo service redis-server start
 
-# Ollama (fallback LLM local)
+# Ollama (local LLM fallback)
 ollama serve
 
-# Vider Redis avant un redémarrage propre
+# Flush Redis before a clean restart
 redis-cli FLUSHDB
 ```
 
-### Ordre de lancement (respecter l'ordre — le Hub vérifie les health checks au démarrage)
+### Launch Order (respect the order — the Hub checks health at startup)
 
 ```bash
 python -m services.database.app              # 1. Port 8006
@@ -242,21 +301,21 @@ python -m hub.orchestrator_core              # 11. Port 8000
 
 ---
 
-## Ports des services
+## Service Ports
 
-| Service | Port | Rôle |
-|---------|------|------|
-| Hub Core | 8000 | Orchestrateur central |
-| Latency Manager | 8001 | Réception RTT depuis PiCar |
-| Intent Manager | 8002 | Extraction SLOs via LLM |
-| ML Predictor | 8003 | Prédictions LSTM/GRU |
-| Metrics Manager | 8004 | MI scoring + seuils adaptatifs |
-| Collector | 8005 | Collecte CPU/RAM sur VMs |
-| Database | 8006 | Persistance Redis |
-| History Loader | 8007 | Fenêtrage historique |
-| Decision Intelligence | 8008 | TOPSIS + détection violations |
-| Observability | 8009 | Dashboard temps réel |
-| OpenStack Client | 8024 | Migrations kubectl/SSH |
+| Service | Port | Role |
+|---|---|---|
+| Hub Core | 8000 | Central orchestrator |
+| Latency Manager | 8001 | RTT reception from PiCar |
+| Intent Manager | 8002 | SLO extraction via LLM |
+| ML Predictor | 8003 | ARIMA/ETS predictions |
+| Metrics Manager | 8004 | MI scoring + adaptive thresholds |
+| Collector | 8005 | CPU/RAM collection from VMs |
+| Database | 8006 | Redis persistence |
+| History Loader | 8007 | Historical windowing |
+| Decision Intelligence | 8008 | TOPSIS + violation detection |
+| Observability | 8009 | Real-time dashboard |
+| OpenStack Client | 8024 | kubectl/SSH migrations |
 
 ---
 
@@ -264,46 +323,56 @@ python -m hub.orchestrator_core              # 11. Port 8000
 
 ### Hub Core — port 8000
 
-| Méthode | Endpoint | Description |
-|---------|----------|-------------|
-| `POST` | `/rtt` | Réception mesures RTT depuis PiCar |
-| `POST` | `/intent` | Injection SLOs extraits par le LLM |
-| `GET` | `/data` | Snapshot complet (métriques + prédictions + décision) |
-| `GET` | `/status` | État résumé de l'orchestrateur |
-| `GET` | `/health` | Healthcheck |
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/rtt` | Receive RTT measurements from PiCar |
+| `POST` | `/intent` | Inject SLOs extracted by the LLM (internal use) |
+| `GET` | `/data` | Full snapshot (metrics + predictions + decision) |
+| `GET` | `/status` | Orchestrator summary state |
+| `GET` | `/health` | Health check |
+| `POST` | `/reset` | Reset to autonomous mode |
 
 ### Intent Manager — port 8002
 
-| Méthode | Endpoint | Description |
-|---------|----------|-------------|
-| `POST` | `/intent` | Traitement LLM de l'intention utilisateur |
-| `GET` | `/health` | Healthcheck + état Ollama |
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/intent` | LLM processing of user intention → forwards SLOs to hub |
+| `GET` | `/health` | Health check + Ollama status |
+
+> **Important**: send intent to `:8002/intent` (not `:8000/intent`) with the field `intention` (not `intent`). The LLM analyzes the text, extracts SLOs, and automatically forwards them to the hub.
 
 ### Decision Intelligence — port 8008
 
-| Méthode | Endpoint | Description |
-|---------|----------|-------------|
-| `POST` | `/decide` | TOPSIS + détection violations (réactive + proactive) |
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/decide` | TOPSIS + violation detection (reactive + proactive) |
 
-### ML Predictor — port 8003
+### Example — send a user intention
 
-| Méthode | Endpoint | Description |
-|---------|----------|-------------|
-| `POST` | `/predict` | Prédictions latence/CPU/RAM pour toutes les VMs |
+```powershell
+# PowerShell
+$body = @{
+    intention = "I need to deploy a real-time video streaming service. The application requires very fast response times, must handle intensive processing workloads, and will run continuously without interruption."
+} | ConvertTo-Json
 
-### OpenStack Client — port 8024
-
-| Méthode | Endpoint | Description |
-|---------|----------|-------------|
-| `POST` | `/migrate` | Migration kubectl réelle entre clusters |
-| `GET` | `/active_vm` | VM actuellement active sur Kubernetes |
-
-### Exemple — envoyer une intention utilisateur
+Invoke-RestMethod -Uri "http://140.93.89.92:8002/intent" `
+                  -Method Post `
+                  -ContentType "application/json" `
+                  -Body $body
+```
 
 ```bash
-curl -X POST http://localhost:8002/intent \
+# bash
+curl -X POST http://140.93.89.92:8002/intent \
   -H "Content-Type: application/json" \
-  -d '{"intention": "Je veux un flux vidéo très fluide avec une latence inférieure à 80ms"}'
+  -d '{"intention": "I want a very smooth video stream with low latency"}'
+```
+
+### Example — check current state
+
+```bash
+curl http://140.93.89.92:8000/status
+# Returns: mode, service_vm, cycle, cooldown_active, active_slos, last_decision
 ```
 
 ---
@@ -311,46 +380,53 @@ curl -X POST http://localhost:8002/intent \
 ## Tests
 
 ```bash
-# Tous les tests
+# All tests
 pytest tests/
 
-# Tests unitaires
+# Unit tests
 pytest tests/unit/
 
-# Tests d'intégration
+# Integration tests
 pytest tests/integration/
 ```
 
 ---
 
-## Structure du projet
+## Project Structure
 
 ```text
 qos-orchestrator/
 ├── hub/
-│   └── orchestrator_core.py          # Hub central — boucle de décision
+│   └── orchestrator_core.py          # Central hub — decision loop
 ├── infrastructure/
-│   ├── vm_agent.py                   # Agent FastAPI sur chaque VM
-│   ├── openstack_client.py           # Migrations kubectl / SSH
-│   ├── picar_client.py               # Client RTT Raspberry Pi
-│   └── ml_apis/                      # APIs ML (latency / cpu / ram)
+│   ├── vm_agent.py                   # FastAPI agent on each VM
+│   ├── openstack_client.py           # kubectl / SSH migrations
+│   ├── picar_bridge.py               # PiCar Flask bridge (port 8080)
+│   ├── picarx_sim.html               # HTML trajectory simulator
+│   ├── Trajectoire.jpg               # Track image
+│   └── vm_ping/                      # Per-VM ping + metrics scripts
+│       ├── edge1_ping.py             # ping :5001 + agent :8200
+│       ├── edge2_ping.py
+│       ├── cloud1_ping.py
+│       └── cloud2_ping.py
 ├── services/
-│   ├── collector/                    # Collecte métriques temps réel (EMA timeout)
-│   ├── database/                     # Persistance Redis (pipeline atomique)
+│   ├── collector/                    # Real-time metrics collection (EMA timeout)
+│   ├── database/                     # Redis persistence (atomic pipeline)
 │   ├── decision_intelligence/        # TOPSIS + ViolationDetector
-│   ├── history_loader/               # Lecture historiques Redis
+│   ├── history_loader/               # Redis history reading
 │   ├── intent_manager/               # LLM (LAAS → Ollama) + SLOMerger
-│   ├── latency_manager/              # Proxy RTT PiCar → Hub
-│   ├── metrics_manager/              # MI scoring + percentile adaptatif
-│   ├── ml_predictor/                 # Orchestration prédictions ML
-│   └── observability/                # Dashboard Matplotlib temps réel
+│   ├── latency_manager/              # RTT proxy PiCar → Hub
+│   ├── metrics_manager/              # MI scoring + adaptive percentile
+│   ├── ml_predictor/                 # ML prediction orchestration
+│   └── observability/                # Real-time dashboard
 ├── shared/
 │   ├── config.py                     # Ports, METRICS_REGISTRY, VM_REGISTRY
-│   ├── models.py                     # Modèles Pydantic (SLO, RTTMeasurement…)
-│   └── redis_keys.py                 # Constantes clés Redis
+│   ├── models.py                     # Pydantic models (SLO, RTTMeasurement…)
+│   └── redis_keys.py                 # Redis key constants
 ├── tests/
 │   ├── unit/                         # TOPSIS, MI, violation_detector, LLM handler
-│   └── integration/                  # Cycle complet hub → services
+│   └── integration/                  # Full hub → services cycle
+├── DOCUMENTATION.md                  # Full technical documentation (FR)
 └── requirements.txt
 ```
 
@@ -358,22 +434,23 @@ qos-orchestrator/
 
 ## Roadmap
 
-- [x] Pipeline QoS end-to-end opérationnel (PiCar → Hub → migration)
-- [x] Migrations kubectl réelles via OpenStack
+- [x] End-to-end QoS pipeline (PiCar → Hub → migration)
+- [x] Real kubectl migrations via OpenStack
 - [x] LLM cascade LAAS vLLM (Qwen3-27B) + Ollama fallback
-- [x] MI scoring + SLOs secondaires adaptatifs
-- [x] Détection proactive des violations (horizon 7 cycles)
-- [x] Dashboard temps réel — marqueurs de migration + pause/resume
-- [x] Tests unitaires (TOPSIS, MI, violation_detector, LLM handler, redis_client)
-- [ ] Conteneurisation Docker + docker-compose
-- [ ] Support multi-utilisateurs et isolation des intents
-- [ ] API REST publique documentée (Swagger UI enrichie)
+- [x] MI scoring + adaptive secondary SLOs
+- [x] Proactive violation detection
+- [x] PiCar-X demo with position-based latency simulation
+- [x] Live HTML dashboard with active VM indicator
+- [x] Unit tests (TOPSIS, MI, violation_detector, LLM handler)
+- [ ] Docker + docker-compose containerization
+- [ ] Multi-user support and intent isolation
+- [ ] Public REST API documentation (enriched Swagger UI)
 
 ---
 
-## Auteurs
+## Authors
 
 **Ahmed Kammoun** — [ahmed.kammoun@enis.tn](mailto:ahmed.kammoun@enis.tn) — ENIS Sfax  
-**Mustapha** — ENIS Sfax  
+**Mustapha** — ENIS Sfax
 
-Encadrement : **LAAS-CNRS Toulouse**
+Supervision: **LAAS-CNRS Toulouse**
