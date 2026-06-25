@@ -5,6 +5,7 @@
 ![Redis](https://img.shields.io/badge/Redis-Storage-red?logo=redis)
 ![OpenStack](https://img.shields.io/badge/Infrastructure-OpenStack-gray?logo=openstack)
 ![LLM](https://img.shields.io/badge/LLM-Qwen3--27B%20%7C%20Qwen2.5-purple?logo=openai)
+![ML](https://img.shields.io/badge/ML-ESN%20%7C%20LSTM%20%7C%20GRU%20%7C%20RNN-orange)
 
 An autonomous QoS orchestration system for microservices, enabling adaptive Quality of Service management in real cloud/edge environments (OpenStack + Kubernetes), demonstrated with a position-based PiCar-X robotic vehicle.
 
@@ -33,8 +34,8 @@ An autonomous QoS orchestration system for microservices, enabling adaptive Qual
 In modern distributed environments, maintaining consistent performance is a challenge. **QoS Orchestrator** solves this by acting as a centralized brain that:
 
 - Interprets user intentions in natural language via an LLM (Qwen3-27B on LAAS-CNRS, Qwen2.5 as local fallback).
-- Dynamically discovers critical metrics via Mutual Information (MI).
-- Predicts future violations using ML models (ARIMA/ETS/Linear) over a configurable horizon.
+- Dynamically discovers critical metrics via Mutual Information (MI k-NN, Kozachenko-Leonenko estimator).
+- Predicts future violations using ML models (ESN, LSTM, GRU, RNN) via a 3-level prediction cascade over a configurable horizon.
 - Makes optimal migration decisions toward the best VM (Edge or Cloud) using the multicriteria TOPSIS algorithm.
 
 The system operates in two modes:
@@ -86,9 +87,12 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 
 - **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 4 OpenStack VMs.
 - **Position-based simulated latency**: `latency_ms = 20 × distance_cm(car, VM)` — the closer the vehicle, the lower the latency.
-- **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM).
-- **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision. If TOPSIS selects it despite a violation → STAY (it remains the best option).
+- **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM). Uses **ML predictions** as input values — not raw measurements — to anticipate future state.
+- **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision pool. If TOPSIS selects it despite a violation → STAY (it remains the best option). This prevents unnecessary migrations when the current VM is still the least-bad choice.
 - **MI k-NN (Kozachenko-Leonenko)**: continuous Mutual Information estimator — replaces the old 2×2 contingency table. No discretization, detects non-linear dependencies, robust from ~15 points per class. Formula: `MI(X;Y) = H(X) − H(X|Y)`, normalized by `H(Y)` → score in [0, 1].
+- **3-level ML prediction cascade**: Level 1 — `POST /predict_sequence` (full window, horizon 7); Level 2 — `GET /predict?input_data=X` (single point); Level 3 — `last_value_fallback`. Each level activates only if the previous fails.
+- **ESN (Echo State Network)**: reservoir computing model with a recursive multi-step strategy for horizon > 1. Trained via `/main` endpoint on historical datasets. Fixed for correct 2D input shape (flatten before recursive loop).
+- **YAML_PER_VM mapping**: each VM maps to the correct Kubernetes YAML file matching its PoP label (`space_1` → edge1/cloud1, `space_2` → edge2/cloud2). Ensures pods land on the correct physical node after migration.
 - **5-step MI visualization**: the `metrics_manager` terminal displays a detailed step-by-step k-NN pipeline (H(X), H(X|Y=1), H(X|Y=0), weighted average, final score) with ASCII tables for each metric at every cycle.
 - **Cycle traceability**: every cycle number is passed from the Hub to both `metrics_manager` and `decision_intelligence`. Both terminals display `[Cycle #N]` headers so MI scores and TOPSIS decisions from the same cycle are visibly linked.
 - **Adaptive thresholds**: automatic percentile (P70/P75/P85) based on coefficient of variation — absorbs signal volatility without manual reconfiguration.
@@ -184,7 +188,8 @@ python edge1_ping.py
 | APIs | FastAPI, Uvicorn, Flask, httpx |
 | Storage | Redis |
 | LLM | LAAS vLLM (Qwen3-27B-FP16), Ollama (Qwen2.5) |
-| ML | ARIMA / ETS / Linear regression |
+| ML Models | ESN, LSTM, GRU, RNN (external FastAPI APIs on :5001/:5002/:5003) |
+| ML Libraries | NumPy, scikit-learn, TensorFlow/Keras, scipy |
 | Infrastructure | OpenStack, Kubernetes (kubectl), SSH |
 | Demo | Raspberry Pi (PiCar-X), Flask bridge, HTML5 Canvas |
 | Tests | Pytest |
@@ -312,14 +317,17 @@ python -m hub.orchestrator_core              # 11. Port 8000
 | Hub Core | 8000 | Central orchestrator |
 | Latency Manager | 8001 | RTT reception from PiCar |
 | Intent Manager | 8002 | SLO extraction via LLM |
-| ML Predictor | 8003 | ARIMA/ETS predictions |
+| ML Predictor | 8003 | Prediction orchestrator (3-level cascade) |
 | Metrics Manager | 8004 | MI scoring + adaptive thresholds |
 | Collector | 8005 | CPU/RAM collection from VMs |
 | Database | 8006 | Redis persistence |
 | History Loader | 8007 | Historical windowing |
 | Decision Intelligence | 8008 | TOPSIS + violation detection |
 | Observability | 8009 | Real-time dashboard |
-| OpenStack Client | 8024 | kubectl/SSH migrations |
+| OpenStack Client | 8024 | kubectl migrations (on master 194.199.113.8) |
+| ML API — Latency | 5001 | ESN/LSTM model for latency prediction |
+| ML API — CPU | 5002 | ESN/LSTM model for cpu_usage prediction |
+| ML API — RAM | 5003 | ESN/LSTM model for ram_usage prediction |
 
 ---
 
@@ -354,15 +362,17 @@ python -m hub.orchestrator_core              # 11. Port 8000
 ### Example — send a user intention
 
 ```powershell
-# PowerShell
-$body = @{
-    intention = "I need to deploy a real-time video streaming service. The application requires very fast response times, must handle intensive processing workloads, and will run continuously without interruption."
-} | ConvertTo-Json
+# PowerShell — UTF-8 encoding required for French characters
+$bodyObj = @{
+    intent_id = "test-enhanced-001"
+    intention = "Je regarde mon robot en direct depuis l appli et ca rame vraiment. L image saute, elle gele pendant des secondes et des fois je perds completement le flux. En plus l appli plante de temps en temps sans raison. Je veux juste regarder le robot bouger sans probleme."
+}
+$bytes = [System.Text.Encoding]::UTF8.GetBytes(($bodyObj | ConvertTo-Json -Depth 3 -Compress))
 
-Invoke-RestMethod -Uri "http://140.93.89.92:8002/intent" `
-                  -Method Post `
-                  -ContentType "application/json" `
-                  -Body $body
+Invoke-RestMethod -Uri "http://localhost:8002/intent" `
+                  -Method POST `
+                  -ContentType "application/json; charset=utf-8" `
+                  -Body $bytes
 ```
 
 ```bash
@@ -403,8 +413,10 @@ qos-orchestrator/
 ├── hub/
 │   └── orchestrator_core.py          # Central hub — decision loop
 ├── infrastructure/
-│   ├── vm_agent.py                   # FastAPI agent on each VM
-│   ├── openstack_client.py           # kubectl / SSH migrations
+│   ├── ml_apis/                      # External ML prediction APIs
+│   │   ├── ml_api_rtt.py             # ESN/LSTM latency model — port 5001
+│   │   ├── ml_api_cpu.py             # ESN/LSTM CPU model    — port 5002
+│   │   └── ml_api_ram.py             # ESN/LSTM RAM model    — port 5003
 │   ├── picar_bridge.py               # PiCar Flask bridge (port 8080)
 │   ├── picarx_sim.html               # HTML trajectory simulator
 │   ├── Trajectoire.jpg               # Track image
@@ -417,19 +429,24 @@ qos-orchestrator/
 │   ├── collector/                    # Real-time metrics collection (EMA timeout)
 │   ├── database/                     # Redis persistence (atomic pipeline)
 │   ├── decision_intelligence/        # TOPSIS + ViolationDetector
+│   │   ├── decision.py               # Decision handler (TOPSIS + active VM fix)
+│   │   ├── topsis.py                 # 7-step TOPSIS with min-max normalisation
+│   │   └── violation_detector.py     # Reactive / proactive breach classification
 │   ├── history_loader/               # Redis history reading
 │   ├── intent_manager/               # LLM (LAAS → Ollama) + SLOMerger
 │   ├── latency_manager/              # RTT proxy PiCar → Hub
-│   ├── metrics_manager/              # MI scoring + adaptive percentile
-│   ├── ml_predictor/                 # ML prediction orchestration
-│   └── observability/                # Real-time dashboard
+│   ├── metrics_manager/              # MI k-NN scoring + adaptive percentile
+│   ├── ml_predictor/                 # 3-level prediction cascade orchestrator
+│   └── observability/                # Real-time SSE dashboard
 ├── shared/
-│   ├── config.py                     # Ports, METRICS_REGISTRY, VM_REGISTRY
+│   ├── config.py                     # Ports, METRICS_REGISTRY, SLO bounds
 │   ├── models.py                     # Pydantic models (SLO, RTTMeasurement…)
 │   └── redis_keys.py                 # Redis key constants
 ├── tests/
 │   ├── unit/                         # TOPSIS, MI, violation_detector, LLM handler
 │   └── integration/                  # Full hub → services cycle
+├── openstack_client.py               # kubectl migrations — deployed on master :8024
+│                                     # YAML_PER_VM: space_1→edge1/cloud1, space_2→edge2/cloud2
 ├── DOCUMENTATION.md                  # Full technical documentation (FR)
 └── requirements.txt
 ```
@@ -450,6 +467,10 @@ qos-orchestrator/
 - [x] PiCar-X demo with position-based latency simulation
 - [x] Live HTML PiCar simulator with active VM indicator
 - [x] Unit tests (TOPSIS, MI, violation_detector, LLM handler)
+- [x] Active VM included in TOPSIS pool — STAY when current VM is still best candidate
+- [x] YAML_PER_VM mapping — correct Kubernetes nodeSelector per VM (space_1/space_2 PoP labels)
+- [x] ESN recursive strategy fixed — flatten guarantees 2D input shape in multi-step prediction
+- [x] 3-level ML prediction cascade (sequence → point → last_value_fallback)
 - [ ] Docker + docker-compose containerization
 - [ ] Multi-user support and intent isolation
 - [ ] Public REST API documentation (enriched Swagger UI)

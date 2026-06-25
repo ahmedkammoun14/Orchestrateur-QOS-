@@ -188,7 +188,10 @@ class PredictorHandler:
                 return preds
             return [p * 100.0 for p in preds]
         if metric == "latency":
-            if preds and max(preds) < 2.0:
+            # predictor.py envoie latency_ms/100 → les prédictions reviennent dans
+            # la même échelle (ex: 3.93 pour 393ms) → multiplier par 100 pour obtenir ms.
+            # Seuil à 100 : si valeur > 100 elle est déjà en ms brut.
+            if preds and max(preds) < 100.0:
                 return [p * 100.0 for p in preds]
         return preds
 

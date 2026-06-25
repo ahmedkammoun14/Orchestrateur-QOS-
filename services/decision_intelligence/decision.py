@@ -103,10 +103,10 @@ class DecisionHandler:
         )
         violated_metrics: List[str] = [v["metric"] for v in violations]
 
-        # ── Étape 4 : Candidats = toutes les VMs sauf la VM en violation ──
-        all_candidates: List[Dict] = [
-            v for v in current_data if v["vm_id"] != service_vm
-        ]
+        # ── Étape 4 : Candidats = toutes les VMs (VM active incluse) ──────
+        # La VM active est incluse dans le pool TOPSIS pour comparer si rester
+        # vaut mieux que migrer. Si TOPSIS la sélectionne → STAY (cf. étape 6).
+        all_candidates: List[Dict] = list(current_data)
 
         if not all_candidates:
             logger.warning(
@@ -123,7 +123,7 @@ class DecisionHandler:
         preferred  = len(candidates) < len(all_candidates)
         logger.info(
             f"🔎 Candidats TOPSIS : {[c['vm_id'] for c in candidates]} "
-            f"| {'SLOs pré-satisfaits' if preferred else 'fallback tous candidats'}"
+            f"| {'SLOs pré-satisfaits' if preferred else 'fallback tous candidats (VM active incluse)'}"
         )
 
         # ── Étape 5 : Sélection TOPSIS ───────────────────────────────

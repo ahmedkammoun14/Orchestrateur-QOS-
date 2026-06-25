@@ -3,7 +3,7 @@
 **Projet** : Orchestration QoS adaptative pour services distribués sur infrastructure OpenStack/Kubernetes  
 **Auteur** : Ahmed Kammoun — ahmed.kammoun@enis.tn  
 **Date** : Juin 2026  
-**Version** : 2.4.0
+**Version** : 2.5.0
 
 ---
 
@@ -20,12 +20,13 @@
 9. [Traçabilité des cycles](#9-traçabilité-des-cycles)
 10. [Observabilité — Dashboard SSE](#10-observabilité--dashboard-sse)
 11. [Module Intent Manager (mode ENHANCED)](#11-module-intent-manager-mode-enhanced)
-12. [Infrastructure OpenStack / Kubernetes](#12-infrastructure-openstack--kubernetes)
-13. [Persistance — Redis & Excel](#13-persistance--redis--excel)
-14. [Configuration](#14-configuration)
-15. [Démarrage du système](#15-démarrage-du-système)
-16. [Démo PiCar-X — Latence basée sur la position](#16-démo-picar-x--latence-basée-sur-la-position)
-17. [Résultats de validation](#17-résultats-de-validation)
+12. [Prédictions ML — Cascade 3 niveaux](#12-prédictions-ml--cascade-3-niveaux)
+13. [Infrastructure OpenStack / Kubernetes](#13-infrastructure-openstack--kubernetes)
+14. [Persistance — Redis & Excel](#14-persistance--redis--excel)
+15. [Configuration](#15-configuration)
+16. [Démarrage du système](#16-démarrage-du-système)
+17. [Démo PiCar-X — Latence basée sur la position](#17-démo-picar-x--latence-basée-sur-la-position)
+18. [Résultats de validation](#18-résultats-de-validation)
 
 ---
 
@@ -101,9 +102,12 @@ Le Hub est le seul coordinateur. Les services spokes n'ont aucune connaissance l
 | **Collector** | 8005 | `services/collector/collector.py` | Collecte CPU/RAM via API agents sur chaque VM |
 | **Database** | 8006 | `services/database/redis_client.py` | Persistance Redis (métriques, SLOs, décisions) |
 | **History Loader** | 8007 | `services/history_loader/app.py` | Chargement historiques depuis Redis |
-| **Decision Intelligence** | 8008 | `services/decision_intelligence/topsis.py` | Sélection VM optimale par TOPSIS |
-| **Observability** | 8009 | `services/observability/visualizer.py` | Dashboard temps réel |
-| **OpenStack Client** | 8024 | `shared/openstack_client.py` | Exécution migrations kubectl sur le master |
+| **Decision Intelligence** | 8008 | `services/decision_intelligence/decision.py` | Sélection VM optimale par TOPSIS |
+| **Observability** | 8009 | `services/observability/visualizer.py` | Dashboard temps réel SSE |
+| **OpenStack Client** | 8024 | `openstack_client.py` (racine, déployé sur master) | Migrations kubectl avec YAML_PER_VM |
+| **ML API — Latency** | 5001 | `infrastructure/ml_apis/ml_api_rtt.py` | Modèle ESN/LSTM pour la latence |
+| **ML API — CPU** | 5002 | `infrastructure/ml_apis/ml_api_cpu.py` | Modèle ESN/LSTM pour cpu_usage |
+| **ML API — RAM** | 5003 | `infrastructure/ml_apis/ml_api_ram.py` | Modèle ESN/LSTM pour ram_usage |
 
 ### VMs OpenStack disponibles
 
@@ -367,8 +371,9 @@ cloud2 : score=0.0639
 
 ### Garde-fous
 
-- **VM active incluse comme candidate** : la VM courante est désormais incluse dans le pool TOPSIS. Si TOPSIS la sélectionne malgré la violation → décision STAY (meilleure option disponible).
-- Fast path cooldown : si cooldown actif → STAY immédiat sans appel TOPSIS
+- **VM active incluse comme candidate** : la VM courante est désormais incluse dans le pool TOPSIS (`all_candidates = list(current_data)`). Si TOPSIS la sélectionne malgré la violation → décision STAY (meilleure option disponible). Ce mécanisme évite les migrations inutiles quand toutes les autres VMs sont pires (ex : edge2 à 164ms vs cloud1 à 1117ms — le système reste sur edge2 même en violation CPU légère).
+- **Fast path cooldown** : si cooldown actif → STAY immédiat sans appel TOPSIS
+- **TOPSIS utilise les prédictions ML**, pas les valeurs instantanées. Si les prédictions sont indisponibles (`last_value_fallback`), la valeur actuelle répétée 7 fois est utilisée — le TOPSIS est fonctionnel mais aveugle aux tendances futures.
 - Colonnes **budget** et **fiabilité** supprimées du TOPSIS — leurs valeurs étaient systématiquement identiques pour toutes les VMs (0.000) et n'apportaient aucune discrimination. Seules les métriques SLO (latency, cpu_usage, ram_usage) constituent la matrice de décision.
 
 ---
@@ -569,25 +574,124 @@ Fusionne les SLOs LLM avec les contraintes du registre métier :
 
 ---
 
-## 12. Infrastructure OpenStack / Kubernetes
+## 12. Prédictions ML — Cascade 3 niveaux
+
+Fichier : `services/ml_predictor/predictor.py`
+
+Le ML Predictor orchestre les appels vers trois APIs externes (une par métrique) en suivant une stratégie de fallback à 3 niveaux garantissant toujours un résultat.
+
+### APIs ML externes
+
+| Port | Métrique | Modèle par défaut | Endpoints |
+|---|---|---|---|
+| 5001 | latency | ESN (look_back=127) | `POST /predict_sequence`, `GET /predict`, `POST /main` |
+| 5002 | cpu_usage | ESN/LSTM | `POST /predict_sequence`, `GET /predict`, `POST /main` |
+| 5003 | ram_usage | ESN/LSTM | `POST /predict_sequence`, `GET /predict`, `POST /main` |
+
+### Cascade de prédiction (par métrique)
+
+```
+Niveau 1 — POST /predict_sequence  (si len(history) >= window_size)
+│  Entrée : {"sequence": [v1/100, ..., vN/100], "horizon": 7}
+│  Sortie : {"predictions": [p1, ..., p7]}
+│  → Dénormalisation : p × 100 si max(p) < 100
+└─ Succès → retourne prédictions ML complètes
+
+Niveau 2 — GET /predict?input_data=X  (si Niveau 1 échoue ou historique insuffisant)
+│  Entrée : last_val / 100.0  (dernier point normalisé)
+│  Sortie : {"prediction": "[p1, ..., p7]"} (string)
+│  → _parse_api_list() pour parser la réponse
+└─ Succès → retourne prédictions partielles
+
+Niveau 3 — last_value_fallback  (si Niveaux 1 et 2 épuisés)
+   Retourne : [last_val] × 7  (valeur actuelle répétée)
+   Impact TOPSIS : aveugle aux tendances, mais fonctionnel
+```
+
+### ESN (Echo State Network) — détails
+
+Le modèle ESN utilise une stratégie récursive pour `horizon > 1` :
+
+```python
+# Stratégie récursive multi-pas
+X_row = np.array(X_row).flatten()        # Garantit 1D (fix critique)
+for i in range(n_steps):
+    forecast = model.predict(np.array([X_row]))  # (1, look_back) → 2D ✓
+    forecasts.append(forecast[0, 0])
+    X_row = X_row.tolist()
+    X_row.append(forecast[0, 0])         # Glissement de fenêtre
+    X_row = X_row[1:]
+    X_row = np.array(X_row)
+```
+
+**Correction critique** : le `flatten()` est indispensable. Sans lui, `X_row` hériterait d'une forme 2D `(1, look_back)`, et `np.array([X_row])` créerait un tenseur 3D `(1, 1, look_back)`. La méthode `predict()` de l'ESN ne redimensionne que si `ndim < 2` → le 3D bypassait ce contrôle → `np.vstack([lastinput_2D, _scale_inputs(3D)])` levait `ValueError: dimensions mismatch`.
+
+### Entraînement des modèles ML
+
+```bash
+# Entraîner le modèle latence (port 5001)
+curl.exe -X POST "http://localhost:5001/main" `
+  -F "file=@qos_picarx_dataset.xlsx" `
+  -F "target_columns=node1_delay" `
+  -F "forecasting_horizon=7"
+
+# Entraîner le modèle CPU (port 5002)
+curl.exe -X POST "http://localhost:5002/main" `
+  -F "file=@qos_picarx_dataset.xlsx" `
+  -F "target_columns=cpu_usage" `
+  -F "forecasting_horizon=7"
+
+# Entraîner le modèle RAM (port 5003)
+curl.exe -X POST "http://localhost:5003/main" `
+  -F "file=@qos_picarx_dataset.xlsx" `
+  -F "target_columns=ram_usage" `
+  -F "forecasting_horizon=7"
+```
+
+> **Note** : les modèles ne sont pas persistés sur disque. Un redémarrage de l'API nécessite de ré-entraîner via `/main`. En l'absence d'entraînement, le Niveau 2 et le Niveau 3 prennent le relais automatiquement.
+
+---
+
+## 13. Infrastructure OpenStack / Kubernetes
 
 ### OpenStack Client (`:8024`)
 
-Déployé sur le master Kubernetes (`194.199.113.8`). Expose deux endpoints :
+Déployé sur le master Kubernetes (`194.199.113.8`). Fichier : `openstack_client.py` (racine du projet). Expose deux endpoints :
 
 ```
 GET  /active_vm  → retourne la VM active courante (kubectl get pods)
 POST /migrate    → body: {"from_vm": "edge1", "to_vm": "cloud2"}
-                 → exécute kubectl scale/rollout sur le bon cluster
-                 → retourne {"status": "ok", "cluster": "cloud-cluster"}
+                 → supprime le déploiement source
+                 → applique le bon fichier YAML sur le cluster cible
+                 → retourne {"status": "migrated", "cluster": "...", "yaml": "..."}
 ```
+
+### YAML_PER_VM — sélection du fichier Kubernetes
+
+Chaque VM correspond à un `PoP` label Kubernetes différent. Le fichier YAML correct doit être appliqué pour que le pod se déploie sur le bon nœud physique.
+
+```python
+YAML_PER_VM = {
+    "edge1":  "tc-stream-source-cloud1.yaml",   # PoP: space_1
+    "edge2":  "tc-stream-source-cloud.yaml",    # PoP: space_2
+    "cloud1": "tc-stream-source-cloud1.yaml",   # PoP: space_1
+    "cloud2": "tc-stream-source-cloud.yaml",    # PoP: space_2
+}
+```
+
+| PoP label | Nœuds | VMs |
+|---|---|---|
+| `space_1` | pop1-worker-1, pop2-worker-1 | edge1, cloud1 |
+| `space_2` | pop1-worker-2, pop2-worker-2 | edge2, cloud2 |
+
+**Bug corrigé** : l'ancienne version utilisait toujours `tc-stream-source-cloud.yaml` (PoP: space_2) pour toutes les VMs. Les migrations vers edge1 et cloud1 déployaient le pod sur le mauvais nœud, rendant le dashboard incohérent avec la VM réellement active.
 
 ### Clusters
 
 | Cluster | VMs | Namespace Kubernetes |
 |---|---|---|
-| edge-cluster | edge1, edge2 | `default` |
-| cloud-cluster | cloud1, cloud2 | `default` |
+| edge-cluster | edge1 (pop1-worker-1), edge2 (pop1-worker-2) | `tc` |
+| cloud-cluster | cloud1 (pop2-worker-1), cloud2 (pop2-worker-2) | `tc` |
 
 ### VM Agent
 
@@ -595,7 +699,7 @@ Chaque VM expose un agent HTTP sur le port 8200 (`vm_agent.py`). Le Collector in
 
 ---
 
-## 13. Persistance — Redis & Excel
+## 14. Persistance — Redis & Excel
 
 ### Redis (`services/database/redis_client.py`)
 
@@ -628,7 +732,7 @@ Fichier : `data/qos_history.xlsx`
 
 ---
 
-## 14. Configuration
+## 15. Configuration
 
 Fichier : `shared/config.py`
 
@@ -689,7 +793,7 @@ LAAS_LLM_PROXY=https://user:pass@proxy.laas.fr:443
 
 ---
 
-## 15. Démarrage du système
+## 16. Démarrage du système
 
 ### Ordre de démarrage recommandé
 
@@ -743,25 +847,30 @@ curl http://localhost:8004/health    # Metrics Manager
 L'intention doit être envoyée à **l'intent_manager** (`:8002`) avec le champ `intention` (et non au hub directement) :
 
 ```powershell
-# PowerShell
-$body = @{
-    intention = "I need to deploy a real-time video streaming service for autonomous vehicles. The application requires very fast response times to avoid any control delay, must handle intensive video processing workloads, and will run continuously without interruption."
-} | ConvertTo-Json
+# PowerShell — encodage UTF-8 obligatoire pour les caractères accentués
+# ConvertTo-Json sans $bytes peut provoquer "There was an error parsing the body" (FastAPI 400)
+$bodyObj = @{
+    intent_id = "test-enhanced-001"
+    intention = "Je regarde mon robot en direct depuis l appli et ca rame vraiment. L image saute, elle gele pendant des secondes et des fois je perds completement le flux. En plus l appli plante de temps en temps sans raison. Je veux juste regarder le robot bouger sans probleme."
+}
+$bytes = [System.Text.Encoding]::UTF8.GetBytes(($bodyObj | ConvertTo-Json -Depth 3 -Compress))
 
-Invoke-RestMethod -Uri "http://140.93.89.92:8002/intent" `
-                  -Method Post `
-                  -ContentType "application/json" `
-                  -Body $body
+Invoke-RestMethod -Uri "http://localhost:8002/intent" `
+                  -Method POST `
+                  -ContentType "application/json; charset=utf-8" `
+                  -Body $bytes
 ```
 
 ```bash
 # bash/curl
-curl -X POST http://140.93.89.92:8002/intent \
+curl -X POST http://localhost:8002/intent \
   -H "Content-Type: application/json" \
-  -d '{"intention": "Je regarde un stream vidéo en ce moment et j'\''ai besoin que ce soit fluide"}'
+  -d '{"intention": "Je regarde un stream video en ce moment et j ai besoin que ce soit fluide"}'
 ```
 
 > **Important** : le champ s'appelle `intention` (pas `intent`). Le LLM (LAAS Qwen3-27B → Ollama fallback) analyse le texte, extrait les SLOs, puis les transmet automatiquement au hub via `POST :8000/intent`.
+
+> **Conseil** : éviter les accents dans la valeur PowerShell pour prévenir tout résidu d'encodage. Le LLM interprète correctement les textes sans accentuation.
 
 ### Reset vers le mode AUTONOMOUS
 
@@ -771,7 +880,7 @@ curl -X POST http://localhost:8000/reset
 
 ---
 
-## 16. Démo PiCar-X — Latence basée sur la position
+## 17. Démo PiCar-X — Latence basée sur la position
 
 ### Principe
 
@@ -877,7 +986,7 @@ python edge1_ping.py
 
 ---
 
-## 17. Résultats de validation
+## 18. Résultats de validation
 
 Tests effectués le 22 juin 2026 sur infrastructure réelle (OpenStack ENIS).
 
@@ -931,3 +1040,11 @@ LLM extrait → 3 SLOs primaires : `latency<300ms (0.5)` + `cpu<80% (0.25)` + `r
 5. **Anti-thrashing cooldown 5s** : réduit de 60s à 5s pour la démo PiCar afin que le système réagisse rapidement. En production, 60s est recommandé pour éviter les migrations en cascade.
 
 6. **Poids originaux préservés** : le mécanisme `original_intent_weights` empêche la dilution progressive des poids LLM cycle après cycle quand le Metrics Manager enrichit avec des SLOs secondaires.
+
+7. **VM active dans le pool TOPSIS** : depuis le correctif de `decision.py`, l'inclusion systématique de la VM courante dans les candidats empêche les migrations inutiles. Exemple observé (Cycle #2093) : edge2 (164ms RTT, violation CPU légère) vs cloud1 (1117ms RTT) — TOPSIS score edge2 = **0.6796** → STAY au lieu d'une migration vers cloud1 qui aurait dégradé la latence de ×6.
+
+8. **YAML_PER_VM** : le correctif de `openstack_client.py` garantit que les migrations vers edge1/cloud1 utilisent `tc-stream-source-cloud1.yaml` (PoP: space_1) et non le fichier space_2. Les pods se déploient désormais sur le bon nœud physique, rendant le dashboard cohérent avec la VM réellement active.
+
+9. **ESN flatten fix** : le correctif dans `auto_predict.py` (ajout de `.flatten()` dans `esn_recursive_strategy`) élimine l'erreur `ValueError: all input arrays must have same number of dimensions` qui bloquait toutes les prédictions multi-pas ESN au Niveau 1 et Niveau 2.
+
+10. **Mode ENHANCED — détection implicite de métriques** : le LLM (Qwen3-27B ou Qwen2.5) déduit correctement les 3 métriques depuis une intention sans métrique nommée (ex : "l'image gèle" → latency, "le serveur rame" → cpu_usage, "l'appli plante" → ram_usage) et applique les seuils experts par défaut (latency=100ms, cpu=80%, ram=80%).

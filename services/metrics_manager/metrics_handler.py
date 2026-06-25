@@ -45,10 +45,17 @@ class MetricsHandler:
     # MI — Information Mutuelle Normalisée
     # ─────────────────────────────────────────────────────────────
 
-    def compute_mi_scores(self, history: List[Dict[str, Any]], cycle: int = 0) -> Dict[str, float]:
+    def compute_mi_scores(
+        self,
+        history: List[Dict[str, Any]],
+        cycle: int = 0,
+        include_primaries: bool = True,
+        skip_metrics: Optional[set] = None,
+    ) -> Dict[str, float]:
         """
         Calcule le score MI entre chaque métrique et le signal de violation.
-        Retourne un score normalisé dans [0, 1].
+        include_primaries=False : saute les métriques primaires du registre (AUTONOMOUS).
+        skip_metrics : ensemble de noms de métriques à sauter (ENHANCED — métriques LLM).
         """
         mi_results = {}
         y_vals = [1 if p.get("is_violation", False) else 0 for p in history]
@@ -69,7 +76,16 @@ class MetricsHandler:
             hist_headers, hist_rows,
         ))
 
-        for metric in self.registry.keys():
+        for metric, reg in self.registry.items():
+            # AUTONOMOUS : métriques primaires du registre → poids fixe 1.0, MI inutile
+            if not include_primaries and reg.get("is_primary_objective", False):
+                logger.debug(f"⏭  {metric} — PRIMAIRE registre, MI ignoré (AUTONOMOUS)")
+                continue
+            # ENHANCED : métriques LLM → poids fixe 1.0, MI inutile
+            if skip_metrics and metric in skip_metrics:
+                logger.debug(f"⏭  {metric} — PRIMAIRE LLM, MI ignoré (ENHANCED)")
+                continue
+
             x_vals   = [p.get(metric) for p in history if p.get(metric) is not None]
             synced_y = [y_vals[i] for i, p in enumerate(history) if p.get(metric) is not None]
 
@@ -429,13 +445,12 @@ class MetricsHandler:
         # ── Étape 1 : SLOs primaires du LLM (seuils conservés) ──────
         covered_metrics: set = set()
         for s in slos:
-            mi_score = mi_scores.get(s.metric, 0.1)
-
             s.is_primary = True
             s.threshold  = self._clamp_to_bounds(s.metric, s.threshold)
             s.target     = min(s.target, s.threshold * 0.95)
-            # Combine poids LLM × MI pour ancrer sur la réalité observée
-            s.weight     = max(0.01, s.weight * mi_score) if mi_score > 0 else max(0.01, s.weight)
+            # Même principe que le mode AUTONOMOUS : poids initial = 1.0
+            # La normalisation finale répartit les poids entre primaires et secondaires.
+            s.weight = 1.0
 
             final_slos.append(s)
             active_metrics.append(s.metric)
