@@ -4,6 +4,7 @@ import re
 import httpx
 from typing import List, Dict, Any, Optional
 from shared import config
+from shared.logging_utils import C
 from shared.models import SLO
 from services.intent_manager.slo_merger import SLOMerger
 
@@ -90,6 +91,19 @@ class LLMHandler:
             logger.error("❌ Le LLM n'a pas produit de résultat exploitable — intention non interprétable")
             return None
 
+        # ── Log des seuils bruts extraits par le LLM ─────────────────
+        _intent_short = f"\"{intention[:60]}{'...' if len(intention) > 60 else ''}\""
+        _raw_parts = [
+            f"{C.BOLD}{r.get('metric','?')}{C.RESET} "
+            f"{r.get('operator','<')} {C.CYAN}{r.get('threshold','?')}{C.RESET} "
+            f"{r.get('unit','') or ''}"
+            for r in result
+        ]
+        logger.info(
+            f"🔍 Seuils LLM bruts — {_intent_short}\n"
+            f"   " + "   |   ".join(_raw_parts)
+        )
+
         # Marque tous les SLOs comme PRIMAIRES (objectifs explicites utilisateur)
         for r in result:
             r["is_primary"] = True
@@ -109,16 +123,26 @@ class LLMHandler:
         for s in final_slos:
             s.is_primary = True
 
+        # ── Log des SLOs finaux validés (après normalisation + merge) ─
+        _slo_lines = [
+            f"   {C.BOLD}{s.metric:<12}{C.RESET} "
+            f"détection {s.operator} {C.GREEN}{s.target:<8.1f}{C.RESET} {s.unit:<4}"
+            f"| contrat {s.operator} {C.CYAN}{s.threshold:.1f}{C.RESET} {s.unit}"
+            for s in final_slos
+        ]
+        logger.info(
+            f"\n{'─'*58}\n"
+            f"  🎯  SLOs validés — {_intent_short}\n"
+            + "\n".join(_slo_lines)
+            + f"\n{'─'*58}"
+        )
+
         entry = {"intention": intention, "slos": [s.dict() for s in final_slos]}
         self.history.append(entry)
         if len(self.history) > config.HISTORY_SIZE:
             self.history.pop(0)
         await self._persist_intent(entry)
 
-        logger.info(
-            f"✅ SLOs primaires extraits et validés — {len(final_slos)} SLO(s) "
-            f"| métriques : {[s.metric for s in final_slos]}"
-        )
         return final_slos
 
     async def _level1_llm(self, text: str, context: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:

@@ -3,10 +3,17 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from shared import config
+from shared.timing import StepProfiler
 from services.decision_intelligence.violation_detector import ViolationDetector
 from services.decision_intelligence.topsis import TopsisSelector, vm_satisfies_slo
 
 logger = logging.getLogger("DecisionIntelligence.handler")
+
+# Marge d'hystérésis anti-ping-pong (dead-band). On ne migre que si le
+# meilleur candidat dépasse la VM ACTIVE de cette fraction. À 0.0, la règle
+# « meilleur > actif » est déjà le comportement par défaut et produit le
+# va-et-vient edge↔cloud ; 0.15 = 15 % de marge nette pour le stopper.
+_MIGRATION_MARGIN: float = 0.15
 
 
 class DecisionHandler:
@@ -31,6 +38,14 @@ class DecisionHandler:
 
         ts: str = datetime.now(timezone.utc).isoformat()
 
+        # Profiler des sous-étapes de la décision (détection, filtrage, TOPSIS).
+        # Ses mesures sont renvoyées au hub via la clé "timings" du résultat.
+        prof = StepProfiler(logger=logger, context=f"DI #{cycle}")
+
+        def _ret(result: Dict[str, Any]) -> Dict[str, Any]:
+            result["timings"] = prof.as_dict()
+            return result
+
         # ── Bannière traçabilité cycle ────────────────────────────────
         sep = "═" * 62
         slo_lines = []
@@ -54,12 +69,15 @@ class DecisionHandler:
         # ── Étape 1 : Cooldown (défensif) ────────────────────────────
         if cooldown_active:
             logger.info("⏳ Cooldown actif — décision STAY immédiate")
-            return self._build_stay("cooldown_active", None, None, ts)
+            return _ret(self._build_stay(
+                "cooldown_active", None, None, ts, self._slos_detail(slos)
+            ))
 
         # ── Étape 2 : Détection de violations sur service_vm ─────────
-        violations: List[Dict] = self._detector.detect(
-            current_data, predictions_map, slos, service_vm
-        )
+        with prof.step("violation_detection"):
+            violations: List[Dict] = self._detector.detect(
+                current_data, predictions_map, slos, service_vm
+            )
 
         if violations:
             summary = "  ".join(
@@ -75,33 +93,52 @@ class DecisionHandler:
                 f"✅ Aucune violation SLO sur {service_vm} — décision STAY"
             )
 
-        # ── Étape 3 : Aucune violation → stay ────────────────────────
-        if not violations:
-            return self._build_stay("No SLO violation detected", None, None, ts)
-
-        # Filtrer les violations proactives de faible sévérité (bruit)
-        _PROACTIVE_MIN_SEVERITY: float = 0.05
-        actionable = [
-            v for v in violations
-            if v["breach_type"] == "reactive"
-            or v["severity"] >= _PROACTIVE_MIN_SEVERITY
+        # ── Étape 3 : GATE — migration déclenchée UNIQUEMENT par une
+        #     violation de la métrique PRIMAIRE (latency en autonomous).
+        #     Une violation secondaire seule (cpu/ram) ne déclenche PAS :
+        #     ce sont des co-facteurs corrélés, pas l'objectif métier. ──
+        primary_metrics: set = {s["metric"] for s in slos if s.get("is_primary")}
+        primary_violations: List[Dict] = [
+            v for v in violations if v["metric"] in primary_metrics
         ]
-        if not actionable:
-            logger.info(
-                f"🟡 Violations proactives sous le seuil de sévérité "
-                f"({_PROACTIVE_MIN_SEVERITY}) — décision STAY"
-            )
-            return self._build_stay(
-                "proactive violations below severity threshold", "proactive", None, ts
-            )
-        violations = actionable
 
-        breach_type: str = (
-            "reactive"
-            if any(v["breach_type"] == "reactive" for v in violations)
-            else "proactive"
+        if not primary_violations:
+            reason = (
+                "Secondary-only violation (no primary/latency breach) — no migration"
+                if violations else "No SLO violation detected"
+            )
+            logger.info(f"✅ {reason} — décision STAY")
+            return _ret(self._build_stay(
+                reason, None, None, ts, self._slos_detail(slos)
+            ))
+
+        # Toute violation détectée (réelle ou prédite par le ML) est
+        # directement actionnable — pas de filtre de sévérité : dès que
+        # ViolationDetector signale une violation, TOPSIS est évalué pour
+        # voir s'il existe une meilleure VM disponible.
+        #
+        # Le type affiché (proactif/réactif) reflète le statut du SLO
+        # PRIMAIRE (latency), pas "la pire métrique parmi toutes" : un
+        # seuil adaptatif secondaire (ex. ram_usage) colle souvent de très
+        # près à la valeur réelle et bascule en réactif au moindre bruit de
+        # mesure, ce qui masquait une détection proactive parfaitement
+        # valide sur la métrique qui compte réellement pour la démo.
+        primary_metric = next(
+            (s["metric"] for s in slos if s.get("is_primary")), None
         )
+        primary_violation = next(
+            (v for v in violations if v["metric"] == primary_metric), None
+        )
+        if primary_violation is not None:
+            breach_type = primary_violation["breach_type"]
+        else:
+            breach_type = (
+                "reactive"
+                if any(v["breach_type"] == "reactive" for v in violations)
+                else "proactive"
+            )
         violated_metrics: List[str] = [v["metric"] for v in violations]
+        slos_detail: List[Dict[str, Any]] = self._slos_detail(slos)
 
         # ── Étape 4 : Candidats = toutes les VMs (VM active incluse) ──────
         # La VM active est incluse dans le pool TOPSIS pour comparer si rester
@@ -113,13 +150,14 @@ class DecisionHandler:
                 f"⚠️  Violation {breach_type} sur {violated_metrics} "
                 "— aucune VM cible disponible"
             )
-            return self._build_stay(
+            return _ret(self._build_stay(
                 f"{breach_type} violation on {violated_metrics} — "
                 "no migration targets available",
-                breach_type, None, ts,
-            )
+                breach_type, None, ts, slos_detail,
+            ))
 
-        candidates = self._filter_candidates(all_candidates, predictions_map, slos)
+        with prof.step("candidate_filter"):
+            candidates = self._filter_candidates(all_candidates, predictions_map, slos)
         preferred  = len(candidates) < len(all_candidates)
         logger.info(
             f"🔎 Candidats TOPSIS : {[c['vm_id'] for c in candidates]} "
@@ -127,22 +165,24 @@ class DecisionHandler:
         )
 
         # ── Étape 5 : Sélection TOPSIS ───────────────────────────────
-        best_candidate, topsis_score = self._topsis.select(
-            candidates         = candidates,
-            predictions_map    = predictions_map,
-            slos               = slos,
-            reliability_scores = reliability_scores,
-        )
+        with prof.step("topsis_total"):
+            best_candidate, topsis_score, vm_scores = self._topsis.select(
+                candidates         = candidates,
+                predictions_map    = predictions_map,
+                slos               = slos,
+                reliability_scores = reliability_scores,
+                profiler           = prof,
+            )
 
         if not best_candidate:
             logger.warning(
                 f"⚠️  TOPSIS n'a retourné aucun candidat "
                 f"— violation {breach_type} non résolue"
             )
-            return self._build_stay(
+            return _ret(self._build_stay(
                 f"{breach_type} violation — TOPSIS returned no candidate",
-                breach_type, None, ts,
-            )
+                breach_type, None, ts, slos_detail,
+            ))
 
         to_vm: str = best_candidate["vm_id"]
         logger.info(
@@ -154,32 +194,42 @@ class DecisionHandler:
             f"{'─'*50}"
         )
 
-        # ── Étape 6 : Filet de sécurité (ne devrait plus se déclencher) ──
-        if to_vm == service_vm:
-            logger.info(
-                f"🟢 TOPSIS confirme {service_vm} comme meilleure VM "
-                f"malgré la violation — décision STAY"
-            )
-            return self._build_stay(
+        # ── Étape 6 : Hystérésis anti-ping-pong ──────────────────────
+        # On ne migre que si le meilleur candidat dépasse la VM ACTIVE
+        # d'une marge nette (_MIGRATION_MARGIN). Sinon STAY. Si la VM active
+        # n'est pas dans le pool (elle ne satisfait aucun SLO alors que des
+        # VMs « propres » existent), active_score=0 → on migre librement
+        # vers la VM propre (on ne reste pas sur une VM qui viole).
+        active_score: float = vm_scores.get(service_vm, 0.0)
+        if to_vm == service_vm or topsis_score <= active_score * (1.0 + _MIGRATION_MARGIN):
+            reason = (
                 f"{breach_type} violation but {service_vm} is still best "
-                f"candidate (score={topsis_score})",
-                breach_type, topsis_score, ts,
+                f"candidate (score={topsis_score})"
+                if to_vm == service_vm else
+                f"{breach_type} violation — best {to_vm} ({topsis_score}) "
+                f"n'excède pas l'actif {service_vm} ({active_score}) "
+                f"de la marge {_MIGRATION_MARGIN:.0%} → STAY"
             )
+            logger.info(f"🟢 {reason}")
+            return _ret(self._build_stay(
+                reason, breach_type, topsis_score, ts, slos_detail,
+            ))
 
         # ── Étape 7 : Décision MIGRATE ───────────────────────────────
-        return {
-            "decision":     "migrate",
-            "from_vm":      service_vm,
-            "to_vm":        to_vm,
+        return _ret({
+            "decision":         "migrate",
+            "from_vm":          service_vm,
+            "to_vm":            to_vm,
             "reason":       (
                 f"{breach_type} violation on "
                 f"{', '.join(violated_metrics)} — "
                 f"TOPSIS selected {to_vm!r} (score={topsis_score})"
             ),
-            "topsis_score": topsis_score,
-            "breach_type":  breach_type,
-            "timestamp":    ts,
-        }
+            "topsis_score":     topsis_score,
+            "breach_type":      breach_type,
+            "violated_metrics": slos_detail,
+            "timestamp":        ts,
+        })
 
     def _filter_candidates(
         self,
@@ -211,18 +261,29 @@ class DecisionHandler:
         return preferred if preferred else all_candidates
 
     @staticmethod
+    def _slos_detail(slos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Nom + poids TOPSIS normalisé de CHAQUE SLO actif ce cycle (somme=1),
+        violé ou non — pour affichage dans la colonne Métriques du dashboard."""
+        return [
+            {"metric": s["metric"], "weight": round(float(s.get("weight") or 0.0), 3)}
+            for s in slos
+        ]
+
+    @staticmethod
     def _build_stay(
         reason: str,
         breach_type: Optional[str],
         topsis_score: Optional[float],
         ts: str,
+        violated_metrics: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         return {
-            "decision":     "stay",
-            "from_vm":      None,
-            "to_vm":        None,
-            "reason":       reason,
-            "topsis_score": topsis_score,
-            "breach_type":  breach_type,
-            "timestamp":    ts,
+            "decision":         "stay",
+            "from_vm":          None,
+            "to_vm":            None,
+            "reason":           reason,
+            "topsis_score":     topsis_score,
+            "breach_type":      breach_type,
+            "violated_metrics": violated_metrics or [],
+            "timestamp":        ts,
         }

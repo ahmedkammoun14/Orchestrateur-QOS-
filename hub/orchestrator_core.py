@@ -7,7 +7,7 @@ import dataclasses
 import logging
 import time
 import uvicorn
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -17,6 +17,8 @@ from fastapi import FastAPI, status, Body
 from shared import config
 from shared.logging_utils import C, PrettyFormatter
 from shared.models import LatencyPayload, RTTMeasurement
+from shared.timing import StepProfiler
+from shared.timing_writer import TimingWriter
 
 
 def setup_logger() -> logging.Logger:
@@ -58,6 +60,10 @@ class OrchestratorState:
         # du poids cycle après cycle. Réinitialisés à chaque nouvelle
         # intention reçue via /intent.
         self.original_intent_weights: Dict[str, float] = {}
+        # Timing de réception d'intention (mode enhanced) en attente d'être
+        # consommé par le prochain cycle pour produire une ligne de mesures
+        # « par intention ». Voir _persist_timing.
+        self.pending_intent_timing: Optional[Dict[str, Any]] = None
         self.cycle_count: int = 0
         self.last_decision: Dict[str, Any] = {}
         self.last_mi_scores: Dict[str, float] = {}
@@ -102,6 +108,13 @@ class OrchestratorState:
 
 state = OrchestratorState()
 
+# Writers Excel des mesures de performance — un fichier par mode :
+#   • autonomous → une ligne par cycle
+#   • enhanced   → une ligne par intention traitée
+_TIMING_MAX_BYTES = config.TIMING_EXCEL_MAX_MB * 1024 * 1024
+timing_writer_autonomous = TimingWriter.for_autonomous(config.TIMING_EXCEL_AUTONOMOUS_PATH, _TIMING_MAX_BYTES)
+timing_writer_enhanced   = TimingWriter.for_enhanced(config.TIMING_EXCEL_ENHANCED_PATH, _TIMING_MAX_BYTES)
+
 
 async def _post(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
@@ -112,6 +125,19 @@ async def _post(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) ->
     except Exception as e:
         logger.error(f"❌ POST {C.CYAN}{url}{C.RESET} failed : {e}")
         return None
+
+
+async def _post_audit(url: str, payload: Dict[str, Any]) -> None:
+    """
+    Envoi best-effort de l'audit à observability avec un client DÉDIÉ.
+    Fire-and-forget : ne doit PAS réutiliser le client du cycle (qui se ferme
+    en fin de _run_flow → erreur 'client has been closed').
+    """
+    try:
+        async with httpx.AsyncClient() as c:
+            await c.post(url, json=payload, timeout=10.0)
+    except Exception as e:
+        logger.debug(f"🔇 Audit non transmis à observability : {e}")
 
 def _threshold_map() -> Dict[str, float]:
     """
@@ -132,7 +158,10 @@ def _threshold_map() -> Dict[str, float]:
 
     for slo in state.current_slos:
         if slo.get("metric") in thr:
-            thr[slo["metric"]] = float(slo["threshold"])
+            # Utilise la cible (target) comme seuil de détection si disponible,
+            # cohérent avec le ViolationDetector du DI.
+            target_val = slo.get("target")
+            thr[slo["metric"]] = float(target_val) if target_val is not None else float(slo["threshold"])
     return thr
 
 def _is_violation(record: Dict[str, Any], thresholds: Dict[str, float]) -> bool:
@@ -294,8 +323,11 @@ class _FlowContext:
 #  Étapes du flow — chacune correspond à un bloc numéroté de l'ancien _run_flow
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str) -> None:
+async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str,
+                      prof: Optional[StepProfiler] = None) -> None:
     """Calcule / met à jour les SLOs actifs (bootstrap ou metrics_manager)."""
+    def _t(name: str):
+        return prof.step(name) if prof is not None else nullcontext()
     if state.cycle_count < state.BOOTSTRAP_MIN:
         state.current_slos = _build_bootstrap_slos()
         ctx.active_metrics = [s["metric"] for s in state.current_slos]
@@ -305,11 +337,12 @@ async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str) -
         )
         return
 
-    h_res = await _post(client, f"{_URLS['history_loader']}/load", {
-        "vm_id":   state.service_vm,
-        "metrics": list(config.METRICS_REGISTRY.keys()),
-        "size":    config.HISTORY_WINDOW,
-    })
+    with _t("slos_load_hist"):
+        h_res = await _post(client, f"{_URLS['history_loader']}/load", {
+            "vm_id":   state.service_vm,
+            "metrics": list(config.METRICS_REGISTRY.keys()),
+            "size":    config.HISTORY_WINDOW,
+        })
     svc_hists = h_res.get("histories", {}) if h_res else {}
 
     if mode == "enhanced":
@@ -330,7 +363,15 @@ async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str) -
         }
         mm_url = f"{_URLS['metrics_manager']}/compute"
 
-    mm_res = await _post(client, mm_url, mm_payload)
+    with _t("slos_mm"):
+        mm_res = await _post(client, mm_url, mm_payload)
+    if prof is not None and mm_res:
+        _mm_timings = mm_res.get("timings", {})
+        if _mm_timings:
+            logger.debug(f"MM timings reçus : {list(_mm_timings.keys())}")
+        else:
+            logger.warning("⚠️  MM response sans 'timings' — relancer le service metrics_manager")
+        prof.merge(_mm_timings)   # absorbe mi_compute + mi_slos
     if mm_res:
         state.current_slos   = mm_res.get("slos", state.current_slos)
         ctx.active_metrics   = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
@@ -354,12 +395,20 @@ async def _step2_persist_slos(client: httpx.AsyncClient, ctx: _FlowContext) -> N
                 {"slos": state.current_slos, "timestamp": ctx.now_iso})
 
 
-async def _step3_collect(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+async def _step3_collect(client: httpx.AsyncClient, ctx: _FlowContext,
+                         prof: Optional[StepProfiler] = None) -> None:
     """Collecte les métriques (CPU, RAM) via le collector pour toutes les VMs."""
     ctx.collector_metrics = [m for m in config.METRICS_REGISTRY.keys() if m != "latency"]
     coll_res   = await _post(client, f"{_URLS['collector']}/collect",
                              {"active_metrics": ctx.collector_metrics, "cycle": state.cycle_count})
     ctx.results = coll_res.get("results", []) if coll_res else []
+
+    # Temps de collecte par VM (mesuré dans le collector, collecte parallèle)
+    if prof is not None and coll_res:
+        per_vm = coll_res.get("collect_timings") or {}
+        for vm_id in config.VM_REGISTRY:
+            prof.record(f"collect_{vm_id}", per_vm.get(vm_id) or 0.0)
+        prof.record("collect_max", coll_res.get("collect_max_ms") or 0.0)
     logger.info(
         f"📡 Métriques collectées — {C.CYAN}{len(ctx.results)}{C.RESET} VM(s) "
         f"| métriques : {C.CYAN}{ctx.collector_metrics}{C.RESET}"
@@ -384,8 +433,13 @@ async def _step4_persist_metrics(
         vm_metrics = {**{m: r.get(m) for m in ctx.collector_metrics}, "latency": rtt_val}
         new_collected.append({
             "vm_id": vm_id, **vm_metrics,
-            "reliability": r.get("reliability"),
-            "reachable":   r.get("reachable"),
+            "reliability":  r.get("reliability"),
+            "reachable":    r.get("reachable"),
+            # Capacité déclarée par la VM elle-même (fédération / service
+            # mesh), propagée par le collector — transite par le hub comme
+            # toute donnée de decision_intelligence (architecture en étoile).
+            "total_cores":  r.get("total_cores"),
+            "total_ram_gb": r.get("total_ram_gb"),
         })
         persist_tasks.append(_post(client, f"{_URLS['database']}/store/metrics", {
             "vm_id": vm_id, "metrics": vm_metrics,
@@ -421,7 +475,7 @@ def _step5_check_violations(ctx: _FlowContext) -> None:
         metric    = slo["metric"]
         threshold = thresholds.get(metric, float("inf"))
         preds     = svc_preds.get(metric, {}).get("predictions", [])
-        if any(p > threshold * config.PROACTIVE_FACTOR for p in preds):
+        if any(p > threshold for p in preds):
             proactive_signals.append(metric)
 
     if violation:
@@ -495,13 +549,18 @@ async def _step7_predict(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
     state.snapshot_predictions = dict(state.last_predictions)
 
 
-async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
+async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext, prof: StepProfiler) -> None:
     """Appelle decision_intelligence et exécute la migration si nécessaire."""
     current_data = []
     for lc in state.last_collected:
         entry = {"vm_id": lc["vm_id"]}
         for m, meta in config.METRICS_REGISTRY.items():
             entry[meta["payload_key"]] = lc.get(m)
+        # Capacité déclarée par la VM (fédération / service mesh) — nécessaire
+        # à TOPSIS pour convertir cpu_usage/ram_usage (%) en disponibilité
+        # absolue. Transite tel quel depuis le collector via le hub.
+        entry["total_cores"]  = lc.get("total_cores")
+        entry["total_ram_gb"] = lc.get("total_ram_gb")
         current_data.append(entry)
 
     # Lookup explicite par vm_id — évite tout risque de désalignement positionnel
@@ -530,7 +589,8 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
         )
 
     if not di_payload["cooldown_active"]:
-        di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
+        with prof.step("decide_call"):
+            di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
     else:
         di_res = {
             "decision": "stay", "from_vm": None, "to_vm": None,
@@ -539,6 +599,9 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
 
     if not di_res:
         return
+
+    # Fusionne les sous-mesures TOPSIS / détection renvoyées par decision_intelligence
+    prof.merge(di_res.get("timings"))
 
     state.last_decision = di_res
     decision = di_res.get("decision", "?")
@@ -551,12 +614,7 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
         **di_res,
         "cycle":            state.cycle_count,
         "mode":             state._mode,
-        "violated_metrics": [
-            v["metric"] for v in di_res.get("violations", [])
-        ] if "violations" in di_res else (
-            [di_res["reason"].split(" on ")[1].split(" —")[0]]
-            if decision == "migrate" and " on " in (di_res.get("reason") or "") else []
-        ),
+        "violated_metrics": di_res.get("violated_metrics", []),
         "slos_active":      state.current_slos,
         "mi_scores":        state.last_mi_scores,
         "current_metrics":  {
@@ -568,7 +626,7 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
         },
     }
     asyncio.create_task(
-        _post(client, f"{_URLS['observability']}/audit", audit_payload)
+        _post_audit(f"{_URLS['observability']}/audit", audit_payload)
     )
 
     if decision == "migrate":
@@ -585,9 +643,14 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
             f"{'═'*60}"
         )
 
-        await _post(client, f"{_URLS['database']}/store/decision", di_res)
+        with prof.step("store_decision"):
+            await _post(client, f"{_URLS['database']}/store/decision", di_res)
 
-        kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
+        # Le temps de migration = wall-clock de l'appel HTTP. openstack_client étant
+        # synchrone (200 OK renvoyé seulement après la fin de la migration), cette
+        # durée englobe toute la migration kubectl (date réponse − date requête).
+        with prof.step("migration"):
+            kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
         if not kubectl_ok:
             logger.warning(
                 f"⚠️  Migration kubectl échouée — "
@@ -610,6 +673,136 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Persistance des mesures de performance
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
+    """
+    Écrit une ligne de mesures dans le fichier Excel selon le mode :
+      • AUTONOMOUS → feuille « par cycle » : une ligne par cycle.
+                     Total = durée du cycle (collecte → décision/migration).
+      • ENHANCED   → feuille « par intention » : une ligne par intention, écrite
+                     sur le cycle qui EXÉCUTE la migration déclenchée par cette
+                     intention. Total = réception intention → migration
+                     (réception LLM + cycle de migration). Tant qu'aucune
+                     migration n'a lieu, l'intention reste en attente (pas de ligne).
+    """
+    d        = prof.durations()
+    decision = state.last_decision.get("decision")
+    ts       = prof.steps.get("total", {}).get("start") or datetime.now(timezone.utc).isoformat()
+
+    # Totaux par microservice (agrégation sans double-comptage des sous-étapes)
+    hub_total = round((d.get("check_violations") or 0.0) + (d.get("migration") or 0.0), 3)
+    db_total  = round((d.get("persist_slos") or 0.0) + (d.get("persist_metrics") or 0.0)
+                      + (d.get("store_decision") or 0.0), 3)
+    hl_total  = round((d.get("slos_load_hist") or 0.0) + (d.get("load_histories") or 0.0), 3)
+
+    # Overhead réseau (valeurs dérivées — non mesurées directement)
+    _c_tot = d.get("collect")
+    _c_max = d.get("collect_max")
+    collect_overhead = (round(_c_tot - _c_max, 3)
+                        if _c_tot is not None and _c_max is not None else None)
+
+    _dc = d.get("decide_call")
+    di_overhead = (round(_dc - ((d.get("violation_detection") or 0.0)
+                                + (d.get("candidate_filter")    or 0.0)
+                                + (d.get("topsis_total")        or 0.0)), 3)
+                   if _dc is not None else None)
+
+    # SOMME = somme des totaux par microservice
+    _somme = round(
+        hub_total
+        + (d.get("collect")    or 0.0)   # Collector total
+        + db_total
+        + hl_total
+        + (d.get("prediction") or 0.0)   # ML Predictor
+        + (d.get("slos_mm")    or 0.0)   # Metrics Manager total
+        + (d.get("decide_call") or 0.0)  # Decision Intelligence total
+        , 3
+    )
+
+    base: Dict[str, Any] = {
+        "vm":                  vm,
+        "decision":            decision,
+        "to_vm":               state.last_decision.get("to_vm"),
+        # Hub
+        "check_violations":    d.get("check_violations"),
+        "migration":           d.get("migration"),
+        "hub_total":           hub_total,
+        # Collector
+        "collect_edge1":       d.get("collect_edge1"),
+        "collect_edge2":       d.get("collect_edge2"),
+        "collect_cloud1":      d.get("collect_cloud1"),
+        "collect_cloud2":      d.get("collect_cloud2"),
+        "collect_max":         d.get("collect_max"),
+        "collect":             d.get("collect"),
+        "collect_overhead":    collect_overhead,
+        # Database
+        "persist_slos":        d.get("persist_slos"),
+        "persist_metrics":     d.get("persist_metrics"),
+        "store_decision":      d.get("store_decision"),
+        "db_total":            db_total,
+        # History Loader
+        "slos_load_hist":      d.get("slos_load_hist"),
+        "load_histories":      d.get("load_histories"),
+        "hl_total":            hl_total,
+        # ML Predictor
+        "prediction":          d.get("prediction"),
+        # Metrics Manager (sous-étapes retournées par le service)
+        "mi_compute":          d.get("mi_compute"),
+        "mi_slos":             d.get("mi_slos"),
+        "slos_mm":             d.get("slos_mm"),
+        # Decision Intelligence
+        "violation_detection": d.get("violation_detection"),
+        "candidate_filter":    d.get("candidate_filter"),
+        "topsis_total":        d.get("topsis_total"),
+        "topsis_matrix":       d.get("topsis_matrix"),
+        "topsis_norm":         d.get("topsis_norm"),
+        "topsis_weight":       d.get("topsis_weight"),
+        "topsis_dist":         d.get("topsis_dist"),
+        "decide_call":         d.get("decide_call"),
+        "di_overhead":         di_overhead,
+        # Résumé
+        "somme":               _somme,
+    }
+
+    if mode == "enhanced":
+        # Une ligne par intention, produite sur le cycle qui exécute la migration.
+        if state.pending_intent_timing and decision == "migrate":
+            pit = state.pending_intent_timing
+            state.pending_intent_timing = None
+            reception_ms = pit.get("reception_ms")
+            cycle_total  = d.get("total")
+            row = dict(base)
+            row.update({
+                "intent_id":        pit.get("intent_id"),
+                "timestamp":        ts,
+                "intention":        (pit.get("intention") or "")[:80],
+                "intent_reception": reception_ms,
+                "cycle_total":      cycle_total,
+                "intention_total":  round((reception_ms or 0.0) + (cycle_total or 0.0), 3),
+            })
+            asyncio.create_task(timing_writer_enhanced.write(row))
+            logger.info(
+                f"📊 Mesures enregistrées (intention {C.CYAN}{pit.get('intent_id')}{C.RESET}) "
+                f"| réception → migration : {C.GREEN}{row['intention_total']} ms{C.RESET}"
+            )
+        # cycle enhanced sans migration → on conserve l'intention en attente
+    elif mode == "autonomous":
+        row = dict(base)
+        row.update({
+            "cycle":     state.cycle_count,
+            "timestamp": ts,
+            "total":     d.get("total"),
+        })
+        asyncio.create_task(timing_writer_autonomous.write(row))
+        logger.info(
+            f"📊 Mesures enregistrées (cycle {C.CYAN}{state.cycle_count}{C.RESET}) "
+            f"| total : {C.GREEN}{d.get('total')} ms{C.RESET}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Coordinateur du cycle — orchestre les 8 étapes séquentiellement
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -626,19 +819,45 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
             f"{'═'*60}"
         )
 
-        async with httpx.AsyncClient() as client:
-            ctx = _FlowContext(
-                vm_ids=list(config.VM_REGISTRY.keys()),
-                now_iso=datetime.now(timezone.utc).isoformat(),
-            )
-            await _step1_slos(client, ctx, mode)
-            await _step2_persist_slos(client, ctx)
-            await _step3_collect(client, ctx)
-            await _step4_persist_metrics(client, ctx, measurements)
-            await _step6_load_histories(client, ctx)
-            await _step7_predict(client, ctx)
-            _step5_check_violations(ctx)   # après prédictions — log cohérent
-            await _step8_decide(client, ctx)
+        prof = StepProfiler(logger=logger, context=f"Cycle #{state.cycle_count}")
+        vm_for_row = state.service_vm  # VM qui sert ce cycle (avant migration éventuelle)
+
+        with prof.step("total"):
+            async with httpx.AsyncClient() as client:
+                ctx = _FlowContext(
+                    vm_ids=list(config.VM_REGISTRY.keys()),
+                    now_iso=datetime.now(timezone.utc).isoformat(),
+                )
+                # SLOs/MI (step1+2) et collecte des métriques VM (step3+4) ne
+                # dépendent l'un de l'autre en rien — seule la suite du cycle
+                # (load_histories → prediction → decide) a besoin des deux.
+                # Parallélisés pour réduire le temps de cycle total (voir étude
+                # de calibrage θ=60ms/v=1.2cm/s : chaque seconde gagnée ici
+                # restaure une prédiction ML utile sur l'horizon de 7).
+                async def _slos_branch() -> None:
+                    with prof.step("slos_mi"):
+                        await _step1_slos(client, ctx, mode, prof)
+                    with prof.step("persist_slos"):
+                        await _step2_persist_slos(client, ctx)
+
+                async def _collect_branch() -> None:
+                    with prof.step("collect"):
+                        await _step3_collect(client, ctx, prof)
+                    with prof.step("persist_metrics"):
+                        await _step4_persist_metrics(client, ctx, measurements)
+
+                with prof.step("slos_and_collect_parallel"):
+                    await asyncio.gather(_slos_branch(), _collect_branch())
+                with prof.step("load_histories"):
+                    await _step6_load_histories(client, ctx)
+                with prof.step("prediction"):
+                    await _step7_predict(client, ctx)
+                with prof.step("check_violations"):
+                    _step5_check_violations(ctx)   # après prédictions — log cohérent
+                with prof.step("decision_total"):
+                    await _step8_decide(client, ctx, prof)
+
+        _persist_timing(prof, mode, vm_for_row)
 
         logger.info(
             f"✅ Cycle #{C.BOLD}{state.cycle_count}{C.RESET} terminé\n"
@@ -742,12 +961,24 @@ async def receive_intent(payload: Dict[str, Any] = Body(...)):
     }
     state._mode = "enhanced"
     intent_id = payload.get("intent_id", "—")
+
+    # Mémorise le timing de réception (mesuré par intent_manager) pour qu'il soit
+    # consommé par le prochain cycle et produise une ligne « par intention ».
+    timing = payload.get("timing", {}) or {}
+    state.pending_intent_timing = {
+        "intent_id":    intent_id,
+        "intention":    payload.get("intention", ""),
+        "reception_ms": timing.get("reception_ms"),
+        "llm_ms":       timing.get("llm_ms"),
+    }
+
     logger.info(
         f"\n{'═'*60}\n"
         f"  📥 Intent reçu — mode Enhanced activé\n"
         f"  {'ID':<16}: {C.CYAN}{intent_id}{C.RESET}\n"
         f"  {'SLOs injectés':<16}: {C.CYAN}{len(state.current_slos)}{C.RESET}\n"
         f"  {'Poids originaux':<16}: {C.CYAN}{state.original_intent_weights}{C.RESET}\n"
+        f"  {'Réception':<16}: {C.CYAN}{timing.get('reception_ms')} ms{C.RESET}\n"
         f"{'═'*60}"
     )
     return {"status": "accepted", "mode": state._mode, "slos": len(state.current_slos)}
@@ -779,6 +1010,7 @@ async def reset():
         state._mode                  = "autonomous"
         state.current_slos           = _build_bootstrap_slos()
         state.original_intent_weights = {}
+        state.pending_intent_timing  = None
         state.last_decision          = {}
         state.cycle_count            = 0
         state.last_migration_ts      = None

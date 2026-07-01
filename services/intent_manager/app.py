@@ -1,4 +1,5 @@
 import logging
+import time
 import httpx
 import uvicorn
 from datetime import datetime, timezone
@@ -71,18 +72,31 @@ async def process_intent(payload: Dict[str, Any]):
     )
 
     try:
-        # 1. Processing (LLM + Cascade + Merge)
-        slos = await handler.handle(payload)
+        # 1. Processing (LLM + Cascade + Merge) — chronométré (réception intention)
+        _t_start    = time.perf_counter()
+        _start_iso  = datetime.now(timezone.utc).isoformat()
+        slos        = await handler.handle(payload)
+        _llm_ms     = (time.perf_counter() - _t_start) * 1000.0
 
         if not slos:
             raise HTTPException(status_code=422, detail="Could not extract valid SLOs from intention")
 
-        # 2. Forward to Hub
+        # 2. Forward to Hub (avec le timing de réception pour les mesures de perf)
+        _reception_ms = (time.perf_counter() - _t_start) * 1000.0
+        logger.info(
+            f"⏱  Réception intention {C.CYAN}{intent_id}{C.RESET} — "
+            f"durée {C.GREEN}{_reception_ms:.2f} ms{C.RESET} (dont LLM {_llm_ms:.2f} ms)"
+        )
         hub_payload = {
             "intent_id": intent_id,
             "intention": intention,
             "slos": [s.dict() for s in slos],
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timing": {
+                "reception_ms": round(_reception_ms, 3),
+                "llm_ms":       round(_llm_ms, 3),
+                "started_at":   _start_iso,
+            },
         }
 
         async with httpx.AsyncClient() as client:
@@ -93,10 +107,13 @@ async def process_intent(payload: Dict[str, Any]):
                     timeout=config.POST_TIMEOUT
                 )
                 if resp.status_code in (200, 201, 202):
+                    _slo_summary = "  ".join(
+                        f"{s.metric} {s.operator} {C.CYAN}{s.threshold}{C.RESET} {s.unit}"
+                        for s in slos
+                    )
                     logger.info(
-                        f"✅ Intent transmis au Hub — "
-                        f"{C.GREEN}{len(slos)}{C.RESET} SLO(s) injectés "
-                        f"| métriques : {C.CYAN}{[s.metric for s in slos]}{C.RESET}"
+                        f"✅ Intent transmis au Hub — {C.GREEN}{len(slos)}{C.RESET} SLO(s) "
+                        f"| {_slo_summary}"
                     )
                     return {"status": "accepted", "slos_count": len(slos)}
                 else:

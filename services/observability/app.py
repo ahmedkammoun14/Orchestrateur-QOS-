@@ -250,6 +250,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="stat-label">Mode</span>
     <span class="stat-value" id="h-mode">—</span>
   </div>
+  <div class="stat">
+    <span class="stat-label">Migrations proactives / réactives</span>
+    <span class="stat-value">
+      <span class="badge badge-proactive" id="h-proactive-count">0</span>
+      <span class="badge badge-reactive" id="h-reactive-count">0</span>
+    </span>
+  </div>
 </header>
 
 <main>
@@ -524,11 +531,23 @@ function updateMetrics(data) {
 
 // ── Audit log ─────────────────────────────────────────────────
 let auditCount = 0;
+let proactiveMigrateCount = 0;
+let reactiveMigrateCount = 0;
+const seenMigrations = new Set();  // clé cycle → évite double comptage (snapshot + live)
+
 function addAuditRows(entries, prepend = false) {
   const tbody = document.getElementById('audit-body');
   entries.forEach(e => {
     const dec = e.decision || '—';
     const breach = e.breach_type || 'none';
+
+    if (dec === 'migrate' && e.cycle != null && !seenMigrations.has(e.cycle)) {
+      seenMigrations.add(e.cycle);
+      if (breach === 'proactive') proactiveMigrateCount++;
+      else if (breach === 'reactive') reactiveMigrateCount++;
+      document.getElementById('h-proactive-count').textContent = proactiveMigrateCount;
+      document.getElementById('h-reactive-count').textContent = reactiveMigrateCount;
+    }
     const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString('fr-FR') : '—';
     const decBadge = dec === 'migrate'
       ? `<span class="badge badge-migrate">MIGRATE</span>`
@@ -538,7 +557,9 @@ function addAuditRows(entries, prepend = false) {
       : breach === 'proactive'
         ? `<span class="badge badge-proactive">proactif</span>`
         : `<span class="badge badge-none">—</span>`;
-    const metrics = (e.violated_metrics || []).join(', ') || '—';
+    const metrics = (e.violated_metrics || [])
+      .map(m => `${m.metric} (${(m.weight ?? 0).toFixed(2)})`)
+      .join(', ') || '—';
     const score = e.topsis_score != null ? parseFloat(e.topsis_score).toFixed(4) : '—';
     const reason = (e.reason || '').substring(0, 60);
 

@@ -174,13 +174,34 @@ class PredictorHandler:
     def _build_response(
         self, metric: str, preds: List[float], raw_result: Dict[str, Any], model_name: str
     ) -> Dict[str, Any]:
-        denorm_preds = self._denormalize(metric, preds)
+        denorm_preds = self._clamp(metric, self._denormalize(metric, preds))
         return {
             "predictions": denorm_preds[:7],
             "confidence":  raw_result.get("confidence", 0.8),
             "uncertainty": self._calc_uncertainty(raw_result, denorm_preds),
             "model":       raw_result.get("model", model_name),
         }
+
+    def _clamp(self, metric: str, preds: List[float]) -> List[float]:
+        """
+        Borne les prédictions aux limites physiques pour éviter qu'un modèle
+        instable (ex. ESN qui diverge) ne produise des valeurs absurdes
+        — latence négative, % > 100 — qui fausseraient TOPSIS et la détection
+        de violations. Log un avertissement quand une correction est appliquée
+        (le modèle reste à surveiller).
+        """
+        if metric == "latency":
+            lo, hi = 0.0, config.LATENCY_MAX
+        else:  # cpu, ram
+            lo, hi = 0.0, 100.0
+        clamped = [max(lo, min(hi, float(p))) for p in preds]
+        n_fixed = sum(1 for p, c in zip(preds, clamped) if p != c)
+        if n_fixed:
+            logger.warning(
+                f"⚠️  {metric} — {n_fixed} prédiction(s) hors bornes "
+                f"[{lo:.0f}, {hi:.0f}] corrigée(s) (modèle instable ?)"
+            )
+        return clamped
 
     def _denormalize(self, metric: str, preds: List[float]) -> List[float]:
         if metric in ["cpu", "ram"]:

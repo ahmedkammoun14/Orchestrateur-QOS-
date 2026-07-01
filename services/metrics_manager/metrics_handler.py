@@ -442,14 +442,16 @@ class MetricsHandler:
         primary_metrics  : List[str] = []
         secondary_metrics: List[str] = []
 
-        # ── Étape 1 : SLOs primaires du LLM (seuils conservés) ──────
+        # ── Étape 1 : SLOs primaires du LLM (seuils et poids conservés) ──────
         covered_metrics: set = set()
         for s in slos:
             s.is_primary = True
             s.threshold  = self._clamp_to_bounds(s.metric, s.threshold)
             s.target     = min(s.target, s.threshold * 0.95)
-            # Même principe que le mode AUTONOMOUS : poids initial = 1.0
-            # La normalisation finale répartit les poids entre primaires et secondaires.
+            # Poids uniforme pour tous les SLOs primaires : le LLM est fiable
+            # pour les seuils/métriques, pas pour les poids numériques.
+            # La normalisation finale répartit objectivement les poids entre
+            # primaires (tous égaux) et secondaires (pondérés par score MI).
             s.weight = 1.0
 
             final_slos.append(s)
@@ -460,7 +462,7 @@ class MetricsHandler:
             logger.debug(
                 f"🎯 SLO PRIMAIRE (LLM) — {s.metric} "
                 f"| seuil : {s.threshold:.2f} {s.unit} "
-                f"| MI : {mi_score:.3f} | poids combiné : {s.weight:.3f}"
+                f"| poids LLM : {s.weight:.3f}"
             )
 
         # ── Étape 2 : SLOs secondaires pour métriques corrélées non couvertes

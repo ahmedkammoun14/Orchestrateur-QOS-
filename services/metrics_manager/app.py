@@ -7,6 +7,7 @@ from typing import Dict, Any
 from shared import config
 from shared.logging_utils import C, PrettyFormatter
 from shared.models import SLO
+from shared.timing import StepProfiler
 from services.metrics_manager.metrics_handler import MetricsHandler
 
 
@@ -87,14 +88,21 @@ async def compute(payload: Dict[str, Any] = Body(...)):
     )
 
     try:
-        mi_scores = handler.compute_mi_scores(history, cycle=cycle, include_primaries=False)
-        all_vals  = payload.get("all_vals", {})
-        final_slos, active_metrics = handler.select_dynamic_slos(mi_scores, all_vals, history)
+        prof = StepProfiler(logger=logger, context=f"MM #{cycle}")
+
+        with prof.step("mi_compute"):
+            mi_scores = handler.compute_mi_scores(history, cycle=cycle, include_primaries=False)
+
+        all_vals = payload.get("all_vals", {})
+
+        with prof.step("mi_slos"):
+            final_slos, active_metrics = handler.select_dynamic_slos(mi_scores, all_vals, history)
 
         return {
             "slos":           [s.dict() for s in final_slos],
             "active_metrics": active_metrics,
             "mi_scores":      mi_scores,
+            "timings":        prof.as_dict(),
             "timestamp":      datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
@@ -129,23 +137,27 @@ async def validate(payload: Dict[str, Any] = Body(...)):
     )
 
     try:
-        # Les SLOs LLM (primaires) reçoivent poids=1.0 — MI inutile pour eux.
-        # On calcule uniquement le MI des métriques secondaires (non couvertes par le LLM).
+        prof = StepProfiler(logger=logger, context=f"MM #{cycle}")
+
         llm_metrics = {s["metric"] for s in slos_raw}
-        mi_scores = handler.compute_mi_scores(
-            history, cycle=cycle, skip_metrics=llm_metrics
-        )
-        slos      = [SLO(**s) for s in slos_raw]
-        # Passage de l'historique pour permettre la génération de SLOs
-        # secondaires adaptatifs sur les métriques corrélées non couvertes
-        final_slos, active_metrics = handler.validate_and_enrich_slos(
-            slos, mi_scores, history
-        )
+
+        with prof.step("mi_compute"):
+            mi_scores = handler.compute_mi_scores(
+                history, cycle=cycle, skip_metrics=llm_metrics
+            )
+
+        slos = [SLO(**s) for s in slos_raw]
+
+        with prof.step("mi_slos"):
+            final_slos, active_metrics = handler.validate_and_enrich_slos(
+                slos, mi_scores, history
+            )
 
         return {
             "slos":           [s.dict() for s in final_slos],
             "active_metrics": active_metrics,
             "mi_scores":      mi_scores,
+            "timings":        prof.as_dict(),
             "timestamp":      datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:

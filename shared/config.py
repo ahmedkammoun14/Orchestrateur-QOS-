@@ -47,8 +47,14 @@ HISTORY_SIZE:     int = int(os.getenv("HISTORY_SIZE", 100))
 EXCEL_PATH:   str = os.getenv("EXCEL_PATH",   "data/qos_history.xlsx")
 EXCEL_MAX_MB: int = int(os.getenv("EXCEL_MAX_MB", 200))
 
+# ── Profilage / mesures de performance ────────────────────────
+# Un fichier par mode (autonomous → par cycle, enhanced → par intention).
+TIMING_EXCEL_AUTONOMOUS_PATH: str = os.getenv("TIMING_EXCEL_AUTONOMOUS_PATH", "data/timings_autonomous.xlsx")
+TIMING_EXCEL_ENHANCED_PATH:   str = os.getenv("TIMING_EXCEL_ENHANCED_PATH",   "data/timings_enhanced.xlsx")
+TIMING_EXCEL_MAX_MB:          int = int(os.getenv("TIMING_EXCEL_MAX_MB", 100))
+
 # ── Orchestration ─────────────────────────────────────────────
-COLLECTION_INTERVAL:  float = float(os.getenv("COLLECTION_INTERVAL",  5.0))
+COLLECTION_INTERVAL:  float = float(os.getenv("COLLECTION_INTERVAL",  2.0))
 MIGRATION_COOLDOWN_S: float = float(os.getenv("MIGRATION_COOLDOWN_S", 5.0))
 BOOTSTRAP_MIN:        int   = int(os.getenv("BOOTSTRAP_MIN",          5))
 RAG_TIMEOUT:          float = float(os.getenv("RAG_TIMEOUT",          2.0))
@@ -116,6 +122,11 @@ VM_CLUSTER_MAP: Dict[str, str] = {
     "cloud2": "cloud-cluster",
 }
 
+# Capacité physique (total_cores, total_ram_gb) : plus fixée ici. Chaque VM
+# la déclare elle-même via son propre /metrics (logique fédération/service
+# mesh — chaque provider annonce sa capacité). Le collector la propage et
+# TopsisSelector la lit directement sur le candidat. Voir vm_ping scripts.
+
 # ── OpenStack SSH ─────────────────────────────────────────────
 OPENSTACK_MASTER_IP: str = os.getenv("OPENSTACK_MASTER_IP", "194.199.113.8")
 OPENSTACK_SSH_USER:  str = os.getenv("OPENSTACK_SSH_USER",  "ubuntu")
@@ -147,7 +158,7 @@ METRICS_REGISTRY: Dict[str, Any] = {
         "payload_key":          "rtt_ms",
         "unit":                 "ms",
         "operator":             "<",
-        "default_threshold":    300.0,
+        "default_threshold":    60.0,
         "bounds":               {"min": 5.0, "max": 2000.0},
         "always_active":        True,
         "is_primary_objective": True,

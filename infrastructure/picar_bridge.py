@@ -41,8 +41,10 @@ LATENCY_MANAGER_URL = "http://140.93.89.92:8001/rtt"
 # URL du hub pour récupérer le statut (VM active)
 HUB_STATUS_URL = "http://140.93.89.92:8000/status"
 
-# Délai minimum entre deux envois au latency_manager (anti-flood)
-SEND_INTERVAL_S = 2.0
+# Délai minimum entre deux envois au latency_manager.
+# Aligné sur la durée d'un cycle d'orchestration (~5 s) : évite d'envoyer des
+# mesures que le hub ignore (un cycle ne peut pas se chevaucher avec le suivant).
+SEND_INTERVAL_S = 5.0
 
 # VMs OpenStack
 # - port 5000  /ping  → reçoit {x,y}, calcule distance, répond avec latency_ms
@@ -62,6 +64,7 @@ CSV_FILE       = os.path.join(_DIR, "latences.csv")
 
 _cycle_count  = 0
 _last_send_ts = 0.0
+_send_count   = 0
 
 # ─── CSV ──────────────────────────────────────────────────────────────────────
 
@@ -126,14 +129,37 @@ def _ping_vm(args: tuple) -> dict:
         }
 
 
-def _send_to_latency_manager(results: list, cycle: int) -> None:
-    """Transmet les RTT au latency_manager (thread daemon, non bloquant)."""
-    global _last_send_ts
+def _fmt_table(headers: list, rows: list) -> str:
+    """Petit tableau ASCII encadré pour des logs lisibles."""
+    widths = [
+        max(len(str(h)), max((len(str(r[i])) for r in rows), default=0))
+        for i, h in enumerate(headers)
+    ]
+    def _line(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+    out = [_line("┌", "┬", "┐")]
+    out.append("│" + "│".join(f" {h:<{w}} " for h, w in zip(headers, widths)) + "│")
+    out.append(_line("├", "┼", "┤"))
+    for row in rows:
+        out.append("│" + "│".join(f" {str(c):<{w}} " for c, w in zip(row, widths)) + "│")
+    out.append(_line("└", "┴", "┘"))
+    return "\n".join(out)
+
+
+def _send_to_latency_manager(results: list, cycle: int, x: float, y: float) -> None:
+    """
+    Transmet les RTT au latency_manager (thread daemon, non bloquant),
+    au plus une fois toutes les SEND_INTERVAL_S secondes (≈ 1 cycle).
+    Affiche un tableau récapitulatif structuré à chaque envoi.
+    """
+    global _last_send_ts, _send_count
 
     now = time.time()
     if now - _last_send_ts < SEND_INTERVAL_S:
         return
     _last_send_ts = now
+    _send_count  += 1
+    send_n        = _send_count
 
     ts = datetime.now(timezone.utc).isoformat()
     measurements = [
@@ -155,6 +181,8 @@ def _send_to_latency_manager(results: list, cycle: int) -> None:
         "measurements": measurements,
     }
 
+    # ── Envoi HTTP ────────────────────────────────────────────────────────
+    status = ""
     try:
         data = json.dumps(payload).encode()
         req  = urllib.request.Request(
@@ -163,12 +191,27 @@ def _send_to_latency_manager(results: list, cycle: int) -> None:
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=5.0) as resp:
-            code = resp.status
-        print(f"[{_ts()}] ↑ orchestrateur HTTP {code} — cycle #{cycle}")
+            status = f"✅ HTTP {resp.status} — transmis à l'orchestrateur"
     except urllib.error.URLError as e:
-        print(f"[{_ts()}] ⚠  orchestrateur injoignable : {e.reason}")
+        status = f"❌ orchestrateur injoignable : {e.reason}"
     except Exception as e:
-        print(f"[{_ts()}] ⚠  orchestrateur erreur : {e}")
+        status = f"❌ erreur d'envoi : {e}"
+
+    # ── Tableau récapitulatif ─────────────────────────────────────────────
+    rows = []
+    for r in results:
+        dist = f"{r['distance_cm']:.0f} cm" if r.get("distance_cm") is not None else "—"
+        lat  = f"{r['latency_ms']:.1f} ms"  if (r.get("ok") and r.get("latency_ms") is not None) else "—"
+        etat = "OK" if r.get("ok") else "INJOIGNABLE"
+        rows.append([r["vm"], dist, lat, etat])
+
+    table = _fmt_table(["VM", "Distance", "Latence", "État"], rows)
+    print(
+        f"\n┏━━ 📡 Envoi #{send_n} → orchestrateur  |  {_ts()}  |  "
+        f"cycle #{cycle}  |  position=({x:.1f}, {y:.1f})\n"
+        f"{table}\n"
+        f"┗━━ {status}\n"
+    )
 
 
 def _ts() -> str:
@@ -224,10 +267,10 @@ def tick():
     _cycle_count += 1
     cycle = _cycle_count
 
-    # Envoi au latency_manager (non bloquant)
+    # Envoi au latency_manager (non bloquant, throttlé à SEND_INTERVAL_S)
     threading.Thread(
         target=_send_to_latency_manager,
-        args=(results, cycle),
+        args=(results, cycle, x, y),
         daemon=True,
     ).start()
 
@@ -240,17 +283,8 @@ def tick():
         )
         _csv_file.flush()
 
-    # Log console
-    parts = []
-    for r in results:
-        if r["ok"]:
-            parts.append(
-                f"{r['vm']}={r['latency_ms']:.0f}ms"
-                f"(d={r['distance_cm']:.0f}cm)"
-            )
-        else:
-            parts.append(f"{r['vm']}=ERR")
-    print(f"[{_ts()}] pos=({x:.1f},{y:.1f})  {'  '.join(parts)}")
+    # Log console compact à chaque tick (le détail par VM est dans le tableau d'envoi, toutes les 5 s)
+    print(f"[{_ts()}] 🚗 tick — position=({x:.1f}, {y:.1f})")
 
     return jsonify(car=[x, y], results=results)
 

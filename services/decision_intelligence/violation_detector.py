@@ -39,15 +39,14 @@ class ViolationDetector:
             preds:        List[float]   = metric_entry.get("predictions", [])
             uncertainty:  float         = float(metric_entry.get("uncertainty", 0.0))
 
-            proactive_factor: float = (
-                _HIGH_UNCERTAINTY_FACTOR
-                if uncertainty > _HIGH_UNCERTAINTY_THRESHOLD
-                else config.PROACTIVE_FACTOR
-            )
+            # Seuil contractuel — les prédictions ML sont comparées directement
+            # à ce seuil sans facteur α : si l'API prédit une valeur future
+            # supérieure au seuil, c'est une violation proactive réelle.
+            contract_threshold: float = float(slo["threshold"])
+            threshold: float = contract_threshold
 
-            threshold: float = float(slo["threshold"])
             breach_type, slope, time_to_breach = self._analyze(
-                preds, threshold, current_val, proactive_factor
+                preds, threshold, current_val
             )
 
             if breach_type != "none":
@@ -56,19 +55,21 @@ class ViolationDetector:
                 ref_val  = peak_val if breach_type == "proactive" else current_val
                 sev = self._severity(ref_val, threshold, slope)
                 violations.append({
-                    "metric":         metric,
-                    "breach_type":    breach_type,
-                    "severity":       sev,
-                    "slope":          slope,
-                    "time_to_breach": time_to_breach,
-                    "current_val":    current_val,
-                    "predicted_peak": peak_val,
-                    "threshold":      threshold,
+                    "metric":              metric,
+                    "breach_type":         breach_type,
+                    "severity":            sev,
+                    "slope":               slope,
+                    "time_to_breach":      time_to_breach,
+                    "current_val":         current_val,
+                    "predicted_peak":      peak_val,
+                    "threshold":           threshold,           # cible = seuil détection
+                    "contract_threshold":  contract_threshold,  # seuil SLO contractuel
                 })
                 logger.debug(
                     f"⚠️  Violation — {metric:<12} "
                     f"type : {breach_type:<10} "
-                    f"val : {current_val:.2f} / seuil : {threshold:.2f} "
+                    f"val : {current_val:.2f} / cible : {threshold:.2f} "
+                    f"(contrat : {contract_threshold:.2f}) "
                     f"sévérité : {sev:.3f}  TTB : {time_to_breach}"
                 )
 
@@ -79,64 +80,46 @@ class ViolationDetector:
         preds: List[float],
         threshold: float,
         current_val: float,
-        proactive_factor: float,
     ) -> Tuple[str, float, int]:
-        breach_reactive: bool = current_val > threshold
-
         # Slope sur les prédictions (dérivée moyenne par pas)
         if len(preds) >= 2:
             slope = (preds[-1] - preds[0]) / (len(preds) - 1)
         else:
             slope = 0.0
 
-        # Temps prédit avant breach : index du 1er pred > seuil
-        # Initialiser à len(preds)+1 pour que la condition ≤ HORIZON_ALERT
-        # ne se déclenche PAS si preds est vide ou si aucun pred ne breach.
+        # Index du 1er pred qui dépasse le seuil réel
         time_to_breach: int = len(preds) + 1
         for idx, p in enumerate(preds):
             if p > threshold:
                 time_to_breach = idx
                 break
 
-        # Temps estimé par la trajectoire courante (dérivée linéaire)
-        if slope > 0 and current_val < threshold:
-            estimated_steps = (threshold - current_val) / slope
-        else:
-            estimated_steps = float("inf")
-
-        proactive_threshold: float = threshold * proactive_factor
-
-        # Condition ML 1 : une prédiction dépasse le seuil proactif
-        pred_breach: bool = bool(preds) and any(p > proactive_threshold for p in preds)
-
-        # Condition ML 2 : breach imminent selon les prédictions ou la trajectoire
-        time_breach_imminent: bool = bool(preds) and (
-            time_to_breach <= config.HORIZON_ALERT
-            or estimated_steps <= config.HORIZON_ALERT
-        )
-
-        # Condition 3 : tendance montante significative
-        _MIN_SLOPE: float = threshold * 0.05
-        trend_rising: bool = slope > _MIN_SLOPE and current_val > threshold * 0.60
-
-        # La décision est "proactive" dès que les prédictions ML confirment ou anticipent
-        # la violation — même si la valeur courante est déjà réactive.
-        # "réactif" ne s'affiche que si aucune prédiction n'est disponible.
-        ml_driven: bool = pred_breach or time_breach_imminent
+        # Une prédiction ML (n'importe où dans l'horizon) dépasse le seuil SLO
+        pred_breach:     bool = bool(preds) and any(p > threshold for p in preds)
+        breach_reactive: bool = current_val > threshold
 
         logger.debug(
             f"🔍 _analyze — val={current_val:.2f} seuil={threshold:.2f} "
-            f"slope={slope:.3f}/pas  TTB_ml={time_to_breach}  "
-            f"TTB_traj={estimated_steps:.1f}  "
-            f"pred_breach={pred_breach}  imminent={time_breach_imminent}  "
-            f"trend={trend_rising}  ml_driven={ml_driven}"
+            f"slope={slope:.3f}/pas  TTB={time_to_breach}  "
+            f"has_preds={bool(preds)}  pred_breach={pred_breach}  "
+            f"reactive={breach_reactive}"
         )
 
-        if ml_driven or trend_rising:
-            # ML ou tendance guide la décision → proactif (même si déjà en breach réactif)
-            return "proactive", slope, time_to_breach
+        # ── Décision pilotée par la PRÉDICTION pour TOUTES les métriques ───
+        # (primaire ET secondaires). Tant qu'une prévision ML existe, on
+        # tranche dessus : violation PROACTIVE si le futur dépasse le seuil,
+        # sinon aucune — on fait confiance au modèle et on ignore un pic
+        # transitoire de la mesure courante. Cela supprime le « flapping »
+        # réactif des seuils adaptatifs secondaires (ex. ram_usage) qui
+        # collent à la valeur mesurée.
+        # Le mode RÉACTIF ne subsiste plus que comme filet de sécurité quand
+        # le modèle ML est indisponible (aucune prédiction).
+        if preds:
+            if pred_breach:
+                return "proactive", slope, time_to_breach
+            return "none", slope, time_to_breach
+
         if breach_reactive:
-            # Aucune prédiction disponible, réaction à la mesure brute seulement
             return "reactive", slope, time_to_breach
         return "none", slope, time_to_breach
 

@@ -54,6 +54,11 @@ class CollectorHandler:
         duration = round(time.perf_counter() - start_time, 3)
         reachable_count = sum(1 for r in results if r.get("reachable"))
 
+        # Temps de collecte par VM (collecte parallèle → max = VM la plus lente)
+        collect_timings = {r["vm_id"]: r.get("collect_ms") for r in results}
+        _vals           = [v for v in collect_timings.values() if v is not None]
+        collect_max_ms  = max(_vals) if _vals else None
+
         logger.info(
             f"✅ Collecte terminée — cycle #{C.BOLD}{cycle}{C.RESET} "
             f"| durée : {C.CYAN}{duration}s{C.RESET} "
@@ -61,9 +66,11 @@ class CollectorHandler:
         )
 
         return {
-            "results":   list(results),
-            "cycle":     cycle,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "results":         list(results),
+            "cycle":           cycle,
+            "collect_timings": collect_timings,  # {vm_id: ms}
+            "collect_max_ms":  collect_max_ms,   # VM la plus lente (parallèle)
+            "timestamp":       datetime.now(timezone.utc).isoformat()
         }
 
     async def _collect_vm(
@@ -88,6 +95,14 @@ class CollectorHandler:
                 self._update_reliability(vm_id, 1.0)
 
                 filtered_metrics = {metric: data.get(metric) for metric in active_metrics}
+                # Capacité physique déclarée par la VM elle-même (fédération :
+                # chaque provider annonce sa propre capacité, pas de valeur
+                # figée côté orchestrateur) — transmise indépendamment des
+                # métriques SLO actives, comme reliability/reachable.
+                capacity_fields = {
+                    "total_cores":  data.get("total_cores"),
+                    "total_ram_gb": data.get("total_ram_gb"),
+                }
                 reliability      = round(self.vm_reliability[vm_id], 3)
 
                 metric_summary = "  ".join(
@@ -103,17 +118,25 @@ class CollectorHandler:
                 return {
                     "vm_id": vm_id,
                     **filtered_metrics,
+                    **capacity_fields,
                     "reliability": reliability,
                     "reachable":   True,
+                    "collect_ms":  round(actual_time * 1000, 1),
                     "timestamp":   data.get("timestamp", datetime.now(timezone.utc).isoformat())
                 }
             else:
-                return self._handle_vm_failure(vm_id, active_metrics, f"HTTP_{response.status_code}")
+                return self._handle_vm_failure(
+                    vm_id, active_metrics, f"HTTP_{response.status_code}",
+                    round(actual_time * 1000, 1),
+                )
 
         except Exception as e:
-            return self._handle_vm_failure(vm_id, active_metrics, str(type(e).__name__))
+            elapsed_ms = round((time.perf_counter() - start_ts) * 1000, 1)
+            return self._handle_vm_failure(vm_id, active_metrics, str(type(e).__name__), elapsed_ms)
 
-    def _handle_vm_failure(self, vm_id: str, metrics: List[str], reason: str) -> Dict[str, Any]:
+    def _handle_vm_failure(
+        self, vm_id: str, metrics: List[str], reason: str, collect_ms: float = None
+    ) -> Dict[str, Any]:
         self._update_reliability(vm_id, 0.0)
         reliability = round(self.vm_reliability[vm_id], 3)
         logger.warning(
@@ -126,6 +149,7 @@ class CollectorHandler:
             **{m: None for m in metrics},
             "reliability": reliability,
             "reachable":   False,
+            "collect_ms":  collect_ms,
             "timestamp":   datetime.now(timezone.utc).isoformat()
         }
 
