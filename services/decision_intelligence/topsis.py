@@ -25,6 +25,16 @@ def _fmt_table(title: str, headers: List[str], rows: List[List[str]]) -> str:
 _BUDGET_WEIGHT:      float = 1.0
 _RELIABILITY_WEIGHT: float = 0.3
 
+# Écart relatif (par rapport à l'échelle de la colonne) en dessous duquel
+# deux candidats sont considérés à égalité sur un critère plutôt que
+# polarisés à 0.0/1.0 par le min-max. Sans ce garde-fou, un écart de
+# prédiction de 0,1 ms sur ~100 ms (bruit du modèle ML) est normalisé
+# exactement comme un écart de 50 ms (vraie différence) — les deux
+# donnent 0.0/1.0 — ce qui peut amener active_score à 0.0 exact et
+# neutraliser l'hystérésis anti-ping-pong de DecisionHandler (0.0 × marge
+# = 0.0, n'importe quel score positif passe alors la barrière).
+_TIE_THRESHOLD: float = 0.01
+
 # Métriques dont la valeur brute (%) est convertie en disponibilité absolue
 # (capacité_totale × (1 - usage/100)) avant d'entrer dans TOPSIS. Nécessaire
 # car deux VMs à la même charge % n'ont pas la même marge réelle si leurs
@@ -285,6 +295,13 @@ class TopsisSelector:
             col_min: float       = min(col)
             col_max: float       = max(col)
             span:    float       = col_max - col_min
+            scale:   float       = max(abs(col_max), abs(col_min), 1e-9)
+            if span <= 0 or span / scale < _TIE_THRESHOLD:
+                # Candidats à égalité sur ce critère (écart négligeable) :
+                # note neutre 0.5 partout, pas de polarisation 0/1 sur du bruit.
+                for i in range(n_vm):
+                    norm[i][j] = 0.5
+                continue
             for i in range(n_vm):
-                norm[i][j] = (matrix[i][j] - col_min) / span if span > 0 else 0.0
+                norm[i][j] = (matrix[i][j] - col_min) / span
         return norm

@@ -74,6 +74,10 @@ COLLECTOR_MIN_TIMEOUT:       float = float(os.getenv("COLLECTOR_MIN_TIMEOUT",   
 COLLECTOR_MAX_TIMEOUT:       float = float(os.getenv("COLLECTOR_MAX_TIMEOUT",       5.0))
 COLLECTOR_TIMEOUT_FACTOR:    float = float(os.getenv("COLLECTOR_TIMEOUT_FACTOR",    1.5))
 COLLECTOR_RELIABILITY_ALPHA: float = float(os.getenv("COLLECTOR_RELIABILITY_ALPHA", 0.2))
+# Intervalle du sondage de fond des VMs (découplé du cycle d'orchestration —
+# voir services/collector/collector.py). /collect lit le cache au lieu
+# d'attendre le round-trip réseau vers les 4 VMs à chaque cycle.
+COLLECTOR_POLL_INTERVAL:     float = float(os.getenv("COLLECTOR_POLL_INTERVAL",     1.0))
 
 # ── Metrics Manager ───────────────────────────────────────────
 CV_LOW:               float = float(os.getenv("CV_LOW",              0.15))
@@ -158,7 +162,7 @@ METRICS_REGISTRY: Dict[str, Any] = {
         "payload_key":          "rtt_ms",
         "unit":                 "ms",
         "operator":             "<",
-        "default_threshold":    60.0,
+        "default_threshold":    100.0,
         "bounds":               {"min": 5.0, "max": 2000.0},
         "always_active":        True,
         "is_primary_objective": True,

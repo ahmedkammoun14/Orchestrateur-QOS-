@@ -2,8 +2,9 @@ import uvicorn
 import asyncio
 import httpx
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Body, BackgroundTasks, status, HTTPException
-from typing import Dict, Any
+from typing import Any, AsyncGenerator, Dict
 from shared import config
 from shared.logging_utils import C, PrettyFormatter
 from services.collector.collector import CollectorHandler
@@ -28,23 +29,35 @@ app_logger.info(
     f"{'═'*60}"
 )
 
+handler = CollectorHandler()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    app_logger.info("🔧 Sondage initial des VMs avant démarrage du service...")
+    await handler.poll_once()
+    handler.launch_background_polling()
+    app_logger.info(
+        f"\n{'═'*60}\n"
+        f"  {C.GREEN}✅  Collector Service prêt{C.RESET}\n"
+        f"  {'Port':<20}: {C.CYAN}{config.COLLECTOR_PORT}{C.RESET}\n"
+        f"  {'VMs enregistrées':<20}: {C.CYAN}{len(config.VM_REGISTRY)}{C.RESET} "
+        f"({', '.join(config.VM_REGISTRY.keys())})\n"
+        f"  {'Timeout base':<20}: {C.CYAN}{config.COLLECTOR_TIMEOUT_BASE}s{C.RESET}\n"
+        f"  {'Alpha EMA':<20}: {C.CYAN}{config.COLLECTOR_RELIABILITY_ALPHA}{C.RESET}\n"
+        f"  {'Intervalle sondage':<20}: {C.CYAN}{config.COLLECTOR_POLL_INTERVAL}s{C.RESET}\n"
+        f"{'═'*60}\n"
+    )
+    yield
+    app_logger.info("🛑 Arrêt du sondage de fond...")
+    await handler.shutdown()
+
+
 app = FastAPI(
     title="Advanced Metrics Collector",
     description="Microservice for polling metrics with adaptive logic.",
-    version="2.1.0"
-)
-
-handler = CollectorHandler()
-
-app_logger.info(
-    f"\n{'═'*60}\n"
-    f"  {C.GREEN}✅  Collector Service prêt{C.RESET}\n"
-    f"  {'Port':<16}: {C.CYAN}{config.COLLECTOR_PORT}{C.RESET}\n"
-    f"  {'VMs enregistrées':<16}: {C.CYAN}{len(config.VM_REGISTRY)}{C.RESET} "
-    f"({', '.join(config.VM_REGISTRY.keys())})\n"
-    f"  {'Timeout base':<16}: {C.CYAN}{config.COLLECTOR_TIMEOUT_BASE}s{C.RESET}\n"
-    f"  {'Alpha EMA':<16}: {C.CYAN}{config.COLLECTOR_RELIABILITY_ALPHA}{C.RESET}\n"
-    f"{'═'*60}\n"
+    version="3.0.0",
+    lifespan=lifespan,
 )
 
 

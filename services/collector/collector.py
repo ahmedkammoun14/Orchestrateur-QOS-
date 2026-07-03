@@ -3,7 +3,7 @@ import httpx
 import logging
 import time
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from shared import config
 from shared.logging_utils import C, PrettyFormatter as _PrettyFormatter
 from shared.http_utils import async_post_with_retry
@@ -25,60 +25,110 @@ logger = setup_logger()
 
 class CollectorHandler:
     """
-    Handles parallel metrics collection with adaptive timeout and reliability tracking.
+    Sondage continu des 4 VMs dans une tâche asyncio de fond, DÉCOUPLÉ du
+    cycle d'orchestration. /collect ne fait plus d'appel réseau lui-même :
+    il lit le cache rempli par la boucle de fond, ce qui retire le RTT
+    réseau réel vers les VMs distantes (~1,4-1,8 s observés) du chemin
+    critique du cycle. Timeout adaptatif et fiabilité EMA inchangés,
+    pilotés par le rythme de la boucle de fond plutôt que par les cycles.
     Follows Hub-and-Spoke: all external reporting goes through Hub proxy.
     """
 
     def __init__(self):
-        self.vm_registry   = config.VM_REGISTRY
-        self.alpha         = config.COLLECTOR_RELIABILITY_ALPHA
-        self.vm_timeouts   = {vm_id: config.COLLECTOR_TIMEOUT_BASE for vm_id in self.vm_registry}
+        self.vm_registry    = config.VM_REGISTRY
+        self.alpha          = config.COLLECTOR_RELIABILITY_ALPHA
+        self.vm_timeouts    = {vm_id: config.COLLECTOR_TIMEOUT_BASE for vm_id in self.vm_registry}
         self.vm_reliability = {vm_id: 1.0 for vm_id in self.vm_registry}
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self._poll_task: Optional[asyncio.Task] = None
 
-    async def handle(self, active_metrics: List[str], cycle: int) -> Dict[str, Any]:
-        logger.info(
-            f"📡 Démarrage collecte — cycle #{C.BOLD}{cycle}{C.RESET} "
-            f"| métriques : {C.CYAN}{active_metrics}{C.RESET} "
-            f"| VMs ciblées : {C.CYAN}{len(self.vm_registry)}{C.RESET}"
-        )
+    # ── Boucle de fond (jamais dans le chemin critique d'un cycle) ───────
 
-        start_time = time.perf_counter()
-
+    async def poll_once(self) -> None:
+        """Une itération de sondage des 4 VMs en parallèle — remplit le cache."""
         async with httpx.AsyncClient() as client:
             tasks = [
-                self._collect_vm(client, vm_id, info, active_metrics)
+                self._poll_vm(client, vm_id, info)
                 for vm_id, info in self.vm_registry.items()
             ]
             results = await asyncio.gather(*tasks)
+        for r in results:
+            self.cache[r["vm_id"]] = r
 
-        duration = round(time.perf_counter() - start_time, 3)
+    async def _background_loop(self) -> None:
+        while True:
+            try:
+                await self.poll_once()
+            except Exception as e:
+                logger.error(f"❌ Boucle de sondage de fond — erreur inattendue : {e}")
+            await asyncio.sleep(config.COLLECTOR_POLL_INTERVAL)
+
+    def launch_background_polling(self) -> None:
+        """Démarre la tâche de fond (idempotent)."""
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(self._background_loop())
+            logger.info(
+                f"🔁 Sondage de fond démarré — intervalle : "
+                f"{C.CYAN}{config.COLLECTOR_POLL_INTERVAL}s{C.RESET}"
+            )
+
+    async def shutdown(self) -> None:
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+
+    # ── Lecture — appelée par /collect, chemin critique du cycle ─────────
+
+    async def handle(self, active_metrics: List[str], cycle: int) -> Dict[str, Any]:
+        results = []
+        for vm_id in self.vm_registry:
+            cached = self.cache.get(vm_id)
+            if cached is None:
+                # Aucun sondage de fond encore terminé (démarrage du service).
+                results.append({
+                    "vm_id": vm_id,
+                    **{m: None for m in active_metrics},
+                    "reliability": self.vm_reliability[vm_id],
+                    "reachable":   False,
+                    "collect_ms":  None,
+                    "timestamp":   datetime.now(timezone.utc).isoformat(),
+                })
+                continue
+            filtered = {m: cached.get(m) for m in active_metrics}
+            results.append({
+                "vm_id":        vm_id,
+                **filtered,
+                "total_cores":  cached.get("total_cores"),
+                "total_ram_gb": cached.get("total_ram_gb"),
+                "reliability":  cached.get("reliability"),
+                "reachable":    cached.get("reachable"),
+                "collect_ms":   cached.get("collect_ms"),  # RTT du dernier sondage de fond
+                "timestamp":    cached.get("timestamp"),
+            })
+
         reachable_count = sum(1 for r in results if r.get("reachable"))
-
-        # Temps de collecte par VM (collecte parallèle → max = VM la plus lente)
         collect_timings = {r["vm_id"]: r.get("collect_ms") for r in results}
         _vals           = [v for v in collect_timings.values() if v is not None]
         collect_max_ms  = max(_vals) if _vals else None
 
         logger.info(
-            f"✅ Collecte terminée — cycle #{C.BOLD}{cycle}{C.RESET} "
-            f"| durée : {C.CYAN}{duration}s{C.RESET} "
+            f"📡 Collecte (cache) — cycle #{C.BOLD}{cycle}{C.RESET} "
+            f"| métriques : {C.CYAN}{active_metrics}{C.RESET} "
             f"| {C.GREEN}{reachable_count}{C.RESET}/{len(results)} VM(s) joignables"
         )
 
         return {
-            "results":         list(results),
+            "results":         results,
             "cycle":           cycle,
-            "collect_timings": collect_timings,  # {vm_id: ms}
-            "collect_max_ms":  collect_max_ms,   # VM la plus lente (parallèle)
+            "collect_timings": collect_timings,  # {vm_id: ms} — RTT du dernier sondage de fond
+            "collect_max_ms":  collect_max_ms,
             "timestamp":       datetime.now(timezone.utc).isoformat()
         }
 
-    async def _collect_vm(
+    async def _poll_vm(
         self,
         client: httpx.AsyncClient,
         vm_id: str,
         info: Dict[str, Any],
-        active_metrics: List[str]
     ) -> Dict[str, Any]:
         url             = f"http://{info['ip']}:{info['port']}/metrics"
         current_timeout = self.vm_timeouts[vm_id]
@@ -94,19 +144,14 @@ class CollectorHandler:
                 self._update_timeout(vm_id, actual_time)
                 self._update_reliability(vm_id, 1.0)
 
-                filtered_metrics = {metric: data.get(metric) for metric in active_metrics}
-                # Capacité physique déclarée par la VM elle-même (fédération :
-                # chaque provider annonce sa propre capacité, pas de valeur
-                # figée côté orchestrateur) — transmise indépendamment des
-                # métriques SLO actives, comme reliability/reachable.
-                capacity_fields = {
-                    "total_cores":  data.get("total_cores"),
-                    "total_ram_gb": data.get("total_ram_gb"),
-                }
-                reliability      = round(self.vm_reliability[vm_id], 3)
+                # Capture tous les champs renvoyés par la VM (registre
+                # extensible — pas de liste de métriques figée ici, /collect
+                # filtre au moment de la lecture selon les SLOs du cycle).
+                metrics = {k: v for k, v in data.items() if k not in ("vm_id", "timestamp")}
+                reliability = round(self.vm_reliability[vm_id], 3)
 
                 metric_summary = "  ".join(
-                    f"{m}={C.CYAN}{v}{C.RESET}" for m, v in filtered_metrics.items() if v is not None
+                    f"{m}={C.CYAN}{v}{C.RESET}" for m, v in metrics.items() if v is not None
                 )
                 logger.info(
                     f"  ✅ {C.GREEN}{C.BOLD}{vm_id}{C.RESET} — "
@@ -117,8 +162,7 @@ class CollectorHandler:
 
                 return {
                     "vm_id": vm_id,
-                    **filtered_metrics,
-                    **capacity_fields,
+                    **metrics,
                     "reliability": reliability,
                     "reachable":   True,
                     "collect_ms":  round(actual_time * 1000, 1),
@@ -126,16 +170,15 @@ class CollectorHandler:
                 }
             else:
                 return self._handle_vm_failure(
-                    vm_id, active_metrics, f"HTTP_{response.status_code}",
-                    round(actual_time * 1000, 1),
+                    vm_id, f"HTTP_{response.status_code}", round(actual_time * 1000, 1),
                 )
 
         except Exception as e:
             elapsed_ms = round((time.perf_counter() - start_ts) * 1000, 1)
-            return self._handle_vm_failure(vm_id, active_metrics, str(type(e).__name__), elapsed_ms)
+            return self._handle_vm_failure(vm_id, str(type(e).__name__), elapsed_ms)
 
     def _handle_vm_failure(
-        self, vm_id: str, metrics: List[str], reason: str, collect_ms: float = None
+        self, vm_id: str, reason: str, collect_ms: float = None
     ) -> Dict[str, Any]:
         self._update_reliability(vm_id, 0.0)
         reliability = round(self.vm_reliability[vm_id], 3)
@@ -146,7 +189,6 @@ class CollectorHandler:
         )
         return {
             "vm_id": vm_id,
-            **{m: None for m in metrics},
             "reliability": reliability,
             "reachable":   False,
             "collect_ms":  collect_ms,

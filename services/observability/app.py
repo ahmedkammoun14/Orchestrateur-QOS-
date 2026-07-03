@@ -131,7 +131,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QoS Orchestrator — Dashboard</title>
+<title>QoS Orchestrator — Tableau de bord</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -318,6 +318,12 @@ const UNITS = """ + json.dumps({
 }) + """;
 
 const COLORS = { latency: '#3b82f6', cpu_usage: '#f59e0b', ram_usage: '#22c55e' };
+const METRIC_LABELS = { latency: 'Latence', cpu_usage: 'CPU', ram_usage: 'RAM' };
+// cpu_usage/ram_usage en mode enhanced (intention LLM) sont exprimés en
+// ressource absolue (cœurs/Go) avec operator ">=" — pas un % de charge.
+// Ce mapping permet de convertir le % brut mesuré en disponibilité réelle
+// de la VM (même formule que TopsisSelector._to_criterion_value côté backend).
+const CAPACITY_KEYS = { cpu_usage: 'total_cores', ram_usage: 'total_ram_gb' };
 const HIST_LEN = 60;
 
 let latencyHist = {}; // vm_id → [values]
@@ -327,6 +333,7 @@ let cycleHist = [];
 let sloWeightCycles = [];
 let currentSlos = [];
 let latencyThreshold = SLO_DEFAULTS['latency'] || 300;
+let lastKnownLatency = {}; // vm_id → dernière latence mesurée connue (pour comparer "VM la plus proche" vs choix TOPSIS)
 
 VMs.forEach(v => { latencyHist[v] = []; latencyPredHist[v] = []; });
 METRICS.forEach(m => { sloWeightHist[m] = []; });
@@ -394,13 +401,13 @@ function buildVmCards() {
     card.innerHTML = `
       <div class="vm-card-header">
         <span class="vm-name">${vm}</span>
-        <span class="vm-tag idle" id="tag-${vm}">IDLE</span>
+        <span class="vm-tag idle" id="tag-${vm}">INACTIF</span>
       </div>
       <div class="vm-metrics" id="metrics-${vm}">
         ${METRICS.map(m => `
           <div>
             <div class="metric-row">
-              <span class="metric-name">${m}</span>
+              <span class="metric-name">${METRIC_LABELS[m] || m}</span>
               <span class="metric-val" id="val-${vm}-${m}">—</span>
             </div>
             <div class="metric-bar"><div class="metric-bar-fill" id="bar-${vm}-${m}" style="width:0%;background:${COLORS[m]||'#3b82f6'}"></div></div>
@@ -443,8 +450,10 @@ function updateMetrics(data) {
     card.className = 'vm-card' + (isActive ? ' active' : '') + (inViolation ? ' violation' : '');
 
     const tag = document.getElementById('tag-' + vm);
-    tag.textContent = isActive ? 'ACTIF' : 'IDLE';
+    tag.textContent = isActive ? 'ACTIF' : 'INACTIF';
     tag.className = 'vm-tag ' + (isActive ? 'active' : 'idle');
+
+    if (latVal !== null && latVal !== undefined) lastKnownLatency[vm] = latVal;
 
     const metricMap = { latency: latVal, cpu_usage: vmData.cpu_usage, ram_usage: vmData.ram_usage };
     const preds = vmData.predictions || {};
@@ -456,25 +465,44 @@ function updateMetrics(data) {
       const predEl = document.getElementById('pred-' + vm + '-' + m);
       if (!el) return;
 
-      const unit = UNITS[m] || '';
       const slo = slos.find(s => s.metric === m);
       const thr = slo ? parseFloat(slo.threshold) : (SLO_DEFAULTS[m] || 100);
+      // Mode enhanced (LLM) : cpu_usage/ram_usage en cœurs/Go, operator ">=".
+      // Il faut convertir le % brut en disponibilité réelle (capacité de
+      // CETTE vm) avant de comparer — sinon on compare un % à un nombre de
+      // cœurs. La direction de violation s'inverse aussi : sous le seuil =
+      // violation (au lieu de : au-dessus = violation pour "<").
+      const capKey  = CAPACITY_KEYS[m];
+      const isFloor = !!(slo && (slo.operator === '>=' || slo.operator === '>') && capKey);
+      const unit    = slo ? slo.unit : (UNITS[m] || '');
 
-      if (val !== null && val !== undefined) {
-        el.textContent = val.toFixed(1) + ' ' + unit;
-        el.style.color = val > thr ? '#ef4444' : '#22c55e';
-        bar.style.width = Math.min(100, (val / thr) * 100) + '%';
-        bar.style.background = val > thr ? '#ef4444' : (COLORS[m] || '#3b82f6');
+      const toDisplay = (raw) => {
+        if (raw === null || raw === undefined) return null;
+        if (!isFloor) return raw;
+        const capacity = vmData[capKey];
+        if (!capacity) return raw; // capacité inconnue — pas de conversion possible
+        return capacity * (1 - raw / 100);
+      };
+      const isBad = (displayVal) => isFloor ? displayVal < thr : displayVal > thr;
+
+      const dVal = toDisplay(val);
+
+      if (dVal !== null && dVal !== undefined) {
+        el.textContent = dVal.toFixed(isFloor ? 2 : 1) + ' ' + unit;
+        el.style.color = isBad(dVal) ? '#ef4444' : '#22c55e';
+        bar.style.width = Math.min(100, Math.max(0, (dVal / thr) * 100)) + '%';
+        bar.style.background = isBad(dVal) ? '#ef4444' : (COLORS[m] || '#3b82f6');
       } else {
         el.textContent = '—'; bar.style.width = '0%';
       }
 
-      const mp = (preds[m] || []);
+      const mp = (preds[m] || []).map(toDisplay).filter(p => p !== null);
       if (mp.length > 0) {
-        const firstPred = mp[0].toFixed(1);
-        const maxPred = Math.max(...mp).toFixed(1);
-        predEl.textContent = `${firstPred} → ${maxPred} ${unit}`;
-        predEl.style.color = parseFloat(maxPred) > thr ? '#f59e0b' : '#94a3b8';
+        const firstPred = mp[0].toFixed(isFloor ? 2 : 1);
+        // Le "pire cas" prédit est le pic pour un plafond, le creux pour un plancher.
+        const worstPred = (isFloor ? Math.min(...mp) : Math.max(...mp)).toFixed(isFloor ? 2 : 1);
+        predEl.textContent = `${firstPred} → ${worstPred} ${unit}`;
+        predEl.style.color = isBad(parseFloat(worstPred)) ? '#f59e0b' : '#94a3b8';
       } else {
         predEl.textContent = '—';
       }
@@ -521,7 +549,7 @@ function updateMetrics(data) {
     const pct = Math.round((s.weight || 0) * 100);
     const color = COLORS[s.metric] || '#94a3b8';
     return `<div class="slo-row">
-      <span class="slo-name">${s.metric}</span>
+      <span class="slo-name">${METRIC_LABELS[s.metric] || s.metric}</span>
       <div class="slo-bar-bg"><div class="slo-bar-fill" style="width:${pct}%;background:${color}"></div></div>
       <span class="slo-weight-val" style="color:${color}">${pct}%</span>
       <span style="font-size:11px;color:#94a3b8;margin-left:8px">${s.operator} ${s.threshold?.toFixed(1)} ${s.unit || ''} ${s.is_primary ? '★' : ''}</span>
@@ -534,6 +562,45 @@ let auditCount = 0;
 let proactiveMigrateCount = 0;
 let reactiveMigrateCount = 0;
 const seenMigrations = new Set();  // clé cycle → évite double comptage (snapshot + live)
+
+// Traduit le "reason" brut (anglais, venant du backend decision_intelligence)
+// en français, et ajoute l'explication "VM la plus proche vs choix TOPSIS"
+// pour les migrations : compare to_vm à la VM ayant la latence la plus basse
+// connue au moment de la décision (lastKnownLatency, alimenté par updateMetrics).
+function translateReason(e) {
+  const breachFr = e.breach_type === 'proactive' ? 'proactive'
+                  : e.breach_type === 'reactive' ? 'réactive' : '';
+  const toVm = e.to_vm;
+
+  let base;
+  if (/Secondary-only violation/.test(e.reason || '')) {
+    base = `Violation ${breachFr} sur une métrique secondaire (CPU/RAM) seulement — pas de migration (seule la latence déclenche une migration).`;
+  } else if (/Cooldown active/i.test(e.reason || '')) {
+    base = `Cooldown actif — migration temporairement bloquée.`;
+  } else if (/No SLO violation/i.test(e.reason || '')) {
+    base = `Aucune violation de SLO détectée.`;
+  } else if (/still best candidate/.test(e.reason || '')) {
+    base = `Violation ${breachFr} détectée, mais ${e.from_vm} reste le meilleur candidat (TOPSIS) — maintien.`;
+  } else if (toVm) {
+    // Cas migration effective : "{breach} violation on {metrics} — TOPSIS selected 'to_vm' (score=...)"
+    const knownVms = Object.keys(lastKnownLatency).filter(v => lastKnownLatency[v] != null);
+    let nearestVm = null;
+    knownVms.forEach(v => {
+      if (nearestVm === null || lastKnownLatency[v] < lastKnownLatency[nearestVm]) nearestVm = v;
+    });
+    if (nearestVm && nearestVm === toVm) {
+      base = `Violation ${breachFr} détectée — migration vers ${toVm}, la VM la plus proche (la latence domine la décision).`;
+    } else if (nearestVm) {
+      base = `Violation ${breachFr} détectée — la VM la plus proche était ${nearestVm}, mais le score TOPSIS `
+           + `(CPU/RAM pris en compte) a favorisé ${toVm} à la place.`;
+    } else {
+      base = `Violation ${breachFr} détectée — TOPSIS a sélectionné ${toVm} (score=${e.topsis_score ?? '—'}).`;
+    }
+  } else {
+    base = e.reason || '—';
+  }
+  return base;
+}
 
 function addAuditRows(entries, prepend = false) {
   const tbody = document.getElementById('audit-body');
@@ -548,20 +615,24 @@ function addAuditRows(entries, prepend = false) {
       document.getElementById('h-proactive-count').textContent = proactiveMigrateCount;
       document.getElementById('h-reactive-count').textContent = reactiveMigrateCount;
     }
+
+    // Audit log = uniquement les migrations effectives (les MAINTIEN sont
+    // omis pour rester lisible ; ils restent visibles dans l'en-tête et
+    // dans les logs bruts du hub).
+    if (dec !== 'migrate') return;
+
     const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString('fr-FR') : '—';
-    const decBadge = dec === 'migrate'
-      ? `<span class="badge badge-migrate">MIGRATE</span>`
-      : `<span class="badge badge-stay">STAY</span>`;
+    const decBadge = `<span class="badge badge-migrate">MIGRATION</span>`;
     const breachBadge = breach === 'reactive'
       ? `<span class="badge badge-reactive">réactif</span>`
       : breach === 'proactive'
         ? `<span class="badge badge-proactive">proactif</span>`
         : `<span class="badge badge-none">—</span>`;
     const metrics = (e.violated_metrics || [])
-      .map(m => `${m.metric} (${(m.weight ?? 0).toFixed(2)})`)
+      .map(m => `${METRIC_LABELS[m.metric] || m.metric} (${(m.weight ?? 0).toFixed(2)})`)
       .join(', ') || '—';
     const score = e.topsis_score != null ? parseFloat(e.topsis_score).toFixed(4) : '—';
-    const reason = (e.reason || '').substring(0, 60);
+    const reason = translateReason(e);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -570,7 +641,7 @@ function addAuditRows(entries, prepend = false) {
       <td>${decBadge}</td>
       <td>${breachBadge}</td>
       <td class="mono">${e.from_vm || '—'}</td>
-      <td class="mono" style="color:${dec==='migrate'?'#22c55e':'inherit'}">${e.to_vm || '—'}</td>
+      <td class="mono" style="color:#22c55e">${e.to_vm || '—'}</td>
       <td class="mono">${score}</td>
       <td class="mono" style="color:#f59e0b">${metrics}</td>
       <td style="color:#94a3b8;font-size:11px">${reason}</td>`;
@@ -586,8 +657,8 @@ function updateHeader(auditData) {
   const breach = auditData.breach_type || 'none';
   const score = auditData.topsis_score;
   document.getElementById('h-decision').innerHTML =
-    dec === 'migrate' ? '<span class="badge badge-migrate">MIGRATE</span>'
-                      : '<span class="badge badge-stay">STAY</span>';
+    dec === 'migrate' ? '<span class="badge badge-migrate">MIGRATION</span>'
+                      : '<span class="badge badge-stay">MAINTIEN</span>';
   document.getElementById('h-breach').innerHTML =
     breach === 'reactive'  ? '<span class="badge badge-reactive">réactif</span>' :
     breach === 'proactive' ? '<span class="badge badge-proactive">proactif</span>' :

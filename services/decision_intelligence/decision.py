@@ -12,8 +12,8 @@ logger = logging.getLogger("DecisionIntelligence.handler")
 # Marge d'hystérésis anti-ping-pong (dead-band). On ne migre que si le
 # meilleur candidat dépasse la VM ACTIVE de cette fraction. À 0.0, la règle
 # « meilleur > actif » est déjà le comportement par défaut et produit le
-# va-et-vient edge↔cloud ; 0.15 = 15 % de marge nette pour le stopper.
-_MIGRATION_MARGIN: float = 0.15
+# va-et-vient edge↔cloud ; 0.05 = 5 % de marge nette pour le stopper.
+_MIGRATION_MARGIN: float = 0.05
 
 
 class DecisionHandler:
@@ -237,7 +237,8 @@ class DecisionHandler:
         predictions_map: Dict[str, Any],
         slos: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        def _satisfies_all(vm_id: str) -> bool:
+        def _satisfies_all(cand: Dict[str, Any]) -> bool:
+            vm_id = cand["vm_id"]
             for slo in slos:
                 metric = slo["metric"]
                 if metric not in config.METRICS_REGISTRY:
@@ -251,12 +252,20 @@ class DecisionHandler:
                 if not preds:
                     return False
                 mean = self._topsis.calculate_weighted_mean(preds)
+                # SLO exprimé en ressource absolue (cœurs/Go, intention LLM
+                # mode enhanced) plutôt qu'en % (mode autonomous) : convertir
+                # la prédiction brute (%) en disponibilité réelle de CETTE VM
+                # avant comparaison — sinon on compare un % à un nombre de
+                # cœurs, ce qui n'a pas de sens. Même conversion que celle
+                # déjà utilisée côté scoring TOPSIS (_to_criterion_value).
+                if slo.get("unit") in ("cores", "GB"):
+                    mean = self._topsis._to_criterion_value(metric, cand, mean)
                 if not vm_satisfies_slo(mean, slo):
                     return False
             return True
 
         preferred: List[Dict] = [
-            c for c in all_candidates if _satisfies_all(c["vm_id"])
+            c for c in all_candidates if _satisfies_all(c)
         ]
         return preferred if preferred else all_candidates
 

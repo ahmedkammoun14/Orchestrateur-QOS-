@@ -40,6 +40,65 @@ PARALLEL_STEPS: Dict[str, str] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Parallélisme ENTRE BRANCHES — niveau différent du tableau ci-dessus.
+#  Ici, deux branches (chacune une SUITE d'étapes de microservices différents)
+#  sont lancées ensemble via UN SEUL asyncio.gather (hub `_run_flow`, wrapper
+#  "slos_and_collect_parallel" — visible dans les logs console, PAS persisté
+#  comme colonne Excel). Durée de l'ensemble = la branche la plus LENTE des
+#  deux, pas la somme.
+# ─────────────────────────────────────────────────────────────────────────────
+PARALLEL_BRANCHES: tuple = (
+    {
+        "branch_a":       ("mi_compute", "mi_slos", "slos_mm", "persist_slos"),
+        "branch_a_label": "Metrics Manager → Database  (SLOs / MI)",
+        "branch_b":       ("collect", "persist_metrics"),
+        "branch_b_label": "Collector → Database  (CPU/RAM)",
+        "note": (
+            "Aucune dépendance entre les deux — seule la suite du cycle "
+            "(historiques → prédiction → décision) a besoin des deux résultats."
+        ),
+    },
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SÉQUENTIEL — complément de PARALLEL_BRANCHES/PARALLEL_STEPS. Aucun de ces
+#  enchaînements n'est parallélisable : chaque étape a besoin de la SORTIE de
+#  la précédente (dépendance de données stricte, pas juste un choix de code).
+#  À NE PAS confondre avec les 2 blocs parallèles ci-dessus : une chaîne peut
+#  être séquentielle EN INTERNE tout en appartenant à une branche qui, elle,
+#  tourne en parallèle avec une autre (ex. collect→persist_metrics = Branche B).
+# ─────────────────────────────────────────────────────────────────────────────
+SEQUENTIAL_CHAINS: tuple = (
+    {
+        "chain": ("load_histories", "prediction", "check_violations",
+                  "decide_call", "store_decision", "migration"),
+        "note": (
+            "Squelette du cycle après le bloc parallèle (niveau 1) : chaque étape "
+            "consomme le résultat de la précédente (histo → prédiction → décision → action). "
+            "store_decision et migration ne s'exécutent que si decision == 'migrate'."
+        ),
+    },
+    {
+        "chain": ("mi_compute → mi_slos (Metrics Manager)", "persist_slos"),
+        "note": "Intérieur de la Branche A (voir PARALLEL_BRANCHES) — pas parallèle en soi.",
+    },
+    {
+        "chain": ("collect", "persist_metrics"),
+        "note": "Intérieur de la Branche B (voir PARALLEL_BRANCHES) — pas parallèle en soi.",
+    },
+    {
+        "chain": ("violation_detection", "candidate_filter", "topsis_total"),
+        "note": "Sous-étapes internes de decide_call (Decision Intelligence).",
+    },
+    {
+        "chain": ("topsis_matrix", "topsis_norm", "topsis_weight", "topsis_dist"),
+        "note": "Les 4 phases TOPSIS — dépendance de calcul stricte (chaque phase transforme la sortie de la précédente).",
+    },
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Ordre d'exécution des microservices dans un cycle d'orchestration
 #  (hub `_run_flow`). Référence UNIQUE pour l'ordre des colonnes de l'export
 #  Excel (voir timing_writer.py). « ∥ » = étapes lancées en parallèle

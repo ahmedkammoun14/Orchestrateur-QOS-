@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "picarx-sim",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "8099", "--directory", "infrastructure"],
+      "port": 8099
+    },
+    {
+      "name": "observability",
+      "runtimeExecutable": "./venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "services.observability.app"],
+      "port": 8009
+    }
+  ]
+}

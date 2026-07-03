@@ -156,21 +156,36 @@ class LLMHandler:
             "Tu es un expert QoS réseau. Tu convertis des intentions utilisateur "
             "en SLOs réseau au format JSON.\n\n"
             "Métriques disponibles (TOUJOURS inclure les 3 sauf si l'intention exclut explicitement une métrique) :\n"
-            "  - latency   : latence réseau en ms  (operator: \"<\")\n"
-            "  - cpu_usage : charge CPU en %        (operator: \"<\")\n"
-            "  - ram_usage : utilisation RAM en %   (operator: \"<\")\n\n"
+            "  - latency   : latence réseau en ms (operator: \"<\", unit: \"ms\") — "
+            "contrainte de performance réseau.\n"
+            "  - cpu_usage : BESOIN ABSOLU de calcul du service, en cœurs disponibles "
+            "nécessaires (operator: \">=\", unit: \"cores\") — PAS un pourcentage de charge, "
+            "une quantité de ressource que le service doit trouver libre sur la machine qui "
+            "l'héberge, indépendamment de la capacité de cette machine.\n"
+            "  - ram_usage : BESOIN ABSOLU de mémoire du service, en Go disponibles "
+            "nécessaires (operator: \">=\", unit: \"GB\") — même logique que cpu_usage.\n\n"
+            "CATALOGUE DE PROFILS DE RÉFÉRENCE (pour estimer cpu_usage/ram_usage à partir du "
+            "type de service décrit dans l'intention — jamais en fonction d'une VM précise, "
+            "seulement du besoin du service lui-même) :\n"
+            "  - service léger / API / monitoring    : 0.3-0.5 cœur,  0.2-0.5 Go\n"
+            "  - traitement web classique / backend  : 0.5-1.0 cœur,  0.5-1.0 Go\n"
+            "  - streaming / transcodage vidéo       : 1.5-3.0 cœurs, 1.0-2.0 Go\n"
+            "  - inférence / entraînement ML          : 1.0-4.0 cœurs, 2.0-8.0 Go\n\n"
             "RÈGLES :\n"
-            "1. Si l'intention donne un chiffre explicite pour une métrique, utilise-le.\n"
+            "1. Si l'intention donne un chiffre explicite pour une métrique, utilise-le "
+            "(garde l'unité adaptée : ms pour latency, cœurs/Go pour cpu/ram).\n"
             "2. Si l'intention est vague ou relative (ex: \"aussi bien qu'actuellement\", "
             "\"sans surcharge\"), utilise les seuils par défaut experts : "
-            "latency=100ms, cpu_usage=80%, ram_usage=80%.\n"
-            "3. Si active_slos contient des SLOs actifs, utilise leurs valeurs comme référence.\n"
-            "4. Les poids (weight) doivent sommer à 1.0.\n\n"
+            "latency=100ms, cpu_usage=0.5 cœur, ram_usage=0.5 Go.\n"
+            "3. Si l'intention décrit un type de service reconnaissable, utilise le "
+            "catalogue ci-dessus pour estimer cpu_usage/ram_usage.\n"
+            "4. Si active_slos contient des SLOs actifs, utilise leurs valeurs comme référence.\n"
+            "5. Les poids (weight) doivent sommer à 1.0.\n\n"
             "FORMAT DE RÉPONSE OBLIGATOIRE — tableau JSON uniquement, "
             "sans texte avant ou après, sans markdown :\n"
-            '[{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":80.0,"window":"5m"},'
-            '{"metric":"cpu_usage","operator":"<","threshold":80.0,"unit":"%","weight":0.25,"target":70.0,"window":"5m"},'
-            '{"metric":"ram_usage","operator":"<","threshold":80.0,"unit":"%","weight":0.25,"target":70.0,"window":"5m"}]'
+            '[{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":90.0,"window":"5m"},'
+            '{"metric":"cpu_usage","operator":">=","threshold":0.5,"unit":"cores","weight":0.25,"target":0.55,"window":"5m"},'
+            '{"metric":"ram_usage","operator":">=","threshold":0.5,"unit":"GB","weight":0.25,"target":0.55,"window":"5m"}]'
         )
 
         user_prompt = (
@@ -278,6 +293,11 @@ class LLMHandler:
             m = r.get("metric", "").lower()
             r["metric"] = norm_map.get(m, m)
 
+            # "Go" (FR) → "GB" : le reste du pipeline (filtre, TOPSIS) ne
+            # connaît que "GB" pour identifier un besoin en ressource absolue.
+            if r.get("unit") == "Go":
+                r["unit"] = "GB"
+
             # Récupération défensive du threshold — gère à la fois clé absente
             # ET clé présente avec valeur None (cas où le LLM renvoie un null)
             raw_threshold = r.get("threshold")
@@ -287,9 +307,17 @@ class LLMHandler:
                 base = raw_threshold if raw_threshold is not None else default_thr
                 r["threshold"] = max(config.LATENCY_MIN, min(config.LATENCY_MAX, float(base)))
             elif r["metric"] in ["cpu_usage", "ram_usage"]:
-                default_thr = 80.0
-                base = raw_threshold if raw_threshold is not None else default_thr
-                r["threshold"] = max(config.USAGE_MIN, min(config.USAGE_MAX, float(base)))
+                if r.get("unit") in ("cores", "GB"):
+                    # Besoin absolu du service (cœurs/Go nécessaires) — pas un
+                    # pourcentage de charge, donc pas de borne 0-100. Juste un
+                    # plancher de sanité pour écarter une valeur nulle/négative.
+                    default_thr = 0.5
+                    base = raw_threshold if raw_threshold is not None else default_thr
+                    r["threshold"] = max(0.1, float(base))
+                else:
+                    default_thr = 80.0
+                    base = raw_threshold if raw_threshold is not None else default_thr
+                    r["threshold"] = max(config.USAGE_MIN, min(config.USAGE_MAX, float(base)))
             else:
                 # Métrique inconnue — pas de bornes définies, on garde la valeur
                 # ou on écarte le SLO si threshold est totalement absent/None
@@ -298,9 +326,15 @@ class LLMHandler:
                     continue
                 r["threshold"] = float(raw_threshold)
 
-            # target : défensif contre target=None explicite
+            # target : défensif contre target=None explicite. Pour un plancher
+            # (">="), viser un peu AU-DESSUS du minimum contractuel a du sens
+            # (marge de sécurité) — l'inverse d'un plafond ("<") où on vise
+            # légèrement EN DESSOUS.
             raw_target = r.get("target")
-            r["target"] = float(raw_target) if raw_target is not None else r["threshold"] * 0.9
+            if raw_target is not None:
+                r["target"] = float(raw_target)
+            else:
+                r["target"] = r["threshold"] * (1.1 if r.get("operator") in (">", ">=") else 0.9)
 
             r.setdefault("window", "5m")
 

@@ -24,7 +24,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from shared.timing import PARALLEL_STEPS, PIPELINE_ORDER
+from shared.timing import PARALLEL_BRANCHES, PARALLEL_STEPS, PIPELINE_ORDER, SEQUENTIAL_CHAINS
 
 logger = logging.getLogger("TimingWriter")
 
@@ -409,25 +409,62 @@ class TimingWriter:
             ("  check_violations (Hub) s'exécute juste avant la décision DI ; le bloc Hub est", None),
             ("  regroupé en fin car son coût dominant est la migration (action finale).", None),
             ("", None),
-            ("SOMME : somme des étapes principales (sans double-comptage des sous-étapes) :", _FONT_SUB),
-            ("  check_violations + migration  (Hub)", None),
-            ("  + collect                     (Collector — total, pas la somme des VMs)", None),
-            ("  + persist_slos + persist_metrics + store_decision  (Database)", None),
-            ("  + slos_load_hist + load_histories  (History Loader)", None),
-            ("  + prediction                  (ML Predictor)", None),
-            ("  + slos_mm                     (Metrics Manager)", None),
-            ("  + decide_call                 (Decision Intelligence — total, pas les sous-étapes)", None),
-            ("  Les colonnes '→' et les phases TOPSIS sont des sous-parties ; elles sont EXCLUES.", None),
-            ("  TOTAL > SOMME car TOTAL inclut les overhead HTTP/asyncio entre étapes.", None),
+            ("═" * 80, None),
+            ("SOMME (colonne 'SOMME (ms)') — quelles colonnes sommer pour l'obtenir :", _FONT_SUB),
+            ("  check_violations + migration                          (Hub)", None),
+            ("  + collect                                              (Collector — total, pas la somme des VMs)", None),
+            ("  + persist_slos + persist_metrics + store_decision      (Database)", None),
+            ("  + slos_load_hist + load_histories                      (History Loader)", None),
+            ("  + prediction                                           (ML Predictor)", None),
+            ("  + slos_mm                                              (Metrics Manager)", None),
+            ("  + decide_call                                          (Decision Intelligence — total, pas les sous-étapes)", None),
+            ("  EXCLUES de la SOMME (ce sont des sous-parties déjà comptées dans leur total parent) :", None),
+            ("     mi_compute, mi_slos (inclus dans slos_mm) ; violation_detection, candidate_filter,", None),
+            ("     topsis_total, topsis_matrix/norm/weight/dist (inclus dans decide_call) ;", None),
+            ("     collect_edge1..cloud2, collect_max (inclus dans collect) ; collect_overhead, di_overhead (dérivées).", None),
+            ("  TOTAL (colonne 'TOTAL cycle (ms)') > SOMME, car TOTAL est mesuré directement par le hub", None),
+            ("  (chrono autour de tout le cycle) et inclut l'overhead HTTP/asyncio ENTRE les étapes,", None),
+            ("  que la SOMME (addition des durées internes) ne peut pas capturer.", None),
             ("", None),
-            ("Étapes exécutées EN PARALLÈLE (asyncio.gather sur les 4 VMs) :", _FONT_SUB),
+            ("═" * 80, None),
+            ("PARALLÉLISME — 2 niveaux distincts dans le pipeline :", _FONT_SUB),
+            ("", None),
+            ("Niveau 1 — ENTRE BRANCHES (deux services différents, un seul cycle) :", None),
+        ]
+        for b in PARALLEL_BRANCHES:
+            lines.append((f"     Branche A : {' → '.join(b['branch_a'])}", None))
+            lines.append((f"                 ({b['branch_a_label']})", None))
+            lines.append((f"     Branche B : {' → '.join(b['branch_b'])}", None))
+            lines.append((f"                 ({b['branch_b_label']})", None))
+            lines.append((f"     A ∥ B  →  {b['note']}", None))
+        lines += [
+            ("     Durée du bloc = max(Branche A, Branche B) — visible dans les logs console", None),
+            ("     (\"slos_and_collect_parallel\"), PAS persistée comme colonne Excel séparée.", None),
+            ("", None),
+            ("Niveau 2 — INTERNE à une étape (4 VMs simultanées via asyncio.gather) :", None),
         ]
         for name, desc in PARALLEL_STEPS.items():
             lines.append((f"     •  {name}  —  {desc}", None))
         lines += [
             ("", None),
-            ("La durée d'une étape parallèle = la VM la plus LENTE (pas la somme des 4).", None),
-            ("Ne jamais multiplier une valeur parallèle par 4 pour obtenir le temps total.", None),
+            ("La durée d'une étape parallèle (niveau 1 ou 2) = la branche/VM la plus LENTE, jamais la somme.", None),
+            ("Ne jamais multiplier une valeur parallèle par 4 (ou par 2) pour obtenir un temps total.", None),
+            ("", None),
+            ("═" * 80, None),
+            ("SÉQUENTIEL — aucun parallélisme, chaque étape attend la sortie de la précédente :", _FONT_SUB),
+            ("  (complément du bloc PARALLÉLISME ci-dessus — TOUTES les autres colonnes du tableau,", None),
+            ("  hors les 2 niveaux listés plus haut, s'exécutent l'une après l'autre.)", None),
+            ("", None),
+        ]
+        for i, sc in enumerate(SEQUENTIAL_CHAINS, start=1):
+            lines.append((f"  {i}. " + " → ".join(sc["chain"]), None))
+            lines.append((f"     {sc['note']}", None))
+        lines += [
+            ("", None),
+            ("Récapitulatif pour lire une ligne du tableau de gauche à droite :", None),
+            ("  Metrics Manager ∥ Collector  →  Database  →  History Loader  →  ML Predictor  →", None),
+            ("  Decision Intelligence  →  Hub (migration). Seul le premier bloc est parallèle (niveau 1) ;", None),
+            ("  tout le reste s'enchaîne séquentiellement, microservice après microservice.", None),
             ("", None),
             ("Collecte par VM :", _FONT_SUB),
             ("  edge1, edge2, cloud1, cloud2 : temps de réponse individuel mesuré dans le Collector.", None),

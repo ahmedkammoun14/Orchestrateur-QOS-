@@ -86,11 +86,13 @@ class OrchestratorState:
             coll  = collected_map.get(vm_id, {})
             preds = self.snapshot_predictions.get(vm_id, {})
             vms_data[vm_id] = {
-                "rtt_ms":      coll.get("latency"),
-                "cpu_usage":   coll.get("cpu_usage"),
-                "ram_usage":   coll.get("ram_usage"),
-                "reliability": coll.get("reliability"),
-                "is_active":   (vm_id == self.service_vm),
+                "rtt_ms":       coll.get("latency"),
+                "cpu_usage":    coll.get("cpu_usage"),
+                "ram_usage":    coll.get("ram_usage"),
+                "reliability":  coll.get("reliability"),
+                "total_cores":  coll.get("total_cores"),
+                "total_ram_gb": coll.get("total_ram_gb"),
+                "is_active":    (vm_id == self.service_vm),
                 "predictions": {
                     "latency":   preds.get("latency",   {}).get("predictions", []),
                     "cpu_usage": preds.get("cpu_usage", {}).get("predictions", []),
