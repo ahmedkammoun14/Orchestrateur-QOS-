@@ -85,10 +85,15 @@ class LLMHandler:
 
         context = await self.rag_builder.build()
 
-        result = await self._level1_llm(intention, context)
+        llm_response = await self._level1_llm(intention, context)
 
-        if not result:
+        if llm_response is None:
             logger.error("❌ Le LLM n'a pas produit de résultat exploitable — intention non interprétable")
+            return None
+
+        llm_strategy, result = llm_response
+        if not result:
+            logger.error("❌ Le LLM n'a produit aucun SLO exploitable pour cette intention")
             return None
 
         # ── Log des seuils bruts extraits par le LLM ─────────────────
@@ -113,9 +118,13 @@ class LLMHandler:
         active_slos = [SLO(**s) for s in context.get("active_slos", [])]
 
         # REFINE toujours désactivé — le LLM gère seul la cohérence avec
-        # l'existant via le prompt (RAG context).
+        # l'existant via le prompt (RAG context). La stratégie REPLACE/ADDITIVE
+        # est décidée par le LLM lui-même (llm_strategy) plutôt que par une
+        # détection de mot-clé sur le texte brut — le repli mot-clé ne joue
+        # que si le LLM n'a pas fourni de merge_strategy exploitable.
         final_slos = self.merger.merge(
             active_slos, normalized, intention,
+            llm_strategy=llm_strategy,
             allow_refine=False
         )
 
@@ -199,20 +208,33 @@ class LLMHandler:
             "4. Si active_slos contient des SLOs actifs, utilise leurs valeurs comme référence.\n"
             "5. Les poids (weight) doivent sommer à 1.0 — poids dominant à la métrique qui "
             "porte la valeur métier de l'intention (ex: la latence pour une alerte, le "
-            "CPU pour du calcul intensif).\n\n"
-            "FORMAT DE RÉPONSE OBLIGATOIRE — tableau JSON uniquement, "
+            "CPU pour du calcul intensif).\n"
+            "6. Détermine aussi merge_strategy — comment tes SLOs doivent se combiner avec "
+            "active_slos :\n"
+            "   - \"replace\" : l'intention donne des valeurs précises et complètes pour les "
+            "métriques qu'elle mentionne (même reliées par \"et\"/\"aussi\" dans la phrase) — "
+            "elle se suffit à elle-même, les anciens SLOs non mentionnés doivent disparaître.\n"
+            "   - \"additive\" : l'intention utilise un langage relatif qui n'a de sens QUE "
+            "par rapport à active_slos (ex: \"minimal\", \"encore plus bas\", \"pareil mais "
+            "plus strict\", \"aussi rapide qu'avant\") — calcule alors la nouvelle valeur à "
+            "partir de active_slos, et les métriques non concernées par l'intention restent "
+            "inchangées.\n"
+            "   Par défaut, si l'intention est autonome et chiffrée : \"replace\".\n\n"
+            "FORMAT DE RÉPONSE OBLIGATOIRE — objet JSON uniquement, "
             "sans texte avant ou après, sans markdown :\n"
-            '[{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":90.0,"window":"5m"},'
+            '{"merge_strategy":"replace","slos":['
+            '{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":90.0,"window":"5m"},'
             '{"metric":"cpu_usage","operator":">=","threshold":0.5,"unit":"cores","weight":0.25,"target":0.55,"window":"5m"},'
-            '{"metric":"ram_usage","operator":">=","threshold":0.5,"unit":"GB","weight":0.25,"target":0.55,"window":"5m"}]'
+            '{"metric":"ram_usage","operator":">=","threshold":0.5,"unit":"GB","weight":0.25,"target":0.55,"window":"5m"}]}'
         )
 
         user_prompt = (
             f"État actuel du système : {json.dumps(rag_summary, ensure_ascii=False)}\n\n"
             f"Intention utilisateur : \"{text}\"\n\n"
-            "Identifie d'abord le service qui réaliserait cette intention, puis génère le "
-            "tableau JSON des SLOs de ce service — uniquement les métriques dont il a "
-            "réellement besoin, tableau vide si aucun service déployable ne correspond."
+            "Identifie d'abord le service qui réaliserait cette intention, détermine "
+            "merge_strategy, puis génère l'objet JSON avec les SLOs de ce service — "
+            "uniquement les métriques dont il a réellement besoin, slos vide si aucun "
+            "service déployable ne correspond."
         )
 
         # ── 1. Try LAAS vLLM (primary) ───────────────────────────────
@@ -228,7 +250,36 @@ class LLMHandler:
         )
         return await self._call_ollama(ollama_prompt, text)
 
-    async def _call_laas(self, system_prompt: str, user_prompt: str, text: str) -> Optional[List[Dict[str, Any]]]:
+    @staticmethod
+    def _parse_llm_response(raw_content: str) -> Optional[tuple]:
+        """
+        Parse la réponse du LLM. Comprend le nouveau format
+        {"merge_strategy": "replace"|"additive", "slos": [...]} ET l'ancien
+        format legacy (tableau JSON brut de SLOs, sans stratégie) pour
+        rester compatible si le modèle ignore la consigne.
+
+        Retourne (merge_strategy_ou_None, liste_de_slos) ou None si rien
+        d'exploitable n'a pu être extrait.
+        """
+        # Capture gourmande du premier '[' ou '{' jusqu'au DERNIER ']' ou '}' —
+        # couvre objet {..."slos":[...]} et ancien format [...] indifféremment.
+        match = re.search(r'[\[{].*[\]}]', raw_content, re.DOTALL)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+
+        if isinstance(parsed, dict) and "slos" in parsed:
+            strategy = parsed.get("merge_strategy")
+            slos = parsed.get("slos") or []
+            return (strategy, slos)
+        if isinstance(parsed, list):
+            return (None, parsed)
+        return None
+
+    async def _call_laas(self, system_prompt: str, user_prompt: str, text: str) -> Optional[tuple]:
         proxies = {"https://": config.LAAS_LLM_PROXY} if config.LAAS_LLM_PROXY else None
         payload = {
             "model": config.LAAS_MODEL,
@@ -256,18 +307,17 @@ class LLMHandler:
                 if resp.status_code == 200:
                     raw_content = resp.json()["choices"][0]["message"]["content"].strip()
                     logger.debug(f"LAAS raw response: {raw_content[:300]}")
-                    # greedy match to capture the full array including nested objects
-                    # (*.  et non +. : un tableau vide `[]` est une réponse valide et
-                    # délibérée — l'intention ne concerne aucune métrique réseau/QoS).
-                    match = re.search(r'\[.*\]', raw_content, re.DOTALL)
-                    if match:
-                        parsed = json.loads(match.group())
-                        if isinstance(parsed, list):
-                            if len(parsed) > 0:
-                                logger.info(f"✅ LAAS LLM — {len(parsed)} SLO(s) extraits")
-                            else:
-                                logger.info("ℹ️  LAAS LLM — tableau vide : intention hors du domaine réseau/QoS")
-                            return parsed
+                    result = self._parse_llm_response(raw_content)
+                    if result is not None:
+                        strategy, slos = result
+                        if slos:
+                            logger.info(
+                                f"✅ LAAS LLM — {len(slos)} SLO(s) extraits "
+                                f"| stratégie : {strategy or 'non fournie (repli mot-clé)'}"
+                            )
+                        else:
+                            logger.info("ℹ️  LAAS LLM — tableau vide : intention hors du domaine réseau/QoS")
+                        return (strategy, slos)
                     logger.warning(f"⚠️  LAAS LLM — réponse sans JSON exploitable : {raw_content[:300]}")
                 else:
                     logger.error(f"❌ LAAS LLM a retourné HTTP {resp.status_code} : {resp.text[:200]}")
@@ -275,7 +325,7 @@ class LLMHandler:
             logger.error(f"❌ LAAS LLM indisponible ou erreur d'appel : {e}")
         return None
 
-    async def _call_ollama(self, prompt: str, text: str) -> Optional[List[Dict[str, Any]]]:
+    async def _call_ollama(self, prompt: str, text: str) -> Optional[tuple]:
         try:
             async with httpx.AsyncClient() as client:
                 logger.info(
@@ -289,15 +339,19 @@ class LLMHandler:
                 )
                 if resp.status_code == 200:
                     raw_content = resp.json().get("response", "")
-                    match = re.search(r'\[.*?\]', raw_content, re.DOTALL)
-                    if match:
-                        parsed = json.loads(match.group())
-                        if isinstance(parsed, list):
-                            if len(parsed) > 0:
-                                logger.info(f"✅ Ollama — {len(parsed)} SLO(s) extraits")
-                            else:
-                                logger.info("ℹ️  Ollama — tableau vide : intention hors du domaine réseau/QoS")
-                            return parsed
+                    logger.debug(f"Ollama raw response: {raw_content[:300]}")
+                    result = self._parse_llm_response(raw_content)
+                    if result is not None:
+                        strategy, slos = result
+                        if slos:
+                            logger.info(
+                                f"✅ Ollama — {len(slos)} SLO(s) extraits "
+                                f"| stratégie : {strategy or 'non fournie (repli mot-clé)'}"
+                            )
+                        else:
+                            logger.info("ℹ️  Ollama — tableau vide : intention hors du domaine réseau/QoS")
+                        return (strategy, slos)
+                    logger.warning(f"⚠️  Ollama — réponse sans JSON exploitable : {raw_content[:300]}")
                 else:
                     logger.error(f"❌ Ollama a retourné HTTP {resp.status_code}")
         except Exception as e:

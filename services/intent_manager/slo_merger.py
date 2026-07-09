@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from shared.models import SLO
 from shared import config
 
@@ -17,19 +17,38 @@ class SLOMerger:
     qui n'ont aucune intelligence sémantique propre.
     """
 
-    def merge(self, active_slos: List[SLO], new_slos: List[SLO], text: str, allow_refine: bool = True) -> List[SLO]:
+    def merge(
+        self,
+        active_slos: List[SLO],
+        new_slos: List[SLO],
+        text: str,
+        llm_strategy: Optional[str] = None,
+        allow_refine: bool = True,
+    ) -> List[SLO]:
         text_lower = text.lower()
+        llm_strategy_norm = (llm_strategy or "").strip().lower()
 
-        # 1. Determine Strategy
-        if allow_refine and any(kw in text_lower for kw in ["plus strict", "moins strict", "affine", "plus de", "moins de"]):
+        # 1. Determine Strategy — priorité à la décision du LLM (comprend le
+        # SENS de l'intention : une intention chiffrée et complète reliée par
+        # "et"/"aussi" doit REMPLACER, pas ADDITIONNER — ce que la détection
+        # par mot-clé seule ne peut pas distinguer). Le mot-clé ne sert plus
+        # que de repli si le LLM n'a pas fourni de merge_strategy exploitable
+        # (ex: niveaux 2/3 sans intelligence sémantique, ou champ manquant).
+        if llm_strategy_norm in ("replace", "additive"):
+            mode = llm_strategy_norm.upper()
+            strategy_source = "LLM"
+        elif allow_refine and any(kw in text_lower for kw in ["plus strict", "moins strict", "affine", "plus de", "moins de"]):
             mode = "REFINE"
+            strategy_source = "mot-clé (repli)"
         elif any(kw in text_lower for kw in ["aussi", "et", "ajoute", "en plus"]):
             mode = "ADDITIVE"
+            strategy_source = "mot-clé (repli)"
         else:
             mode = "REPLACE"
+            strategy_source = "mot-clé (repli)"
 
         logger.info(
-            f"🔀 Stratégie de fusion SLOs : {mode} "
+            f"🔀 Stratégie de fusion SLOs : {mode} (source : {strategy_source}) "
             f"| SLOs actifs : {len(active_slos)} | nouveaux SLOs : {len(new_slos)} "
             f"| REFINE autorisé : {allow_refine}"
         )

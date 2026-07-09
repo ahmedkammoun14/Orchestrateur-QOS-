@@ -1,0 +1,22 @@
+════════════════════════════════════════════════════════════
+  📥 Intention reçue
+  ID              : gen-163955
+  Intention       : "Always encrypt my stream end-to-end, even if it increases latency."
+════════════════════════════════════════════════════════════
+14:39:56  [INFO]  🤖 Appel LAAS vLLM — modèle : Qwen3/Qwen--Qwen3.6-27B-FP16 | intention : "Always encrypt my stream end-to-end, even if it increases la..."
+14:39:57  [DEBUG]  LAAS raw response: [{"metric":"latency","operator":"<","threshold":200.0,"unit":"ms","weight":0.4,"target":180.0,"window":"5m"},{"metric":"cpu_usage","operator":">=","threshold":1.5,"unit":"cores","weight":0.3,"target":1.65,"window":"5m"},{"metric":"ram_usage","operator":">=","threshold":1.0,"unit":"GB","weight":0.3,"
+14:39:57  [INFO]  ✅ LAAS LLM — 3 SLO(s) extraits
+14:39:57  [INFO]  🔍 Seuils LLM bruts — "Always encrypt my stream end-to-end, even if it increases la..."
+   latency < 200.0 ms   |   cpu_usage >= 1.5 cores   |   ram_usage >= 1.0 GB
+14:39:57  [INFO]  🔀 Stratégie de fusion SLOs : REPLACE | SLOs actifs : 3 | nouveaux SLOs : 3 | REFINE autorisé : False
+14:39:57  [INFO]
+──────────────────────────────────────────────────────────
+  🎯  SLOs validés — "Always encrypt my stream end-to-end, even if it increases la..."
+   latency      détection < 180.0    ms  | contrat < 200.0 ms
+   cpu_usage    détection >= 1.6      cores| contrat >= 1.5 cores
+   ram_usage    détection >= 1.1      GB  | contrat >= 1.0 GB
+──────────────────────────────────────────────────────────
+14:39:58  [INFO]  ⏱  Réception intention gen-163955 — durée 3070.26 ms (dont LLM 3070.26 ms)
+14:39:58  [INFO]  ✅ Intent transmis au Hub — 3 SLO(s) | latency < 200.0 ms  cpu_usage >= 1.5 cores  ram_usage >= 1.0 GB
+INFO:     127.0.0.1:61744 - "POST /intent HTTP/1.1" 202 Accepted
+Rédiger
