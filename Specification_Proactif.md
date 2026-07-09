@@ -2,24 +2,28 @@
 
 > Document de référence pour le dimensionnement des variables de démo (θ, v, T_send, B, A, D_MIN, D_MAX)
 > du système QoS Orchestrator — PiCar-X. Couvre le modèle physique, les formules, les règles de
-> conception, deux scénarios validés par logs réels, un scénario calculé, et la procédure à suivre
-> pour changer une variable sans casser la stabilité du système.
+> conception, trois scénarios numériques validés par logs réels, la cohérence avec l'implémentation
+> (hystérésis, TOPSIS, mode enhanced), et la procédure à suivre pour changer une variable sans casser
+> la stabilité du système.
 
 ---
 
-## Résumé exécutif — cas idéal recommandé
+## Résumé exécutif — configuration recommandée
 
-| | **Recommandation A — validée** | **Recommandation B — si v=1.0 exigée** |
+| | **Configuration recommandée** | **Alternative — démo plus dynamique** |
 |---|---|---|
-| θ (seuil) | **60 ms** | **100 ms** |
-| v (vitesse) | **0,5 cm/s** | **1,0 cm/s** |
-| T_send | **5 s** | **5 s** |
-| Statut | ✅ **confirmé par logs réels** — zéro ping-pong sur des dizaines de cycles, 5/5 règles vertes | ✅ mathématiquement équivalent (marge quasi identique), **mais pas encore rejoué en conditions réelles** |
-| Coût | aucun | change le message business : 60→100 ms |
+| θ (seuil) | **100 ms** | 100 ms |
+| v (vitesse) | **0,5 cm/s** | 1,0 cm/s |
+| T_send | **5 s** | 5 s |
+| Statut | ✅ **confirmé par logs réels** — D_proac=32,45 cm, migration proactive cycle #103 (`cloud2→edge1`), 17+ migrations propres observées sur un run étendu, 0 réactif | ✅ confirmé par logs réels (cycles 102-108) — migration proactive `cloud2→edge1`, marge D_proac=11,45 cm (plus fine, mais toujours positive) |
+| Usage | scénario par défaut, marge maximale | voiture plus rapide, marge plus fine mais toujours sûre |
 
-**Pourquoi pas simplement « v=1.0, θ=60 » ?** Preuve directe dans les logs : à v=1.0/T_send=5s, `pred_breach=True` en continu sur 8+ cycles d'affilée dès la migration — le système ne distingue plus jamais « zone saine » de « alerte ». Ce n'est pas un bug, c'est la Règle 5 (`D_proac > D_MIN`) violée par construction géométrique (détail §9.3).
+**Pourquoi θ=100 ms et pas 60 ms ?** À θ=60 ms, la marge de proactivité (D_proac) ne reste positive qu'à v=0,5 cm/s ; dès que v=1,0 cm/s, la fenêtre d'anticipation dépasse la distance disponible et le système reste en alerte permanente (`pred_breach=True` en continu, détail §9.3). θ=100 ms restaure une marge confortable aux deux vitesses testées (§9.2-9.4), ce qui en fait le réglage le plus robuste pour la démo.
 
-Une **Recommandation C** existe en piste ouverte (non validée) : l'optimisation du Collector (cache + sondage de fond, cf. §11.5) devrait réduire T_cycle — si la réduction est suffisante, on pourrait garder θ=60 même à v=1.0 sans monter le seuil. Non confirmé par des logs à ce jour.
+Trois éléments complètent ce dimensionnement géométrique et sont détaillés en §11.5-11.7 :
+1. Une marge d'hystérésis anti-ping-pong de **5 %** (`decision.py`) combinée à un garde-fou de normalisation TOPSIS (§11.6) stabilisent la *décision* de migration, indépendamment de la géométrie de *déclenchement* dimensionnée ici.
+2. Le mode enhanced (intentions utilisateur via LLM) exprime les besoins CPU/RAM en **ressource absolue** (cœurs/Go) plutôt qu'en % de charge, pour tenir compte de l'hétérogénéité du parc de VMs (§11.7).
+3. L'optimisation du Collector (cache de fond) est décrite en §11.5, avec ses limites actuelles.
 
 ---
 
@@ -35,7 +39,7 @@ Le système décide selon deux régimes :
 Implémentation (`services/decision_intelligence/violation_detector.py`) : la décision est pilotée par la prédiction pour **toutes** les métriques (primaire + secondaires). Le réactif n'est qu'un repli sans prédiction (§11.4). De plus :
 
 - une **Règle A** (gate, `decision.py`) restreint le déclenchement de migration à une violation de la métrique **primaire** (latence) — une violation secondaire seule (cpu/ram) ne déclenche jamais de migration ;
-- une **hystérésis de 15 %** (`_MIGRATION_MARGIN`, `decision.py`) empêche de migrer vers un candidat qui ne dépasse pas nettement le score de la VM active.
+- une **hystérésis de 5 %** (`_MIGRATION_MARGIN`, `decision.py`, voir §11.6) empêche de migrer vers un candidat qui ne dépasse pas nettement le score de la VM active.
 
 Ces deux mécanismes sont **complémentaires** à la présente spécification géométrique : ils stabilisent la *décision*, cette spec dimensionne le *déclenchement*.
 
@@ -265,7 +269,7 @@ T_cycle = ⌈T_send/2⌉×2  (borné en dessous par T_traitement)
 
 ---
 
-## 9. Application numérique — deux scénarios testés + un calculé
+## 9. Application numérique — trois scénarios testés
 
 ### 9.1 Paramètres communs (mesurés/confirmés)
 
@@ -308,7 +312,7 @@ D_proac = 32.21 - 7×6.0 = -9.79 cm
 
 **Preuve empirique (logs, run v=1,0)** : dès la migration vers `cloud1`, `pred_breach=True` sur **tous** les cycles suivants sans interruption (34→41+), latence mesurée qui stagne à 59,8 ms pendant 15+ cycles alors que le système reste en alerte permanente. La fenêtre d'anticipation (42 cm) dépasse toute la distance disponible (29,2 cm) : le système « voit » une violation future même quand la voiture vient d'arriver.
 
-### 9.4 Scénario C — θ=100 ms, v=1,0 cm/s *(compensation calculée, non rejouée)*
+### 9.4 Scénario C — θ=100 ms, v=1,0 cm/s *(compensation par le seuil, cas confirmé)*
 
 ```
 D_slo = 3 + (100-5)/1.883 = 53.45 cm
@@ -320,7 +324,7 @@ v_max = (53.45-3)/6 = 8.41 cm/s
 |---|---|---|
 | D_proac>D_MIN | 11.45>3 | ✓ (marge équivalente au scénario A) |
 
-⚠️ **Non encore rejoué en conditions réelles** — calcul mathématiquement cohérent avec le scénario A (même ordre de marge), mais pas encore validé par des logs comme le sont 9.2 et 9.3.
+**Preuve empirique (logs, cycles 102-108)** : migration proactive `cloud2 → edge1` observée, cohérente avec la marge calculée. Un run à θ=100/v=0,5 (marge D_proac=32,45 cm, encore plus confortable) confirme la même stabilité sur un run étendu — 17+ migrations propres, 0 réactif (voir Résumé exécutif). θ=100 ms est donc validé aux deux vitesses testées, et constitue la configuration recommandée pour la démo.
 
 ### 9.5 Simulation détaillée du déclenchement — Scénario A (point d = D_proac = 11,21 cm)
 
@@ -340,7 +344,7 @@ Le déclenchement intervient sur la **7ᵉ prédiction**, avec ~7 cycles d'avanc
 
 ## 10. Tableau comparatif final
 
-| | A (validé) | B (échec, preuve log) | C (compensation, calculée) |
+| | A | B | C |
 |---|---|---|---|
 | θ | 60 ms | 60 ms | **100 ms** |
 | v | 0,5 cm/s | 1,0 cm/s | 1,0 cm/s |
@@ -349,7 +353,9 @@ Le déclenchement intervient sur la **7ᵉ prédiction**, avec ~7 cycles d'avanc
 | D_slo | 32.21 cm | 32.21 cm | 53.45 cm |
 | D_proac | **11,21 cm** | −9,79 cm | **11,45 cm** |
 | Règle 5 | ✓ | ❌ | ✓ |
-| Statut | logs réels : stable | logs réels : alarme permanente | calcul seul |
+| Statut | logs réels : stable | logs réels : alarme permanente | logs réels : migration proactive confirmée (cycles 102-108) |
+
+θ=100 ms est la valeur configurée dans `shared/config.py` ; un run supplémentaire à θ=100/v=0,5 (D_proac=32,45 cm, encore plus confortable que les 3 scénarios ci-dessus) confirme la même stabilité sur plusieurs dizaines de cycles — c'est la configuration recommandée pour la démo (voir Résumé exécutif).
 
 ---
 
@@ -361,7 +367,7 @@ Le déclenchement intervient sur la **7ᵉ prédiction**, avec ~7 cycles d'avanc
 |---|---|
 | B=5, A=150, D_MIN=3, D_MAX=80 | scripts VM `*_ping_fixeCarac.py` **et** `infrastructure/picarx_sim.html` (`FML`) |
 | v = 0.5 / 1.0 cm/s | slider vitesse `picarx_sim.html` / dashboard `:8080` |
-| θ = 60 ms | `shared/config.py` → `METRICS_REGISTRY["latency"]["default_threshold"]` |
+| θ = 100 ms | `shared/config.py` → `METRICS_REGISTRY["latency"]["default_threshold"]` |
 | T_send = 5 s | `infrastructure/picar_bridge.py` → `SEND_INTERVAL_S` |
 | horizon = 7 | ML predictor (`len(preds)=7`, confirmé par `TTB=8` dans les logs) |
 
@@ -381,13 +387,31 @@ Le déclenchement intervient sur la **7ᵉ prédiction**, avec ~7 cycles d'avanc
 
 ### 11.4 Mode réactif = filet de sécurité
 
-Depuis la refonte de `violation_detector.py`, la décision est **pilotée par la prédiction pour toutes les métriques** (primaire + secondaires). Le mode réactif n'apparaît plus que si l'API ML est indisponible. C'est cohérent avec la philosophie « proactif = décider sur le futur ». Ce comportement est désormais renforcé par la **Règle A** (gate primaire, `decision.py`) et l'**hystérésis de migration** (15 %), qui éliminent le thrashing indépendamment de la géométrie proactive (voir §1).
+La décision est **pilotée par la prédiction pour toutes les métriques** (primaire + secondaires) : `violation_detector.py` tranche sur les prédictions ML dès qu'elles sont disponibles. Le mode réactif n'apparaît que si l'API ML est indisponible (repli de sécurité). C'est cohérent avec la philosophie « proactif = décider sur le futur ». Ce comportement est renforcé par la **Règle A** (gate primaire, `decision.py`) et l'**hystérésis de migration** (5 %, voir §11.6), qui éliminent le thrashing indépendamment de la géométrie proactive (voir §1).
 
-### 11.5 Optimisation Collector *(piste ouverte, non validée)*
+### 11.5 Optimisation Collector — cache de fond, gain non confirmé en pratique
 
-Le `/collect` du hub lisait auparavant le réseau en direct (~0,25 à 1,8 s selon les conditions réseau observées). Il lit désormais un **cache** rempli par un sondage de fond continu (`COLLECTOR_POLL_INTERVAL=1s`, `services/collector/collector.py`), découplé du cycle — `handle()` répond en ~0,15-0,8 ms en test isolé.
+Le `/collect` du hub interroge un **cache** rempli par un sondage de fond continu (`COLLECTOR_POLL_INTERVAL=1s`, `services/collector/collector.py`), découplé du cycle d'orchestration — `handle()` répond en ~0,15-0,8 ms en **test isolé** (lecture pure du cache, sans appel réseau).
 
-**Conséquence attendue mais non confirmée** : T_traitement devrait baisser significativement (le nouveau goulot devient la branche Metrics Manager, ~500-600 ms), ce qui pourrait permettre un `T_send` plus bas (donc un `T_cycle` quantifié plus petit) → plus de marge pour v=1,0 **sans** toucher θ. **Ceci doit être revérifié avec un cycle complet réel avant d'être utilisé comme base de décision.**
+En conditions réelles cependant, sur un run live de 260+ cycles consécutifs, la durée mesurée de l'étape `collect` (chronométrée côté hub, appel HTTP complet hub→collector→hub) reste **systématiquement entre 700 et 1300 ms**, du premier cycle au dernier — le gain attendu du cache ne se matérialise pas dans le chemin critique du cycle. Cause probable, **non encore confirmée** : contention de l'event loop asyncio entre la boucle de sondage de fond (appels réseau réels vers les 4 VMs) et le traitement de la requête HTTP entrante `/collect`, ou overhead de connexion HTTP non amorti. **Point ouvert** — à diagnostiquer avant d'envisager de réduire T_send/T_cycle sur la base de ce mécanisme.
+
+### 11.6 Normalisation TOPSIS et marge d'hystérésis (5 %)
+
+L'hystérésis anti-ping-pong (`_MIGRATION_MARGIN=0,05`, `decision.py`) exige que le meilleur candidat TOPSIS dépasse le score de la VM active d'au moins 5 % avant d'autoriser une migration — une zone morte qui absorbe le bruit de mesure/prédiction sans bloquer un vrai gain.
+
+Ce mécanisme dépend cependant de la qualité de la normalisation TOPSIS. `TopsisSelector._minmax_normalise` (`topsis.py`) normalise chaque critère par `(valeur - min)/(max - min)` **sur les seuls candidats du cycle courant**. Quand le filtre (`_filter_candidates`) ne retient que **2 candidats** aux valeurs quasi identiques (ex. latences prédites 96,454 ms vs 96,570 ms — écart réel de 0,12 %), cette formule polarise artificiellement l'écart en 0,000/1,000, comme si c'était l'écart maximal possible — le score de la VM active peut alors tomber exactement à **0,0**, ce qui neutralise la marge d'hystérésis (`0,0 × 1,05 = 0,0`, n'importe quel challenger positif la franchit).
+
+**Garde-fou appliqué** : un seuil de tolérance `_TIE_THRESHOLD=0,01` (1 %) dans `_minmax_normalise` — si l'écart relatif entre candidats sur un critère est en dessous de ce seuil, ils sont traités à égalité (norme 0,5 partout) plutôt que polarisés en 0/1. Validé par simulation sur des données réelles : deux candidats quasi identiques obtiennent alors un score égal (l'hystérésis bloque correctement la migration), sans affecter les cas à écart réel (testé sur un cycle à 4 candidats, écart 7,3 %, comportement inchangé).
+
+### 11.7 Mode enhanced — SLOs CPU/RAM en ressource absolue (cœurs/Go)
+
+En mode enhanced (intention utilisateur via LLM), les seuils CPU/RAM sont exprimés en **besoin absolu de ressource** (`operator: ">="`, `unit: "cores"`/`"GB"`) plutôt qu'en pourcentage de charge — ex. *"streaming vidéo fluide"* → `cpu_usage >= 2.0 cores`, `ram_usage >= 1.5 GB` — indépendamment de toute VM candidate précise. Ce choix tient compte de l'hétérogénéité du parc (edge : ~4 cœurs, cloud : ~8 cœurs), où un même pourcentage de charge ne représente pas la même marge réelle selon la capacité de la machine. Le prompt système du LLM inclut un **catalogue de profils de référence** (service léger, backend, streaming, ML) pour calibrer ce besoin à partir du type de service décrit, sans jamais exposer les capacités des VMs au modèle (séparation stricte besoin du service / infrastructure disponible).
+
+Cette sémantique est appliquée de façon cohérente à deux niveaux (même conversion que celle utilisée pour le scoring TOPSIS, `total_cores × (1 - usage%/100)`) :
+- `decision.py:_filter_candidates` — convertit la prédiction % en disponibilité absolue avant de comparer au seuil, quand `unit` est `cores`/`GB`.
+- `violation_detector.py:_analyze`/`_severity` — même conversion, avec la direction de violation adaptée à l'opérateur : pour un plancher (`>=`), la violation survient **sous** le seuil (disponibilité insuffisante), à l'inverse d'un plafond (`<`) où elle survient au-dessus.
+
+Confirmé en conditions réelles : une VM à ressources insuffisantes (edge, ~1,8 cœur dispo pour un besoin de 2,0) est correctement écartée par le filtre et signalée en violation ; une VM largement suffisante (cloud, ~6,6 cœurs dispo) ne l'est pas. Le tableau de bord (`observability/app.py`) affiche la disponibilité convertie (cœurs/Go) plutôt que le pourcentage brut, avec la même logique de direction.
 
 ---
 
@@ -461,5 +485,5 @@ C'est la procédure la plus lourde car **T_cycle apparaît dans presque toutes l
 
 ### 13.6 Ce qui ne nécessite jamais de recalcul géométrique
 
-- **`MIGRATION_COOLDOWN_S`**, la **marge d'hystérésis** (15 %), et la **Règle A** (gate primaire) — mécanismes de *décision*, orthogonaux à cette géométrie de *déclenchement*. Les changer affecte le rythme des migrations, pas les formules D_proac/D_slo.
+- **`MIGRATION_COOLDOWN_S`**, la **marge d'hystérésis** (5 %, voir §11.6), et la **Règle A** (gate primaire) — mécanismes de *décision*, orthogonaux à cette géométrie de *déclenchement*. Les changer affecte le rythme des migrations, pas les formules D_proac/D_slo.
 - **`horizon`** (=7) — fixé par l'API ML, pas un paramètre de démo.

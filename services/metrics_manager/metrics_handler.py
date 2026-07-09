@@ -442,17 +442,20 @@ class MetricsHandler:
         primary_metrics  : List[str] = []
         secondary_metrics: List[str] = []
 
-        # ── Étape 1 : SLOs primaires du LLM (seuils et poids conservés) ──────
+        # ── Étape 1 : SLOs primaires du LLM (seuils ET poids conservés) ─────
         covered_metrics: set = set()
         for s in slos:
             s.is_primary = True
             s.threshold  = self._clamp_to_bounds(s.metric, s.threshold)
             s.target     = min(s.target, s.threshold * 0.95)
-            # Poids uniforme pour tous les SLOs primaires : le LLM est fiable
-            # pour les seuils/métriques, pas pour les poids numériques.
-            # La normalisation finale répartit objectivement les poids entre
-            # primaires (tous égaux) et secondaires (pondérés par score MI).
-            s.weight = 1.0
+            # Poids issu directement du LLM : l'analyse de l'intention pondère
+            # les critères selon leur importance métier (ex. latence dominante
+            # pour une alerte temps réel). Repli à 1.0 si le LLM n'a pas fourni
+            # de poids exploitable. La normalisation finale (_normalize_weights)
+            # garantit une somme = 1 et fusionne proprement avec les poids MI
+            # des éventuels SLOs secondaires.
+            llm_weight = getattr(s, "weight", None)
+            s.weight = float(llm_weight) if (llm_weight is not None and llm_weight > 0) else 1.0
 
             final_slos.append(s)
             active_metrics.append(s.metric)

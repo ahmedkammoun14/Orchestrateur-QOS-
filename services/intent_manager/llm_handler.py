@@ -153,34 +153,53 @@ class LLMHandler:
         }
 
         system_prompt = (
-            "Tu es un expert QoS réseau. Tu convertis des intentions utilisateur "
-            "en SLOs réseau au format JSON.\n\n"
-            "Métriques disponibles (TOUJOURS inclure les 3 sauf si l'intention exclut explicitement une métrique) :\n"
-            "  - latency   : latence réseau en ms (operator: \"<\", unit: \"ms\") — "
-            "contrainte de performance réseau.\n"
+            "Tu es un expert QoS réseau. Tu convertis des intentions utilisateur en SLOs "
+            "au format JSON pour le SERVICE qui réalisera cette intention.\n\n"
+            "DÉMARCHE DE RAISONNEMENT (toujours dans cet ordre) :\n"
+            "1. Identifie le TYPE DE SERVICE qu'il faudrait déployer pour réaliser l'intention "
+            "(ex: serveur de streaming, backend web, sonde de surveillance/détection, agent "
+            "d'inférence ML). L'intention n'a PAS besoin de mentionner explicitement "
+            "CPU/RAM/latence — déduis les besoins du service réalisateur : une tâche "
+            "d'analyse continue implique du CPU, un état/historique à maintenir implique de "
+            "la RAM, une exigence de réactivité (alerte, temps réel) implique une latence "
+            "faible.\n"
+            "2. Estime les besoins cpu_usage/ram_usage de ce service via le catalogue "
+            "ci-dessous.\n"
+            "3. Déduis la contrainte de latence du niveau de réactivité qu'implique "
+            "l'intention.\n\n"
+            "Métriques disponibles — UNIQUEMENT ces 3, avec exactement ces noms et ces "
+            "unités (n'invente JAMAIS d'autre nom de métrique ni d'autre unité) :\n"
+            "  - latency   : latence réseau en ms (operator: \"<\", unit: \"ms\").\n"
             "  - cpu_usage : BESOIN ABSOLU de calcul du service, en cœurs disponibles "
             "nécessaires (operator: \">=\", unit: \"cores\") — PAS un pourcentage de charge, "
             "une quantité de ressource que le service doit trouver libre sur la machine qui "
             "l'héberge, indépendamment de la capacité de cette machine.\n"
             "  - ram_usage : BESOIN ABSOLU de mémoire du service, en Go disponibles "
-            "nécessaires (operator: \">=\", unit: \"GB\") — même logique que cpu_usage.\n\n"
-            "CATALOGUE DE PROFILS DE RÉFÉRENCE (pour estimer cpu_usage/ram_usage à partir du "
-            "type de service décrit dans l'intention — jamais en fonction d'une VM précise, "
-            "seulement du besoin du service lui-même) :\n"
-            "  - service léger / API / monitoring    : 0.3-0.5 cœur,  0.2-0.5 Go\n"
-            "  - traitement web classique / backend  : 0.5-1.0 cœur,  0.5-1.0 Go\n"
-            "  - streaming / transcodage vidéo       : 1.5-3.0 cœurs, 1.0-2.0 Go\n"
-            "  - inférence / entraînement ML          : 1.0-4.0 cœurs, 2.0-8.0 Go\n\n"
+            "nécessaires (operator: \">=\", unit: \"GB\") — même logique que cpu_usage. "
+            "Toujours en GB, jamais en Mo/MB (512 Mo → 0.5 GB).\n\n"
+            "N'inclus une métrique QUE si le service réalisateur en a réellement besoin — "
+            "n'ajoute pas une métrique juste pour compléter la liste. Renvoie un tableau "
+            "vide `[]` UNIQUEMENT si aucun service réseau déployable ne peut réaliser "
+            "l'intention (ex: question générale, demande de contenu sans service associé).\n\n"
+            "CATALOGUE DE PROFILS DE RÉFÉRENCE (besoin du service réalisateur — jamais en "
+            "fonction d'une VM précise) :\n"
+            "  - service léger / API / monitoring simple        : 0.3-0.5 cœur,  0.2-0.5 Go\n"
+            "  - surveillance / détection continue (sonde, IDS, inspection de trafic/TLS) : 0.3-0.8 cœur, 0.3-0.8 Go\n"
+            "  - traitement web classique / backend             : 0.5-1.0 cœur,  0.5-1.0 Go\n"
+            "  - streaming / transcodage vidéo                  : 1.5-3.0 cœurs, 1.0-2.0 Go\n"
+            "  - inférence / entraînement ML                     : 1.0-4.0 cœurs, 2.0-8.0 Go\n\n"
             "RÈGLES :\n"
             "1. Si l'intention donne un chiffre explicite pour une métrique, utilise-le "
-            "(garde l'unité adaptée : ms pour latency, cœurs/Go pour cpu/ram).\n"
-            "2. Si l'intention est vague ou relative (ex: \"aussi bien qu'actuellement\", "
-            "\"sans surcharge\"), utilise les seuils par défaut experts : "
-            "latency=100ms, cpu_usage=0.5 cœur, ram_usage=0.5 Go.\n"
-            "3. Si l'intention décrit un type de service reconnaissable, utilise le "
-            "catalogue ci-dessus pour estimer cpu_usage/ram_usage.\n"
+            "(garde l'unité adaptée : ms pour latency, cœurs/GB pour cpu/ram).\n"
+            "2. Latence selon la réactivité implicite : alerte/temps réel critique ≈ 50-100 ms ; "
+            "confort utilisateur ≈ 100-200 ms ; tâche d'arrière-plan tolérante ≈ 200-500 ms. "
+            "Si vraiment aucun indice : 100 ms.\n"
+            "3. Pour cpu_usage/ram_usage sans chiffre explicite, utilise le catalogue selon "
+            "le type de service réalisateur identifié à l'étape 1.\n"
             "4. Si active_slos contient des SLOs actifs, utilise leurs valeurs comme référence.\n"
-            "5. Les poids (weight) doivent sommer à 1.0.\n\n"
+            "5. Les poids (weight) doivent sommer à 1.0 — poids dominant à la métrique qui "
+            "porte la valeur métier de l'intention (ex: la latence pour une alerte, le "
+            "CPU pour du calcul intensif).\n\n"
             "FORMAT DE RÉPONSE OBLIGATOIRE — tableau JSON uniquement, "
             "sans texte avant ou après, sans markdown :\n"
             '[{"metric":"latency","operator":"<","threshold":100.0,"unit":"ms","weight":0.5,"target":90.0,"window":"5m"},'
@@ -191,7 +210,9 @@ class LLMHandler:
         user_prompt = (
             f"État actuel du système : {json.dumps(rag_summary, ensure_ascii=False)}\n\n"
             f"Intention utilisateur : \"{text}\"\n\n"
-            "Génère le tableau JSON des SLOs correspondants. Inclus les 3 métriques sauf exclusion explicite."
+            "Identifie d'abord le service qui réaliserait cette intention, puis génère le "
+            "tableau JSON des SLOs de ce service — uniquement les métriques dont il a "
+            "réellement besoin, tableau vide si aucun service déployable ne correspond."
         )
 
         # ── 1. Try LAAS vLLM (primary) ───────────────────────────────
@@ -236,11 +257,16 @@ class LLMHandler:
                     raw_content = resp.json()["choices"][0]["message"]["content"].strip()
                     logger.debug(f"LAAS raw response: {raw_content[:300]}")
                     # greedy match to capture the full array including nested objects
-                    match = re.search(r'\[.+\]', raw_content, re.DOTALL)
+                    # (*.  et non +. : un tableau vide `[]` est une réponse valide et
+                    # délibérée — l'intention ne concerne aucune métrique réseau/QoS).
+                    match = re.search(r'\[.*\]', raw_content, re.DOTALL)
                     if match:
                         parsed = json.loads(match.group())
-                        if isinstance(parsed, list) and len(parsed) > 0:
-                            logger.info(f"✅ LAAS LLM — {len(parsed)} SLO(s) extraits")
+                        if isinstance(parsed, list):
+                            if len(parsed) > 0:
+                                logger.info(f"✅ LAAS LLM — {len(parsed)} SLO(s) extraits")
+                            else:
+                                logger.info("ℹ️  LAAS LLM — tableau vide : intention hors du domaine réseau/QoS")
                             return parsed
                     logger.warning(f"⚠️  LAAS LLM — réponse sans JSON exploitable : {raw_content[:300]}")
                 else:
@@ -266,8 +292,11 @@ class LLMHandler:
                     match = re.search(r'\[.*?\]', raw_content, re.DOTALL)
                     if match:
                         parsed = json.loads(match.group())
-                        if isinstance(parsed, list) and len(parsed) > 0:
-                            logger.info(f"✅ Ollama — {len(parsed)} SLO(s) extraits")
+                        if isinstance(parsed, list):
+                            if len(parsed) > 0:
+                                logger.info(f"✅ Ollama — {len(parsed)} SLO(s) extraits")
+                            else:
+                                logger.info("ℹ️  Ollama — tableau vide : intention hors du domaine réseau/QoS")
                             return parsed
                 else:
                     logger.error(f"❌ Ollama a retourné HTTP {resp.status_code}")
@@ -297,6 +326,14 @@ class LLMHandler:
             # connaît que "GB" pour identifier un besoin en ressource absolue.
             if r.get("unit") == "Go":
                 r["unit"] = "GB"
+            # Mo/MB → GB : le LLM peut raisonner en Mo pour un petit service
+            # (ex: sonde 256 Mo). Sans conversion, l'unité inconnue ferait
+            # retomber le seuil dans la branche % (clamp 1-99) — absurde.
+            if r.get("unit") in ("MB", "Mo"):
+                r["unit"] = "GB"
+                for fld in ("threshold", "target"):
+                    if r.get(fld) is not None:
+                        r[fld] = float(r[fld]) / 1024.0
 
             # Récupération défensive du threshold — gère à la fois clé absente
             # ET clé présente avec valeur None (cas où le LLM renvoie un null)
