@@ -23,6 +23,7 @@ HISTORY_LOADER_PORT          = int(os.getenv("HISTORY_LOADER_PORT",          800
 DECISION_INTELLIGENCE_PORT   = int(os.getenv("DECISION_INTELLIGENCE_PORT",   8008))
 OBSERVABILITY_PORT           = int(os.getenv("OBSERVABILITY_PORT",           8009))
 OPENSTACK_CLIENT_PORT        = int(os.getenv("OPENSTACK_CLIENT_PORT",        8024))
+PROVIDER_RELAY_PORT          = int(os.getenv("PROVIDER_RELAY_PORT",          8010))
 
 # ── URLs services ────────────────────────────────────────────
 DATABASE_SERVICE_URL              = f"http://{HUB_HOST}:{DATABASE_PORT}"
@@ -32,6 +33,7 @@ ML_PREDICTOR_SERVICE_URL          = f"http://{HUB_HOST}:{ML_PREDICTOR_PORT}"
 METRICS_MANAGER_SERVICE_URL       = f"http://{HUB_HOST}:{METRICS_MANAGER_PORT}"
 DECISION_INTELLIGENCE_SERVICE_URL = f"http://{HUB_HOST}:{DECISION_INTELLIGENCE_PORT}"
 OPENSTACK_CLIENT_SERVICE_URL      = f"http://{HUB_HOST}:{OPENSTACK_CLIENT_PORT}"
+PROVIDER_RELAY_SERVICE_URL        = f"http://{HUB_HOST}:{PROVIDER_RELAY_PORT}"
 
 # ── Redis ─────────────────────────────────────────────────────
 REDIS_HOST: str = os.getenv("REDIS_HOST",  "127.0.0.1")
@@ -125,6 +127,47 @@ VM_CLUSTER_MAP: Dict[str, str] = {
     "cloud1": "cloud-cluster",
     "cloud2": "cloud-cluster",
 }
+
+# ── Providers (partition transversale) ────────────────────────
+# Axe PROPRIÉTÉ (business), ORTHOGONAL à l'axe CLUSTER/TIER physique
+# (VM_CLUSTER_MAP ci-dessus). Un provider possède son propre parc mixte
+# edge+cloud et ignore les VMs des autres. Le cluster reste une propriété
+# de la VM, jamais du provider.
+#
+# Purement DÉCLARATIF : aucun service ne lit encore ce registre à ce stade
+# → zéro changement de comportement runtime.
+PROVIDER_REGISTRY: Dict[str, Any] = {
+    "provider-1": {"vms": ["edge1", "cloud1"]},
+    "provider-2": {"vms": ["edge2", "cloud2"]},
+}
+
+# Dérivé (source unique = PROVIDER_REGISTRY) : lookup inverse VM → provider.
+PROVIDER_OF_VM: Dict[str, str] = {
+    vm_id: provider_id
+    for provider_id, profile in PROVIDER_REGISTRY.items()
+    for vm_id in profile["vms"]
+}
+
+# ── Routage inter-orchestrateurs (passerelle de fédération) ───
+# Adresse de l'orchestrateur responsable de chaque provider. En mono-processus,
+# les deux rôles sont joués par le MÊME hub : les deux entrées pointent donc
+# sur lui. Passer à N orchestrateurs réels = changer ces URLs, et RIEN d'autre
+# dans tout le projet — c'est le seul endroit qui connaît la topologie.
+PROVIDER_ORCHESTRATOR_URL: Dict[str, str] = {
+    provider_id: os.getenv(
+        f"ORCHESTRATOR_URL_{provider_id.upper().replace('-', '_')}",
+        f"http://{HUB_HOST}:{HUB_PORT}",
+    )
+    for provider_id in PROVIDER_REGISTRY
+}
+
+# Interrupteur de la machine à états multi-provider dans _step8_decide (hub).
+# OFF (défaut) : le cycle se comporte EXACTEMENT comme avant cette extension
+# (chemin _decide_mono_provider, code d'origine inchangé). ON : bascule vers
+# _decide_multi_provider (évaluation par provider, passation inter-provider
+# si besoin). Défaut à False pour ne jamais changer le comportement en
+# production tant que la fonctionnalité n'est pas explicitement activée.
+MULTI_PROVIDER_ENABLED: bool = os.getenv("MULTI_PROVIDER_ENABLED", "false").lower() == "true"
 
 # Capacité physique (total_cores, total_ram_gb) : plus fixée ici. Chaque VM
 # la déclare elle-même via son propre /metrics (logique fédération/service

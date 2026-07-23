@@ -212,7 +212,7 @@ class DecisionHandler:
             )
             logger.info(f"🟢 {reason}")
             return _ret(self._build_stay(
-                reason, breach_type, topsis_score, ts, slos_detail,
+                reason, breach_type, topsis_score, ts, slos_detail, vm_scores,
             ))
 
         # ── Étape 7 : Décision MIGRATE ───────────────────────────────
@@ -229,6 +229,10 @@ class DecisionHandler:
             "breach_type":      breach_type,
             "violated_metrics": slos_detail,
             "timestamp":        ts,
+            # Classement TOPSIS complet (toutes les VMs du pool, pas
+            # seulement la gagnante) — additif, nécessaire pour justifier
+            # "pourquoi cette VM plutôt qu'une autre" côté dashboard.
+            "vm_scores":        vm_scores,
         })
 
     def _filter_candidates(
@@ -285,8 +289,16 @@ class DecisionHandler:
         topsis_score: Optional[float],
         ts: str,
         violated_metrics: Optional[List[str]] = None,
+        vm_scores: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
-        return {
+        """
+        `vm_scores` : classement TOPSIS complet, uniquement disponible pour le
+        STAY issu de l'hystérésis (TOPSIS a réellement tourné). Défaut `None`
+        pour que les appels existants (cooldown, absence de violation,
+        absence de candidat — TOPSIS jamais atteint) restent inchangés : la
+        clé est alors ABSENTE du dict renvoyé, pas de régression de forme.
+        """
+        result: Dict[str, Any] = {
             "decision":         "stay",
             "from_vm":          None,
             "to_vm":            None,
@@ -296,3 +308,6 @@ class DecisionHandler:
             "violated_metrics": violated_metrics or [],
             "timestamp":        ts,
         }
+        if vm_scores is not None:
+            result["vm_scores"] = vm_scores
+        return result

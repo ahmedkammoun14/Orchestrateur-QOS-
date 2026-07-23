@@ -96,8 +96,8 @@
       <button id="csv">Télécharger CSV</button>
     </div>
     <div class="ctl">
-      <label>Vitesse <b><span id="uval">1.0</span> cm/s</b></label>
-      <input id="u" type="range" min="0.5" max="10" value="1" step="0.1">
+      <label>Vitesse <b><span id="uval">0.5</span> cm/s</b></label>
+      <input id="u" type="range" min="0.5" max="10" value="0.5" step="0.1">
     </div>
     <div class="ctl">
       <label>Rotation <b><span id="rval">0</span>°</b></label>
@@ -130,19 +130,19 @@
       <!-- Paramètre δ pour le buffer proactif -->
       <div class="zone-params">
         <div class="ctl">
-          <label style="color:#f59e0b">T_send <b id="tsend-lbl" style="color:#f59e0b">2.0</b>s</label>
-          <input id="tsend" type="range" min="1" max="10" value="2" step="0.5"
+          <label style="color:#f59e0b">T_cycle <b id="tsend-lbl" style="color:#f59e0b">6.0</b>s</label>
+          <input id="tsend" type="range" min="1" max="10" value="6" step="0.5"
             style="accent-color:#f59e0b">
         </div>
         <div class="ctl">
-          <label style="color:#f59e0b">vitesse v <b id="vcar-lbl" style="color:#f59e0b">1.0</b>cm/s</label>
-          <input id="vcar" type="range" min="0.5" max="10" value="1.0" step="0.1"
+          <label style="color:#f59e0b">vitesse v <b id="vcar-lbl" style="color:#f59e0b">0.5</b>cm/s</label>
+          <input id="vcar" type="range" min="0.5" max="10" value="0.5" step="0.1"
             style="accent-color:#f59e0b">
         </div>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-top:4px">
-        δ = v×T_send = <b id="delta-lbl" style="color:#f59e0b">2.0</b> cm &nbsp;|&nbsp;
-        buffer proactif = 7δ = <b id="proac-buf-lbl" style="color:#f59e0b">14.0</b> cm
+        δ = v×T_send = <b id="delta-lbl" style="color:#f59e0b">3.0</b> cm &nbsp;|&nbsp;
+        buffer proactif = 7δ = <b id="proac-buf-lbl" style="color:#f59e0b">21.0</b> cm
       </div>
 
       <div class="zone-toggles">
@@ -208,32 +208,48 @@ function cmToPx(x, y) {
 // ────────────────────────────────────────────────────────────
 // Paramètres proactifs (δ = v × T_send)
 // ────────────────────────────────────────────────────────────
-let T_SEND = 2.0;   // s
-let V_CAR  = 1.0;   // cm/s
+// Défauts alignés sur la réalité mesurée : T_cycle effectif = 6 s
+// (T_send = 5 s quantifié par le cycle d'orchestration) et v = 0,5 cm/s
+// (vitesse retenue pour que le déclenchement proactif reste atteignable
+// avant la frontière de zone).
+// → δ = 3 cm, buffer proactif 7δ = 21 cm : la carte dit la vérité.
+let T_SEND = 6.0;   // s (représente le T_cycle effectif)
+let V_CAR  = 0.5;   // cm/s
 
 function getDelta()     { return V_CAR * T_SEND; }        // cm
 function getProacBuf()  { return 7 * getDelta(); }         // cm = 7δ
 
 // ────────────────────────────────────────────────────────────
-// Formule latence (identique aux VMs)
+// Formule latence — physique hétérogène par TIER (edge / cloud)
+// DOIT rester synchronisé avec les 4 scripts VM déployés
+// (infrastructure/vm_ping/*.py) : le modèle physique appartient au
+// TIER de la VM, jamais au provider — un provider transversal possède
+// une VM edge ET une VM cloud, donc deux profils différents.
 // ────────────────────────────────────────────────────────────
-const FML = { D_MIN:3, D_MAX:80, B:5, A:150 };
-function latencyEst(dCm) {
-  const d = Math.max(FML.D_MIN, Math.min(FML.D_MAX, dCm));
-  return ((d - FML.D_MIN) / (FML.D_MAX - FML.D_MIN)) * (FML.A - FML.B) + FML.B;
+const FML = {
+  edge:  { D_MIN:3, D_MAX:80, B:5,  A:150 },
+  cloud: { D_MIN:3, D_MAX:80, B:50, A:230 },
+};
+function latencyEst(dCm, type) {
+  const f = FML[type] || FML.edge;
+  const d = Math.max(f.D_MIN, Math.min(f.D_MAX, dCm));
+  return ((d - f.D_MIN) / (f.D_MAX - f.D_MIN)) * (f.A - f.B) + f.B;
 }
 
 // ────────────────────────────────────────────────────────────
-// Zone : VM optimale pour un point du canvas
+// Zone : VM optimale pour un point du canvas — par LATENCE estimée
+// (avec la physique hétérogène, la VM la plus proche n'est plus
+// forcément la moins latente : un edge à 20 cm bat un cloud à 10 cm)
 // ────────────────────────────────────────────────────────────
 function bestVmAt(px, py) {
-  let best = null, bestD = Infinity;
+  let best = null, bestD = Infinity, bestLat = Infinity;
   for (const v of VMS) {
     const [vx, vy] = cmToPx(v.x, v.y);
-    const d = Math.hypot(px - vx, py - vy);
-    if (d < bestD) { bestD = d; best = v; }
+    const dCm = Math.hypot(px - vx, py - vy) / PX_PER_CM;
+    const lat = latencyEst(dCm, v.type);
+    if (lat < bestLat) { bestLat = lat; best = v; bestD = dCm; }
   }
-  return { vm: best, distCm: bestD / PX_PER_CM };
+  return { vm: best, distCm: bestD, latMs: bestLat };
 }
 
 // ────────────────────────────────────────────────────────────
@@ -518,8 +534,8 @@ function drawLegend() {
 // Mise à jour zone courante dans le panel
 // ────────────────────────────────────────────────────────────
 function updateZonePanel(carPos) {
-  const { vm: optVm, distCm } = bestVmAt(carPos.x, carPos.y);
-  const lat  = latencyEst(distCm);
+  const { vm: optVm, distCm, latMs } = bestVmAt(carPos.x, carPos.y);
+  const lat  = latMs;
   const col  = VM_COLORS[optVm.id];
 
   const badge = document.getElementById('zone-badge');

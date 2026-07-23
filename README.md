@@ -39,8 +39,8 @@ In modern distributed environments, maintaining consistent performance is a chal
 - Makes optimal migration decisions toward the best VM (Edge or Cloud) using the multicriteria TOPSIS algorithm.
 
 The system operates in two modes:
-- **Autonomous** — fixed business objective (latency < 300 ms for the demo), secondary SLOs discovered automatically by MI.
-- **Enhanced** — SLOs injected by the user via natural language, enriched by MI.
+- **Autonomous** — fixed business objective (latency < 100 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
+- **Enhanced** — SLOs injected by the user via natural language (LLM also assigns each SLO's **weight** and decides the **merge_strategy** — REPLACE or ADDITIVE — against active SLOs), enriched by MI-driven secondary SLOs.
 
 ---
 
@@ -86,7 +86,7 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 ## Key Technical Features
 
 - **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 4 OpenStack VMs.
-- **Position-based simulated latency**: `latency_ms = 20 × distance_cm(car, VM)` — the closer the vehicle, the lower the latency.
+- **Position-based simulated latency**: `latency_ms = VM_BASE_MS + VM_K_MS_PER_CM × distance_cm(car, VM)` (`infrastructure/vm_agent.py`) — the closer the vehicle, the lower the latency. Default coefficient `K` is **20 ms/cm for edge VMs, 40 ms/cm for cloud VMs** (edge is structurally favored).
 - **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM). Uses **ML predictions** as input values — not raw measurements — to anticipate future state.
 - **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision pool. If TOPSIS selects it despite a violation → STAY (it remains the best option). This prevents unnecessary migrations when the current VM is still the least-bad choice.
 - **MI k-NN (Kozachenko-Leonenko)**: continuous Mutual Information estimator — replaces the old 2×2 contingency table. No discretization, detects non-linear dependencies, robust from ~15 points per class. Formula: `MI(X;Y) = H(X) − H(X|Y)`, normalized by `H(Y)` → score in [0, 1].
@@ -96,7 +96,8 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 - **5-step MI visualization**: the `metrics_manager` terminal displays a detailed step-by-step k-NN pipeline (H(X), H(X|Y=1), H(X|Y=0), weighted average, final score) with ASCII tables for each metric at every cycle.
 - **Cycle traceability**: every cycle number is passed from the Hub to both `metrics_manager` and `decision_intelligence`. Both terminals display `[Cycle #N]` headers so MI scores and TOPSIS decisions from the same cycle are visibly linked.
 - **Adaptive thresholds**: automatic percentile (P70/P75/P85) based on coefficient of variation — absorbs signal volatility without manual reconfiguration.
-- **ML-driven proactive detection**: the breach type is labeled `"proactive"` whenever ML predictions confirm or anticipate a violation (pred_breach or imminent). The label `"reactive"` only appears when no predictions are available.
+- **ML-driven proactive detection**: for every metric (primary and secondary), the decision is made on the **prediction** — `"proactive"` if a predicted horizon value breaches the threshold, `"none"` otherwise (ignores transient measured spikes). `"reactive"` (raw measured value) is only used as a safety net when no ML prediction is available (ML API down).
+- **LLM-driven SLO weight & merge strategy**: in Enhanced mode, the LLM assigns each extracted SLO's `weight` (used directly, renormalized, in the TOPSIS weighting phase — not a fixed 1.0) and decides whether new SLOs should `REPLACE` or be `ADDITIVE` to the active ones, based on the intent's meaning (keyword detection is only a fallback for non-LLM levels).
 - **Observability dashboard**: real-time SSE dashboard at `http://localhost:8009` — VM cards with metric bars and predictions, latency history chart, SLO weight chart, and full audit log with cycle number, breach type, TOPSIS score, and migration trace.
 - **Audit trail**: every decision is posted to the observability service with full context (cycle, breach_type, SLOs, MI scores, TOPSIS score) and broadcast to all SSE subscribers.
 - **2-level LLM cascade**: SLO extraction from natural language via LAAS vLLM (Qwen3-27B, primary) → local Ollama (Qwen2.5, fallback).
@@ -111,7 +112,8 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 The demo replaces traditional network RTT measurement with **distance-based simulated latency**. As the PiCar-X vehicle moves along its track, latency to each VM is computed from the Euclidean distance on a 2D map:
 
 ```
-latency_ms = 20.0 × distance_cm(car_position, vm_position)
+latency_ms = VM_BASE_MS + K × distance_cm(car_position, vm_position)
+K = 20 ms/cm (edge VMs)  |  K = 40 ms/cm (cloud VMs)
 ```
 
 ### VM Positions on the Map
@@ -325,6 +327,7 @@ python -m hub.orchestrator_core              # 11. Port 8000
 | Decision Intelligence | 8008 | TOPSIS + violation detection |
 | Observability | 8009 | Real-time dashboard |
 | OpenStack Client | 8024 | kubectl migrations (on master 194.199.113.8) |
+| Provider Relay | 8010 | Inter-provider handoff gateway (federation) |
 | ML API — Latency | 5001 | ESN/LSTM model for latency prediction |
 | ML API — CPU | 5002 | ESN/LSTM model for cpu_usage prediction |
 | ML API — RAM | 5003 | ESN/LSTM model for ram_usage prediction |

@@ -42,6 +42,14 @@ logger = _setup_logger()
 _audit_log: deque = deque(maxlen=500)
 _subscribers: List[asyncio.Queue] = []
 
+# Compteur cumulé des chemins multi-provider (A/B/C/D) depuis le démarrage —
+# c'est ce compteur qui permet de prouver en soutenance que les 5 cas de la
+# spécification se produisent réellement. Les entrées mono-provider (flag
+# MULTI_PROVIDER_ENABLED=False, sans "provider_path" dans le payload) ne sont
+# comptées dans AUCUNE catégorie.
+_PROVIDER_PATHS: List[str] = ["A", "B", "C", "D"]
+_provider_path_counts: Dict[str, int] = {p: 0 for p in _PROVIDER_PATHS}
+
 # ── Application ───────────────────────────────────────────────
 app = FastAPI(title="QoS Observability", version="2.0.0")
 
@@ -57,8 +65,10 @@ async def stream(request: Request) -> StreamingResponse:
 
     async def generator():
         # Envoie immédiatement l'historique d'audit pour hydratation initiale
+        # (+ le compteur de chemins courant, pour qu'un client qui se connecte
+        # en cours de session affiche tout de suite les totaux cumulés).
         snapshot = list(_audit_log)
-        yield f"data: {json.dumps({'type': 'snapshot', 'log': snapshot})}\n\n"
+        yield f"data: {json.dumps({'type': 'snapshot', 'log': snapshot, 'provider_path_counts': dict(_provider_path_counts)})}\n\n"
         try:
             while True:
                 if await request.is_disconnected():
@@ -90,19 +100,38 @@ async def _broadcast(event: Dict[str, Any]) -> None:
 @app.post("/audit", status_code=200)
 async def receive_audit(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
     payload.setdefault("received_at", datetime.now(timezone.utc).isoformat())
+
+    # Compteur de chemins : lu sur le payload REÇU, jamais écrit dedans —
+    # l'entrée stockée dans _audit_log reste, à received_at près, identique
+    # à ce que le hub a envoyé (non-régression du mode mono-provider, qui
+    # n'a pas de clé "provider_path").
+    provider_path = payload.get("provider_path")
+    if provider_path in _provider_path_counts:
+        _provider_path_counts[provider_path] += 1
+
     _audit_log.append(payload)
-    await _broadcast({"type": "audit", "data": payload})
+    await _broadcast({
+        "type": "audit",
+        "data": payload,
+        "provider_path_counts": dict(_provider_path_counts),
+    })
     logger.info(
         f"Audit reçu — cycle={payload.get('cycle')} "
         f"decision={payload.get('decision')} "
         f"breach={payload.get('breach_type')}"
+        + (f" | chemin={provider_path} provider={payload.get('provider_used')}"
+           if provider_path else "")
     )
     return {"status": "ok"}
 
 
 @app.get("/audit/log")
 async def get_audit_log() -> Dict[str, Any]:
-    return {"count": len(_audit_log), "log": list(_audit_log)}
+    return {
+        "count": len(_audit_log),
+        "log": list(_audit_log),
+        "provider_path_counts": dict(_provider_path_counts),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -161,6 +190,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-proactive { background: #78350f; color: #fcd34d; }
   .badge-reactive  { background: #7f1d1d; color: #fca5a5; }
   .badge-none      { background: #1e293b; color: var(--muted); }
+  /* Chemins multi-provider (A/B/C/D) — voir _PROVIDER_PATHS côté backend */
+  .badge-path-a { background: #14532d; color: #4ade80; }
+  .badge-path-b { background: #78350f; color: #fbbf24; }
+  .badge-path-c { background: #4c1d75; color: #c084fc; }
+  .badge-path-d { background: #7f1d1d; color: #f87171; }
   #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 4px; }
   #conn-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
 
@@ -189,8 +223,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .metric-bar-fill { height: 100%; border-radius: 2px; transition: width .4s; }
   .pred-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 4px; }
 
-  /* ── Charts row ── */
-  .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  /* ── Charts ── */
   .chart-card {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 10px; padding: 16px;
@@ -209,13 +242,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .audit-wrap { max-height: 320px; overflow-y: auto; border-radius: 10px; border: 1px solid var(--border); }
   .mono { font-family: 'Consolas', monospace; font-size: 11px; }
 
-  /* ── SLO weights ── */
-  .slo-grid { display: flex; flex-direction: column; gap: 8px; }
-  .slo-row { display: flex; align-items: center; gap: 10px; }
-  .slo-name { width: 90px; font-size: 12px; color: var(--muted); }
-  .slo-bar-bg { flex: 1; height: 8px; background: #2d3148; border-radius: 4px; }
-  .slo-bar-fill { height: 100%; border-radius: 4px; transition: width .5s; }
-  .slo-weight-val { width: 40px; text-align: right; font-size: 12px; font-weight: 600; }
+  /* ── Raisonnement du cycle ── */
+  .reasoning-header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 13px; color: var(--muted); }
+  .reasoning-step { margin-bottom: 14px; }
+  .reasoning-step:last-child { margin-bottom: 0; }
+  .reasoning-step-title { font-size: 12px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+  .reasoning-row { display: flex; gap: 10px; align-items: baseline; font-size: 12px; padding: 3px 0; color: var(--text); }
+  .reasoning-empty { color: #64748b; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -233,6 +266,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="stat">
     <span class="stat-label">VM active</span>
     <span class="stat-value" id="h-vm">—</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Provider actif</span>
+    <span class="stat-value" id="h-provider">—</span>
   </div>
   <div class="stat">
     <span class="stat-label">Dernière décision</span>
@@ -257,6 +294,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="badge badge-reactive" id="h-reactive-count">0</span>
     </span>
   </div>
+  <div class="stat">
+    <span class="stat-label">Chemins multi-provider</span>
+    <span class="stat-value">
+      <span class="badge badge-none" id="h-path-a" title="Le provider courant avait des VMs conformes — TOPSIS a départagé">INTRA 0</span>
+      <span class="badge badge-none" id="h-path-b" title="Aucune VM conforme chez le provider courant — passation vers l'autre provider">INTER 0</span>
+      <span class="badge badge-none" id="h-path-c" title="Aucun provider conforme — décision par négociation sur le score de violation">NÉGO 0</span>
+      <span class="badge badge-none" id="h-path-d" title="Aucun provider ne peut satisfaire les SLOs — le service reste en place">IMPOSSIBLE 0</span>
+    </span>
+  </div>
 </header>
 
 <main>
@@ -267,22 +313,18 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="vm-grid" id="vm-grid"></div>
   </div>
 
-  <!-- Charts -->
-  <div class="charts-row">
-    <div class="chart-card">
-      <div class="section-title">Latence — historique & prédictions</div>
-      <canvas id="chart-latency" height="160"></canvas>
-    </div>
-    <div class="chart-card">
-      <div class="section-title">Poids SLOs actifs (TOPSIS)</div>
-      <canvas id="chart-slo" height="160"></canvas>
-    </div>
+  <!-- SLO weights -->
+  <div class="chart-card">
+    <div class="section-title">Poids SLOs actifs (TOPSIS)</div>
+    <canvas id="chart-slo" height="160"></canvas>
   </div>
 
-  <!-- SLO weights details -->
+  <!-- Raisonnement du cycle -->
   <div class="chart-card">
-    <div class="section-title">Détail des SLOs actifs</div>
-    <div class="slo-grid" id="slo-detail"></div>
+    <div class="section-title">Raisonnement du cycle</div>
+    <div id="reasoning-panel">
+      <span style="color:#64748b">Mode mono-provider — raisonnement multi-provider non actif</span>
+    </div>
   </div>
 
   <!-- Audit log -->
@@ -293,6 +335,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         <thead>
           <tr>
             <th>Heure</th><th>Cycle</th><th>Décision</th><th>Type</th>
+            <th>Provider</th>
             <th>VM source</th><th>VM cible</th><th>TOPSIS</th>
             <th>Métriques</th><th>Raison</th>
           </tr>
@@ -316,8 +359,17 @@ const UNITS = """ + json.dumps({
     m: config.METRICS_REGISTRY[m]["unit"]
     for m in config.METRICS_REGISTRY
 }) + """;
+// Carte VM → provider et VMs de chaque provider (partition transversale) —
+// injectées depuis shared/config.py pour que le JS affiche "pour quel
+// provider l'orchestrateur travaille" sans dupliquer la topologie ici.
+const PROVIDER_OF_VM = """ + json.dumps(config.PROVIDER_OF_VM) + """;
+const PROVIDER_REGISTRY = """ + json.dumps(config.PROVIDER_REGISTRY) + """;
 
 const COLORS = { latency: '#3b82f6', cpu_usage: '#f59e0b', ram_usage: '#22c55e' };
+// Couleur distinctive par provider, réutilisée partout où provider_used ou
+// le provider actif apparaît (tuile d'en-tête, colonne Provider du journal)
+// pour que l'œil suive un même provider d'un endroit à l'autre du dashboard.
+const PROVIDER_COLORS = { 'provider-1': '#3fd0c9', 'provider-2': '#f59e0b' };
 const METRIC_LABELS = { latency: 'Latence', cpu_usage: 'CPU', ram_usage: 'RAM' };
 // cpu_usage/ram_usage en mode enhanced (intention LLM) sont exprimés en
 // ressource absolue (cœurs/Go) avec operator ">=" — pas un % de charge.
@@ -326,48 +378,15 @@ const METRIC_LABELS = { latency: 'Latence', cpu_usage: 'CPU', ram_usage: 'RAM' }
 const CAPACITY_KEYS = { cpu_usage: 'total_cores', ram_usage: 'total_ram_gb' };
 const HIST_LEN = 60;
 
-let latencyHist = {}; // vm_id → [values]
-let latencyPredHist = {}; // vm_id → [first_pred]
 let sloWeightHist = {}; // metric → [weights]
-let cycleHist = [];
 let sloWeightCycles = [];
 let currentSlos = [];
 let latencyThreshold = SLO_DEFAULTS['latency'] || 300;
 let lastKnownLatency = {}; // vm_id → dernière latence mesurée connue (pour comparer "VM la plus proche" vs choix TOPSIS)
 
-VMs.forEach(v => { latencyHist[v] = []; latencyPredHist[v] = []; });
 METRICS.forEach(m => { sloWeightHist[m] = []; });
 
 // ── Charts ────────────────────────────────────────────────────
-const latCtx = document.getElementById('chart-latency').getContext('2d');
-const latChart = new Chart(latCtx, {
-  type: 'line',
-  data: {
-    labels: [],
-    datasets: VMs.map((v, i) => ({
-      label: v,
-      data: [],
-      borderColor: ['#3b82f6','#f59e0b','#22c55e','#8b5cf6'][i],
-      backgroundColor: 'transparent',
-      borderWidth: 1.8, pointRadius: 0, tension: 0.3,
-    })).concat([{
-      label: 'Seuil SLO',
-      data: [],
-      borderColor: '#ef4444', borderDash: [6,3],
-      backgroundColor: 'transparent',
-      borderWidth: 1.5, pointRadius: 0,
-    }])
-  },
-  options: {
-    animation: false, responsive: true,
-    plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } },
-    scales: {
-      x: { ticks: { color: '#64748b', maxTicksLimit: 8 }, grid: { color: '#1e2235' } },
-      y: { ticks: { color: '#64748b' }, grid: { color: '#1e2235' }, min: 0 }
-    }
-  }
-});
-
 const sloCtx = document.getElementById('chart-slo').getContext('2d');
 const sloChart = new Chart(sloCtx, {
   type: 'line',
@@ -423,6 +442,24 @@ function buildVmCards() {
 }
 buildVmCards();
 
+// Met à jour la tuile "Provider actif" d'après la VM active courante.
+// Sans PROVIDER_OF_VM (VM inconnue du registre) : affichage neutre "—",
+// jamais de valeur incorrecte ou d'exception.
+function updateActiveProviderTile(activeVm) {
+  const el = document.getElementById('h-provider');
+  const providerId = PROVIDER_OF_VM[activeVm];
+  if (providerId) {
+    const vms = (PROVIDER_REGISTRY[providerId]?.vms || []).join(' · ');
+    el.textContent = providerId;
+    el.style.color = PROVIDER_COLORS[providerId] || '';
+    el.title = vms;
+  } else {
+    el.textContent = '—';
+    el.style.color = '';
+    el.title = '';
+  }
+}
+
 // ── Mise à jour métriques ──────────────────────────────────────
 function updateMetrics(data) {
   const vms = data.vms || {};
@@ -435,6 +472,7 @@ function updateMetrics(data) {
   document.getElementById('h-cycle').textContent = cycle;
   const activeVm = Object.entries(vms).find(([,d]) => d.is_active)?.[0] || '—';
   document.getElementById('h-vm').textContent = activeVm;
+  updateActiveProviderTile(activeVm);
 
   // Seuil latence depuis SLOs actifs
   const latSlo = slos.find(s => s.metric === 'latency');
@@ -508,26 +546,7 @@ function updateMetrics(data) {
       }
     });
 
-    // Historique latence pour chart
-    if (latVal !== null && latVal !== undefined) {
-      if (!latencyHist[vm]) latencyHist[vm] = [];
-      latencyHist[vm].push(latVal);
-      if (latencyHist[vm].length > HIST_LEN) latencyHist[vm].shift();
-    }
   });
-
-  // Cycles
-  cycleHist.push(cycle);
-  if (cycleHist.length > HIST_LEN) cycleHist.shift();
-
-  // Chart latence
-  const maxLen = Math.max(...VMs.map(v => (latencyHist[v]||[]).length));
-  latChart.data.labels = cycleHist.slice(-maxLen);
-  VMs.forEach((v, i) => {
-    latChart.data.datasets[i].data = latencyHist[v] || [];
-  });
-  latChart.data.datasets[VMs.length].data = Array(cycleHist.slice(-maxLen).length).fill(latencyThreshold);
-  latChart.update('none');
 
   // SLO weights
   const weightMap = {};
@@ -542,19 +561,6 @@ function updateMetrics(data) {
   sloChart.data.labels = sloWeightCycles;
   METRICS.forEach((m, i) => { sloChart.data.datasets[i].data = sloWeightHist[m]; });
   sloChart.update('none');
-
-  // SLO detail bars
-  const sloDetail = document.getElementById('slo-detail');
-  sloDetail.innerHTML = slos.map(s => {
-    const pct = Math.round((s.weight || 0) * 100);
-    const color = COLORS[s.metric] || '#94a3b8';
-    return `<div class="slo-row">
-      <span class="slo-name">${METRIC_LABELS[s.metric] || s.metric}</span>
-      <div class="slo-bar-bg"><div class="slo-bar-fill" style="width:${pct}%;background:${color}"></div></div>
-      <span class="slo-weight-val" style="color:${color}">${pct}%</span>
-      <span style="font-size:11px;color:#94a3b8;margin-left:8px">${s.operator} ${s.threshold?.toFixed(1)} ${s.unit || ''} ${s.is_primary ? '★' : ''}</span>
-    </div>`;
-  }).join('') || '<span style="color:#64748b">Aucun SLO actif</span>';
 }
 
 // ── Audit log ─────────────────────────────────────────────────
@@ -563,13 +569,83 @@ let proactiveMigrateCount = 0;
 let reactiveMigrateCount = 0;
 const seenMigrations = new Set();  // clé cycle → évite double comptage (snapshot + live)
 
+// Libellés/couleurs des types de violation. Étendu avec
+// inter_provider_negotiation (chemins B/C) : sans cette entrée, breachFr
+// valait '' et produisait une phrase trouée ("Violation  détectée...").
+const BREACH_FR = {
+  proactive: 'proactive',
+  reactive:  'réactive',
+  inter_provider_negotiation: 'inter-provider',
+};
+
+// Libellés / infobulles des chemins multi-provider (voir provider_arbitration.py).
+// Même texte que les infobulles du compteur d'en-tête (une seule source de vérité).
+const PATH_LABELS = { A: 'INTRA', B: 'INTER', C: 'NÉGO', D: 'IMPOSSIBLE' };
+const PATH_TITLES = {
+  A: "Le provider courant avait des VMs conformes — TOPSIS a départagé.",
+  B: "Aucune VM conforme chez le provider courant — passation vers l'autre provider.",
+  C: "Aucun provider conforme — décision par négociation sur le score de violation.",
+  D: "Aucun provider ne peut satisfaire les SLOs — le service reste en place.",
+};
+
+// Badge de chemin affiché dans la colonne "Type" du journal d'audit. Le
+// provider (provider_used) a sa PROPRE colonne dédiée (voir providerCellHtml)
+// — pas de doublon ici. Retourne '' quand provider_path est absent (mode
+// mono-provider) : AUCUN badge, AUCUN texte ajouté — compatibilité stricte.
+function pathBadgeHtml(e) {
+  if (!e.provider_path) return '';
+  const cls = 'badge-path-' + e.provider_path.toLowerCase();
+  const label = PATH_LABELS[e.provider_path] || e.provider_path;
+  const title = PATH_TITLES[e.provider_path] || '';
+  return ` <span class="badge ${cls}" title="${title}">${label}</span>`;
+}
+
+// Cellule de la colonne "Provider" du journal. Vide (jamais "—", jamais
+// "undefined") quand provider_used est absent — mode mono-provider inchangé.
+// Coloré selon PROVIDER_COLORS pour que l'œil suive le même provider entre
+// la tuile d'en-tête et le journal.
+function providerCellHtml(e) {
+  if (!e.provider_used) return '';
+  const color = PROVIDER_COLORS[e.provider_used] || '#e2e8f0';
+  return `<span style="color:${color};font-weight:600">${e.provider_used}</span>`;
+}
+
 // Traduit le "reason" brut (anglais, venant du backend decision_intelligence)
 // en français, et ajoute l'explication "VM la plus proche vs choix TOPSIS"
 // pour les migrations : compare to_vm à la VM ayant la latence la plus basse
 // connue au moment de la décision (lastKnownLatency, alimenté par updateMetrics).
 function translateReason(e) {
-  const breachFr = e.breach_type === 'proactive' ? 'proactive'
-                  : e.breach_type === 'reactive' ? 'réactive' : '';
+  // ── Chemins B / C / D (multi-provider, hors chemin A) ────────────────
+  // Phrase structurée à partir des champs disponibles (provider_used, to_vm,
+  // from_vm), COMPLÉTÉE par le "reason" du hub — jamais remplacée par lui.
+  // Le chemin A n'entre pas ici : il retombe sur la logique historique
+  // ci-dessous, strictement inchangée (comme le mode mono-provider, qui n'a
+  // pas de provider_path du tout).
+  if (e.provider_path && e.provider_path !== 'A') {
+    const used = e.provider_used || '—';
+
+    // Chemin C (négociation) : format à part, en 2 lignes — un en-tête
+    // gras/coloré ("qui a gagné"), puis le "reason" du hub tel quel (raison
+    // du POURQUOI). Sans "reason", seul l'en-tête est affiché.
+    if (e.provider_path === 'C') {
+      const color = PROVIDER_COLORS[e.provider_used] || '#a855f7';
+      const header = `<strong style="color:${color}">NÉGOCIATION — ${used} l'emporte</strong>`;
+      return e.reason ? `${header}<br><span style="color:#94a3b8">${e.reason}</span>` : header;
+    }
+
+    let structured;
+    if (e.provider_path === 'B') {
+      structured = `Aucune VM conforme localement — passation vers ${used}`
+                 + (e.to_vm ? `, qui a sélectionné ${e.to_vm} par TOPSIS.` : '.');
+    } else {
+      structured = `Aucun provider ne peut satisfaire les SLOs — le service reste sur `
+                 + `${e.from_vm || e.to_vm || '—'}.`;
+    }
+    return e.reason ? `${structured} (${e.reason})` : structured;
+  }
+
+  // ── Chemin A / mode mono-provider : comportement INCHANGÉ ────────────
+  const breachFr = BREACH_FR[e.breach_type] || '';
   const toVm = e.to_vm;
 
   let base;
@@ -602,9 +678,190 @@ function translateReason(e) {
   return base;
 }
 
+// ── Panneau "Raisonnement du cycle" ─────────────────────────────
+//
+// Affiche le raisonnement de la DERNIÈRE entrée d'audit possédant un bloc
+// "reasoning" (voir hub/orchestrator_core.py::_build_reasoning) — c'est-à-
+// dire uniquement les cycles où config.MULTI_PROVIDER_ENABLED est actif.
+// Compatibilité stricte : tant qu'aucune entrée de ce type n'est arrivée,
+// le panneau garde son message statique HTML par défaut ("mode
+// mono-provider") — aucune fonction ci-dessous n'est même appelée.
+let lastReasoningEntry = null;
+
+// Ne remplace l'entrée retenue que par une plus récente (cycle supérieur
+// ou égal) : le snapshot initial arrive en ordre ANTI-chronologique
+// (le plus récent en premier), il ne faut pas laisser une entrée plus
+// ancienne écraser ensuite la plus récente déjà affichée.
+function considerForReasoningPanel(e) {
+  if (!e || !e.reasoning) return;
+  const prevCycle = lastReasoningEntry ? (lastReasoningEntry.cycle ?? -Infinity) : -Infinity;
+  const thisCycle = e.cycle ?? -Infinity;
+  if (thisCycle >= prevCycle) {
+    lastReasoningEntry = e;
+    renderReasoningPanel(e);
+  }
+}
+
+// Étape 2 : violation détectée. Sur le chemin A / mono-provider,
+// violated_metrics + breach_type (proactif/réactif) sont fiables — c'est
+// decision.py (ViolationDetector) qui les a produits. Sur les chemins
+// B/C/D, decision.py n'est PAS appelé sur ce provider : violated_metrics
+// est toujours vide et breach_type vaut "inter_provider_*" (le mécanisme,
+// pas le type de violation). On retombe alors sur le détail par métrique
+// de l'évaluation du provider courant (reasoning.evaluations[].detail),
+// seule donnée disponible pour cette VM — sans qualificatif
+// proactif/réactif, qui n'est pas déterminable dans ce cas.
+function renderStep2(e, r) {
+  const violated = e.violated_metrics || [];
+  if (violated.length && (e.breach_type === 'proactive' || e.breach_type === 'reactive')) {
+    const label = (BREACH_FR[e.breach_type] || e.breach_type).toUpperCase();
+    return violated.map(m =>
+      `<div class="reasoning-row"><span class="mono">${e.from_vm || '—'}</span> : `
+      + `<span class="mono">${METRIC_LABELS[m.metric] || m.metric}</span> → `
+      + `<span style="color:#f59e0b;font-weight:600">${label}</span></div>`
+    ).join('');
+  }
+  // from_vm n'est renseigné que sur une MIGRATION (convention du hub) : sur un
+  // maintien il vaut null et l'évaluation de la VM active restait introuvable,
+  // d'où un « Aucune violation détectée » trompeur juste au-dessus d'une VM
+  // affichée non conforme à l'étape 3. reasoning.vm_active comble ce trou.
+  const vmActive = e.from_vm || r.vm_active;
+  const activeEval = r.evaluations.find(ev => ev.vm_id === vmActive);
+  if (activeEval && activeEval.detail) {
+    const excesses = Object.entries(activeEval.detail).filter(([, v]) => v > 0);
+    if (excesses.length) {
+      return excesses.map(([metric, excess]) =>
+        `<div class="reasoning-row"><span class="mono">${vmActive}</span> : `
+        + `<span class="mono">${METRIC_LABELS[metric] || metric}</span> `
+        + `<span style="color:#f59e0b">(excès ${excess.toFixed(3)})</span></div>`
+      ).join('');
+    }
+  }
+  return '<div class="reasoning-empty">Aucune violation détectée</div>';
+}
+
+// Étape 4 : dépend du chemin. A/B → classement TOPSIS (reasoning.topsis) ;
+// C/D → négociation (reasoning.negotiation). "information indisponible"
+// plutôt qu'une cellule muette quand la donnée manque.
+function renderStep4(e, r) {
+  if (e.provider_path === 'A' || e.provider_path === 'B') {
+    const classement = (r.topsis && r.topsis.classement) || {};
+    const entries = Object.entries(classement).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) {
+      return { title: 'TOPSIS départage les conformes', body: '<div class="reasoning-empty">information indisponible</div>' };
+    }
+    const retenue = r.topsis ? r.topsis.retenue : null;
+    const body = entries.map(([vm, score]) =>
+      `<div class="reasoning-row"><span class="mono">${vm}</span> `
+      + `<span class="mono">${score.toFixed(4)}</span> `
+      + (vm === retenue ? '<span style="color:#22c55e;font-weight:600">← retenue</span>' : '')
+      + `</div>`
+    ).join('');
+    return { title: 'TOPSIS départage les conformes', body };
+  }
+
+  const neg = r.negotiation;
+  const title = 'Négociation' + (neg && neg.provider_cible ? ` avec ${neg.provider_cible}` : '');
+  if (!neg) {
+    return { title, body: '<div class="reasoning-empty">information indisponible</div>' };
+  }
+  const fmtOffer = (o) => o ? `${o.vm_id} <span class="mono">${o.violation_score.toFixed(4)}</span>` : 'information indisponible';
+  const body = `
+    <div class="reasoning-row"><span style="color:#94a3b8">offre locale</span> ${fmtOffer(neg.offre_locale)}</div>
+    <div class="reasoning-row"><span style="color:#94a3b8">offre reçue</span> ${fmtOffer(neg.offre_recue)}</div>
+    <div class="reasoning-row"><span style="color:#94a3b8">dead-band</span> <span class="mono">${neg.deadband != null ? neg.deadband.toFixed(4) : 'information indisponible'}</span></div>
+    <div class="reasoning-row">→ ${neg.decision || 'information indisponible'}</div>
+  `;
+  return { title, body };
+}
+
+function renderReasoningPanel(e) {
+  const panel = document.getElementById('reasoning-panel');
+  const r = e.reasoning;
+
+  const pathCls   = e.provider_path ? 'badge-path-' + e.provider_path.toLowerCase() : 'badge-none';
+  const pathLabel = e.provider_path ? (PATH_LABELS[e.provider_path] || e.provider_path) : '—';
+  const provColor = PROVIDER_COLORS[r.provider_courant] || '#e2e8f0';
+
+  // Étape 1 : SLOs actifs — primaire/secondaire, poids, MI si disponible.
+  const slos = e.slos_active || [];
+  const miScores = e.mi_scores || {};
+  const step1 = slos.map(s => {
+    const mi = miScores[s.metric];
+    const kind = s.is_primary ? 'primaire'
+               : (mi != null ? `secondaire · MI ${mi.toFixed(2)}` : 'secondaire');
+    const pct = Math.round((s.weight || 0) * 100);
+    return `<div class="reasoning-row">
+      <span class="mono">${METRIC_LABELS[s.metric] || s.metric}</span>
+      <span class="mono" style="color:#94a3b8">${s.operator} ${s.threshold != null ? s.threshold.toFixed(1) : '—'}${s.unit || ''}</span>
+      <span style="color:#94a3b8">${kind}</span>
+      <span style="color:#f59e0b">poids ${pct}%</span>
+    </div>`;
+  }).join('') || '<div class="reasoning-empty">Aucun SLO actif</div>';
+
+  // Étape 3 : évaluation du provider courant, triée par violation croissante.
+  const evals = (r.evaluations || []).slice().sort((a, b) => a.violation_score - b.violation_score);
+  const nConform = evals.filter(x => x.is_compliant).length;
+  const step3 = evals.map(x =>
+    `<div class="reasoning-row"><span class="mono">${x.vm_id}</span> `
+    + `<span class="mono">violation ${x.violation_score.toFixed(3)}</span> `
+    + (x.is_compliant
+        ? '<span style="color:#22c55e">conforme</span>'
+        : '<span style="color:#ef4444">non conforme</span>')
+    + `</div>`
+  ).join('') || '<div class="reasoning-empty">Aucune évaluation disponible</div>';
+  const step3Summary = evals.length
+    ? (nConform > 0 ? `→ ${nConform} VM(s) conforme(s)` : '→ aucune VM conforme')
+    : '';
+
+  const step4 = renderStep4(e, r);
+
+  const decLabel = e.decision === 'migrate' ? 'MIGRATION' : 'MAINTIEN';
+  const decColor = e.decision === 'migrate' ? '#fca5a5' : '#86efac';
+  // Sur un MAINTIEN, to_vm et from_vm sont tous deux null (convention du hub) :
+  // on affichait « MAINTIEN sur — ». reasoning.vm_active donne la VM réellement
+  // conservée.
+  const vmLine   = e.decision === 'migrate'
+    ? `${e.from_vm || r.vm_active || '—'} → ${e.to_vm || '—'}`
+    : `sur ${e.to_vm || e.from_vm || r.vm_active || '—'}`;
+
+  panel.innerHTML = `
+    <div class="reasoning-header">
+      <span>Cycle #${e.cycle ?? '—'}</span>
+      <span class="badge ${pathCls}">${pathLabel}</span>
+      <span style="color:${provColor};font-weight:600">${r.provider_courant || ''}</span>
+    </div>
+    <div class="reasoning-step">
+      <div class="reasoning-step-title">1. SLOs actifs</div>
+      ${step1}
+    </div>
+    <div class="reasoning-step">
+      <div class="reasoning-step-title">2. Violation détectée</div>
+      ${renderStep2(e, r)}
+    </div>
+    <div class="reasoning-step">
+      <div class="reasoning-step-title">3. Évaluation de ${r.provider_courant || '—'}</div>
+      ${step3}
+      <div style="margin-top:4px;color:#94a3b8">${step3Summary}</div>
+    </div>
+    <div class="reasoning-step">
+      <div class="reasoning-step-title">4. ${step4.title}</div>
+      ${step4.body}
+    </div>
+    <div class="reasoning-step">
+      <div class="reasoning-step-title">5. DÉCISION : <span style="color:${decColor}">${decLabel}</span> ${vmLine}</div>
+      <div style="color:#94a3b8;margin-top:4px">${e.reason || ''}</div>
+    </div>
+  `;
+}
+
 function addAuditRows(entries, prepend = false) {
   const tbody = document.getElementById('audit-body');
   entries.forEach(e => {
+    considerForReasoningPanel(e);   // AVANT le filtre d'affichage du tableau —
+                                    // le panneau doit refléter TOUT cycle multi-
+                                    // provider, y compris les STAY que le journal masque.
+
     const dec = e.decision || '—';
     const breach = e.breach_type || 'none';
 
@@ -616,13 +873,23 @@ function addAuditRows(entries, prepend = false) {
       document.getElementById('h-reactive-count').textContent = reactiveMigrateCount;
     }
 
-    // Audit log = uniquement les migrations effectives (les MAINTIEN sont
-    // omis pour rester lisible ; ils restent visibles dans l'en-tête et
-    // dans les logs bruts du hub).
-    if (dec !== 'migrate') return;
+    // Journal = les événements PORTEURS D'INFORMATION.
+    //  - migrations : toujours affichées (comportement historique) ;
+    //  - MAINTIEN   : masqué, SAUF le chemin D (PLACEMENT_IMPOSSIBLE), qui
+    //    est le seul STAY signifiant — il prouve qu'aucun provider ne
+    //    pouvait tenir les SLOs.
+    // Un STAY de routine (chemins A ou C gagnés localement) n'apprend rien
+    // et saturait le journal — c'était le problème signalé.
+    //
+    // Effet sur le mono-provider : provider_path est absent donc
+    // "!== 'D'" est vrai → le filtre redevient dec !== 'migrate', EXACTEMENT
+    // le comportement d'origine.
+    if (dec !== 'migrate' && e.provider_path !== 'D') return;
 
     const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString('fr-FR') : '—';
-    const decBadge = `<span class="badge badge-migrate">MIGRATION</span>`;
+    const decBadge = dec === 'migrate'
+      ? `<span class="badge badge-migrate">MIGRATION</span>`
+      : `<span class="badge badge-stay">MAINTIEN</span>`;
     const breachBadge = breach === 'reactive'
       ? `<span class="badge badge-reactive">réactif</span>`
       : breach === 'proactive'
@@ -639,7 +906,8 @@ function addAuditRows(entries, prepend = false) {
       <td class="mono">${ts}</td>
       <td>${e.cycle ?? '—'}</td>
       <td>${decBadge}</td>
-      <td>${breachBadge}</td>
+      <td>${breachBadge}${pathBadgeHtml(e)}</td>
+      <td class="mono">${providerCellHtml(e)}</td>
       <td class="mono">${e.from_vm || '—'}</td>
       <td class="mono" style="color:#22c55e">${e.to_vm || '—'}</td>
       <td class="mono">${score}</td>
@@ -667,6 +935,24 @@ function updateHeader(auditData) {
   document.getElementById('h-mode').textContent = auditData.mode || '—';
 }
 
+// Compteur cumulé des chemins multi-provider — alimenté par le backend
+// (provider_path_counts, joint à chaque événement "audit"/"snapshot"), pas
+// recalculé côté client : un seul endroit fait autorité sur le total.
+// Chaque catégorie à ZÉRO reste grisée (badge-none) : l'œil va directement
+// à ce qui s'est réellement produit plutôt qu'à 4 badges pleine couleur
+// dont la plupart valent 0 en début de session.
+const PATH_COUNT_IDS = { A: 'h-path-a', B: 'h-path-b', C: 'h-path-c', D: 'h-path-d' };
+
+function updatePathCounts(counts) {
+  if (!counts) return;
+  Object.keys(PATH_LABELS).forEach(key => {
+    const el = document.getElementById(PATH_COUNT_IDS[key]);
+    const n = counts[key] || 0;
+    el.textContent = PATH_LABELS[key] + ' ' + n;
+    el.className = 'badge ' + (n > 0 ? 'badge-path-' + key.toLowerCase() : 'badge-none');
+  });
+}
+
 // ── SSE ───────────────────────────────────────────────────────
 const dot = document.getElementById('conn-dot');
 const connStatus = document.getElementById('conn-status');
@@ -680,8 +966,15 @@ function connect() {
   evtSource.onmessage = e => {
     const msg = JSON.parse(e.data);
     if (msg.type === 'metrics') updateMetrics(msg.data);
-    else if (msg.type === 'audit') { addAuditRows([msg.data], true); updateHeader(msg.data); }
-    else if (msg.type === 'snapshot') addAuditRows((msg.log || []).reverse(), false);
+    else if (msg.type === 'audit') {
+      addAuditRows([msg.data], true);
+      updateHeader(msg.data);
+      updatePathCounts(msg.provider_path_counts);
+    }
+    else if (msg.type === 'snapshot') {
+      addAuditRows((msg.log || []).reverse(), false);
+      updatePathCounts(msg.provider_path_counts);
+    }
   };
   evtSource.onerror = () => {
     dot.className = ''; connStatus.textContent = 'Reconnexion...';

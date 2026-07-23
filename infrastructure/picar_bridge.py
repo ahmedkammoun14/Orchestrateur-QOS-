@@ -47,7 +47,7 @@ HUB_STATUS_URL = "http://140.93.89.92:8000/status"
 SEND_INTERVAL_S = 5.0
 
 # VMs OpenStack
-# - port 5000  /ping  → reçoit {x,y}, calcule distance, répond avec latency_ms
+# - port 5001  /ping  → reçoit {x,y}, calcule distance, répond avec latency_ms
 # - port 8200  /health → vm_agent.py (orchestrateur, inchangé)
 VMS = [
     {"name": "edge 1",  "id": "edge1",  "type": "edge",  "ip": "194.199.113.18", "ping_port": 5001},
@@ -89,7 +89,7 @@ _pool = ThreadPoolExecutor(max_workers=len(VMS))
 
 def _ping_vm(args: tuple) -> dict:
     """
-    Envoie POST /ping {x, y} à la VM sur port 5000.
+    Envoie POST /ping {x, y} à la VM sur port 5001.
     La VM calcule la distance voiture<->VM, dort latency_ms, répond.
     Le RTT mesuré = latence simulée (incluant le sleep côté VM).
     """

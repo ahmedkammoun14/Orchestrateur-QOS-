@@ -12,13 +12,16 @@ from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, status, Body
+from fastapi import FastAPI, HTTPException, status, Body
 
 from shared import config
 from shared.logging_utils import C, PrettyFormatter
-from shared.models import LatencyPayload, RTTMeasurement
+from shared.models import LatencyPayload, RTTMeasurement, SLO, SLOIntent
 from shared.timing import StepProfiler
 from shared.timing_writer import TimingWriter
+from hub.provider_arbitration import (
+    ProviderAssessment, ProviderOffer, evaluate_provider, negotiate,
+)
 
 
 def setup_logger() -> logging.Logger:
@@ -551,10 +554,17 @@ async def _step7_predict(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
     state.snapshot_predictions = dict(state.last_predictions)
 
 
-async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext, prof: StepProfiler) -> None:
-    """Appelle decision_intelligence et exécute la migration si nécessaire."""
+def _build_candidates(collected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Construit la liste de candidats attendue par decision_intelligence et par
+    provider_arbitration, à partir des mesures du collector.
+
+    Extrait de _step8_decide pour être partagé avec le point de réception de
+    la passation inter-provider, sans dupliquer la convention payload_key
+    (latency → rtt_ms, etc.).
+    """
     current_data = []
-    for lc in state.last_collected:
+    for lc in collected:
         entry = {"vm_id": lc["vm_id"]}
         for m, meta in config.METRICS_REGISTRY.items():
             entry[meta["payload_key"]] = lc.get(m)
@@ -564,7 +574,38 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext, prof: Step
         entry["total_cores"]  = lc.get("total_cores")
         entry["total_ram_gb"] = lc.get("total_ram_gb")
         current_data.append(entry)
+    return current_data
 
+
+async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext, prof: StepProfiler) -> None:
+    """
+    Appelle decision_intelligence et exécute la migration si nécessaire.
+
+    Aiguillage sur l'interrupteur multi-provider de shared/config.py (OFF par
+    défaut) : le chemin mono-provider est le code d'origine, déplacé tel quel
+    dans _decide_mono_provider — zéro changement de comportement tant que
+    l'interrupteur n'est pas activé explicitement.
+    """
+    current_data = _build_candidates(state.last_collected)
+    if not config.MULTI_PROVIDER_ENABLED:
+        await _decide_mono_provider(client, ctx, prof, current_data)
+        return
+    await _decide_multi_provider(client, ctx, prof, current_data)
+
+
+async def _decide_mono_provider(
+    client: httpx.AsyncClient,
+    ctx: _FlowContext,
+    prof: StepProfiler,
+    current_data: List[Dict[str, Any]],
+) -> None:
+    """
+    Corps ORIGINAL de _step8_decide, déplacé sans aucune modification de
+    logique (seule current_data, calculée par l'appelant, est passée en
+    paramètre au lieu d'être recalculée ici). C'est le chemin actif par
+    défaut (interrupteur multi-provider OFF) — toute divergence par rapport
+    au comportement historique est un bug.
+    """
     # Lookup explicite par vm_id — évite tout risque de désalignement positionnel
     # entre vm_ids et state.last_collected.
     collected_lookup = {lc["vm_id"]: lc for lc in state.last_collected}
@@ -672,6 +713,465 @@ async def _step8_decide(client: httpx.AsyncClient, ctx: _FlowContext, prof: Step
             f"🟢 Décision : {C.GREEN}MAINTIEN{C.RESET} sur {C.CYAN}{state.service_vm}{C.RESET} "
             f"| raison : {reason}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Décision multi-provider (interrupteur ON — shared/config.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Valeur par défaut du sous-bloc "topsis" du reasoning : chemins C et D ne
+# font jamais tourner TOPSIS (négociation sur le score de violation, pas de
+# classement) — ce dict neutre évite un "None" au lecteur du dashboard, qui
+# peut toujours lire classement/retenue/score sans test d'existence.
+def _empty_topsis_reasoning() -> Dict[str, Any]:
+    return {"classement": {}, "retenue": None, "score": None}
+
+
+def _build_reasoning(
+    current_provider: str,
+    assessment: ProviderAssessment,
+    negotiation_data: Optional[Dict[str, Any]],
+    topsis_data: Dict[str, Any],
+    vm_active: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Construit le bloc "reasoning" de l'audit multi-provider : la CHAÎNE DE
+    RAISONNEMENT qui a mené à la décision (évaluation VM par VM, sous-
+    ensemble conforme retenu, classement TOPSIS complet, éventuelle
+    négociation) — pas seulement son résultat. Objectif : rendre la décision
+    auditable a posteriori (dashboard, debug, soutenance) sans avoir à
+    recouper les logs bruts du hub.
+
+    PUREMENT INFORMATIF : ce bloc ne pèse jamais sur la décision elle-même,
+    déjà prise par l'appelant au moment où cette fonction est invoquée.
+
+    Tuples → listes, objets → dicts : le résultat part sur le réseau vers
+    observability (POST /audit), il doit être json.dumps-able tel quel.
+
+    `vm_active` = VM hébergeant le service AU MOMENT DE LA DÉCISION. Sur les
+    chemins multi-provider, di_res["from_vm"] vaut None quand la décision est
+    un maintien (convention : from_vm/to_vm ne sont renseignés que sur une
+    migration). Le dashboard n'avait alors aucun moyen de savoir sur quelle VM
+    porter l'étape « violation détectée » ni quoi afficher en étape « décision ».
+    Ce champ le lui donne, sans toucher à la sémantique de from_vm/to_vm.
+    """
+    return {
+        "provider_courant": current_provider,
+        "vm_active":        vm_active,
+        "evaluations": [
+            {
+                "vm_id":           ev.vm_id,
+                "violation_score": ev.violation_score,
+                "is_compliant":    ev.is_compliant,
+                "evaluable":       ev.evaluable,
+                "detail":          dict(ev.detail),
+            }
+            for ev in assessment.evaluations
+        ],
+        "compliant_vms": list(assessment.compliant_vms),
+        "negotiation":   negotiation_data,
+        "topsis":        topsis_data,
+    }
+
+
+async def _finalize_multi_provider_decision(
+    client: httpx.AsyncClient,
+    prof: StepProfiler,
+    di_res: Dict[str, Any],
+    provider_path: str,
+    provider_used: str,
+    current_provider: str,
+    assessment: ProviderAssessment,
+    negotiation_data: Optional[Dict[str, Any]] = None,
+    topsis_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Fin commune aux chemins A/B/C/D de la décision multi-provider : logging,
+    mise à jour de l'état, audit, puis migration effective si nécessaire.
+    Reprend la même séquence que la fin de _decide_mono_provider
+    (store/decision → kubectl → mise à jour de state) pour ne pas diverger
+    du comportement de migration existant.
+
+    `current_provider`/`assessment`/`negotiation_data`/`topsis_data`
+    alimentent le bloc d'audit "reasoning" (voir _build_reasoning).
+    `topsis_data` par défaut à None (chemins C/D, qui ne font jamais tourner
+    TOPSIS) → repli sur _empty_topsis_reasoning(). Sa construction est
+    protégée par un try/except : une erreur ici (structure inattendue, champ
+    manquant) ne doit JAMAIS empêcher l'audit d'être posté ni interrompre le
+    cycle — ce bloc est un bonus informatif, pas un prérequis du cycle.
+    """
+    state.last_decision = di_res
+    decision = di_res.get("decision", "?")
+    reason   = di_res.get("reason", "—")
+
+    logger.info(
+        f"🌐 Cycle #{state.cycle_count} — multi-provider "
+        f"| chemin {C.CYAN}{provider_path}{C.RESET} "
+        f"| provider {C.CYAN}{provider_used}{C.RESET} "
+        f"| décision : {(C.YELLOW if decision == 'migrate' else C.GREEN)}{decision}{C.RESET} "
+        f"| VM finale : {C.GREEN}{di_res.get('to_vm') or state.service_vm}{C.RESET} "
+        f"| raison : {reason}"
+    )
+
+    try:
+        # state.service_vm est encore la VM SOURCE ici : l'audit est posté
+        # avant l'exécution de la migration (plus bas), donc ce champ décrit
+        # bien la VM sur laquelle la décision a été prise.
+        reasoning: Optional[Dict[str, Any]] = _build_reasoning(
+            current_provider, assessment, negotiation_data,
+            topsis_data if topsis_data is not None else _empty_topsis_reasoning(),
+            vm_active=state.service_vm,
+        )
+    except Exception as exc:
+        logger.warning(f"⚠️  Construction du bloc reasoning (audit) échouée : {exc}")
+        reasoning = None
+
+    audit_payload = {
+        **di_res,
+        "cycle":            state.cycle_count,
+        "mode":              state._mode,
+        "violated_metrics": di_res.get("violated_metrics", []),
+        "slos_active":      state.current_slos,
+        "mi_scores":        state.last_mi_scores,
+        "current_metrics":  {
+            lc["vm_id"]: {
+                "latency":   lc.get("latency"),
+                "cpu_usage": lc.get("cpu_usage"),
+                "ram_usage": lc.get("ram_usage"),
+            } for lc in state.last_collected
+        },
+        "provider_path": provider_path,
+        "provider_used": provider_used,
+        "reasoning":     reasoning,
+    }
+    asyncio.create_task(
+        _post_audit(f"{_URLS['observability']}/audit", audit_payload)
+    )
+
+    if decision == "migrate":
+        from_vm = di_res["from_vm"]
+        to_vm   = di_res["to_vm"]
+        logger.info(
+            f"\n{'═'*60}\n"
+            f"  🎯 DÉCISION : {C.BOLD}{C.YELLOW}MIGRATION{C.RESET} "
+            f"(multi-provider, chemin {provider_path})\n"
+            f"  {'Source':<16}: {C.RED}{from_vm}{C.RESET}\n"
+            f"  {'Destination':<16}: {C.GREEN}{to_vm}{C.RESET}\n"
+            f"  {'Raison':<16}: {C.CYAN}{reason}{C.RESET}\n"
+            f"{'═'*60}"
+        )
+
+        with prof.step("store_decision"):
+            await _post(client, f"{_URLS['database']}/store/decision", di_res)
+
+        # Même séquence que le chemin mono-provider : durée = wall-clock de
+        # l'appel HTTP synchrone à openstack_client.
+        with prof.step("migration"):
+            kubectl_ok = await _execute_kubectl_migration(client, from_vm, to_vm)
+        if not kubectl_ok:
+            logger.warning(
+                f"⚠️  Migration kubectl échouée — "
+                f"état interne mis à jour malgré tout "
+                f"({C.YELLOW}{from_vm}{C.RESET} → {C.GREEN}{to_vm}{C.RESET})"
+            )
+
+        state.service_vm        = to_vm
+        state.last_migration_ts = time.monotonic()
+        logger.info(
+            f"✅ Migration effectuée — "
+            f"nouvelle VM active : {C.GREEN}{C.BOLD}{to_vm}{C.RESET} "
+            f"| kubectl : {'OK' if kubectl_ok else C.RED+'ÉCHEC'+C.RESET}"
+        )
+    else:
+        logger.info(
+            f"🟢 Décision : {C.GREEN}MAINTIEN{C.RESET} sur {C.CYAN}{state.service_vm}{C.RESET} "
+            f"| raison : {reason}"
+        )
+
+
+async def _decide_multi_provider(
+    client: httpx.AsyncClient,
+    ctx: _FlowContext,
+    prof: StepProfiler,
+    current_data: List[Dict[str, Any]],
+) -> None:
+    """
+    Machine à états multi-provider (voir hub/provider_arbitration.py). Le
+    provider COURANT — celui qui héberge state.service_vm — est évalué en
+    premier :
+
+      A. il a des VMs conformes     → TOPSIS restreint à CES VMs (intra-provider)
+      B/C. aucune conforme chez lui  → passation via provider_relay ; la
+           négociation renvoyée décide seule de la migration
+      D. rien d'exploitable          → STAY, PLACEMENT_IMPOSSIBLE
+
+    TOPSIS ne tourne JAMAIS sur un pool mêlant deux providers, ni sur des VMs
+    non conformes : chaque provider départage SES PROPRES conformes, jamais
+    ceux de l'autre (isolation — voir candidates_for_provider).
+    """
+    # Le cooldown est vérifié AVANT toute évaluation ou passation : une
+    # migration inter-provider est encore plus coûteuse qu'une migration
+    # intra-provider, elle doit respecter le même garde-fou anti-ping-pong.
+    cooldown_active = state.check_cooldown()
+    if cooldown_active:
+        elapsed   = time.monotonic() - state.last_migration_ts
+        remaining = config.MIGRATION_COOLDOWN_S - elapsed
+        logger.warning(
+            f"⏳ Cooldown actif — évaluation multi-provider ignorée "
+            f"({C.YELLOW}{remaining:.0f}s{C.RESET} restante(s))"
+        )
+        state.last_decision = {
+            "decision": "stay", "from_vm": None, "to_vm": None,
+            "reason": "Cooldown active", "topsis_score": None, "breach_type": None,
+        }
+        return
+
+    current_provider = config.PROVIDER_OF_VM.get(state.service_vm)
+    if current_provider is None:
+        # VM active hors registre (ex. configuration en cours de migration
+        # topologique) : jamais planter, repli sur le comportement historique.
+        logger.warning(
+            f"⚠️  VM active '{state.service_vm}' absente de PROVIDER_OF_VM — "
+            f"repli sur la décision mono-provider pour ce cycle"
+        )
+        await _decide_mono_provider(client, ctx, prof, current_data)
+        return
+
+    assessment = evaluate_provider(
+        current_provider, state.current_slos, current_data, state.snapshot_predictions
+    )
+
+    collected_lookup   = {lc["vm_id"]: lc for lc in state.last_collected}
+    reliability_scores = {
+        vid: collected_lookup.get(vid, {}).get("reliability", 1.0)
+        for vid in ctx.vm_ids
+    }
+
+    # ── Chemin A : TOPSIS intra-provider sur les seules VMs conformes ─────
+    if assessment.compliant_vms:
+        restricted = [c for c in current_data if c["vm_id"] in assessment.compliant_vms]
+        di_payload = {
+            "current_data":       restricted,
+            "predictions_map":    state.last_predictions,
+            "slos":               state.current_slos,
+            "service_vm":         state.service_vm,
+            "cooldown_active":    cooldown_active,
+            "reliability_scores": reliability_scores,
+            "cycle":              state.cycle_count,
+            "mi_scores":          state.last_mi_scores,
+        }
+        with prof.step("decide_call"):
+            di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
+
+        if di_res:
+            prof.merge(di_res.get("timings"))
+        else:
+            logger.warning(
+                "⚠️  Chemin A — decision_intelligence n'a pas répondu, STAY"
+            )
+            di_res = {
+                "decision": "stay", "from_vm": None, "to_vm": None,
+                "reason": "decision_intelligence indisponible (chemin A)",
+                "topsis_score": None, "breach_type": None,
+            }
+
+        # Classement TOPSIS complet : vm_scores n'est présent que si
+        # decision.py a réellement fait tourner TOPSIS (donc absent sur le
+        # repli "decision_intelligence indisponible" ci-dessus) — {} sinon.
+        topsis_data = {
+            "classement": di_res.get("vm_scores") or {},
+            "retenue":    di_res.get("to_vm"),
+            "score":      di_res.get("topsis_score"),
+        }
+        await _finalize_multi_provider_decision(
+            client, prof, di_res, "A", current_provider, current_provider, assessment,
+            None, topsis_data,
+        )
+        return
+
+    # ── Chemins B / C / D : passation à l'autre provider ──────────────────
+    other_provider = next(
+        (p for p in config.PROVIDER_REGISTRY if p != current_provider), None
+    )
+    if other_provider is None:
+        logger.warning("⚠️  Aucun autre provider déclaré — PLACEMENT_IMPOSSIBLE")
+        await _finalize_multi_provider_decision(
+            client, prof,
+            {
+                "decision": "stay", "from_vm": None, "to_vm": None,
+                "reason": "PLACEMENT_IMPOSSIBLE — aucun autre provider disponible",
+                "topsis_score": None, "breach_type": None,
+            },
+            "D", current_provider, current_provider, assessment,
+        )
+        return
+
+    try:
+        intent = SLOIntent(
+            intent_id=f"cycle-{state.cycle_count}",
+            slos=[SLO(**s) for s in state.current_slos],
+            mode=state._mode,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            attempted_providers=(current_provider,),
+        )
+    except (ValueError, TypeError) as exc:
+        # Ex. aucun SLO actif : rien à négocier. Ne jamais planter le cycle
+        # pour ça — traité comme une impossibilité de placement.
+        logger.warning(
+            f"⚠️  Impossible de construire l'intention pour la passation : {exc}"
+        )
+        await _finalize_multi_provider_decision(
+            client, prof,
+            {
+                "decision": "stay", "from_vm": None, "to_vm": None,
+                "reason": f"PLACEMENT_IMPOSSIBLE — intention invalide ({exc})",
+                "topsis_score": None, "breach_type": None,
+            },
+            "D", current_provider, current_provider, assessment,
+        )
+        return
+
+    offer = assessment.to_offer()
+    handoff_payload = {
+        "slo_intent":         intent.to_dict(),
+        "offer":              offer.to_dict() if offer else None,
+        "target_provider":    other_provider,
+        "from_provider":      current_provider,
+        "incumbent_provider": current_provider,
+        # VM réellement active (en violation) chez l'émetteur. Le receveur en
+        # a besoin pour que TOPSIS s'exécute réellement — voir le
+        # commentaire détaillé dans /intent/relay.
+        "incumbent_vm":       state.service_vm,
+    }
+
+    with prof.step("handoff_call"):
+        try:
+            handoff_res = await _post(
+                client, f"{config.PROVIDER_RELAY_SERVICE_URL}/handoff", handoff_payload
+            )
+        except Exception as exc:
+            # _post capture déjà les erreurs réseau normales et renvoie None ;
+            # ce filet couvre le cas résiduel d'une exception inattendue qui
+            # échapperait malgré tout — une passation ratée ne doit JAMAIS
+            # interrompre le cycle ni empêcher l'audit d'être posté.
+            logger.warning(f"⚠️  Appel au relais /handoff a levé une exception : {exc}")
+            handoff_res = None
+
+    if not handoff_res:
+        # Relais injoignable, ou refus (409 anti-boucle, 502…) : une passation
+        # ratée ne doit jamais interrompre le cycle — STAY et on réessaiera
+        # au prochain cycle.
+        logger.warning(
+            f"⚠️  Passation vers {other_provider} impossible "
+            f"(relais indisponible ou refus) — STAY"
+        )
+        await _finalize_multi_provider_decision(
+            client, prof,
+            {
+                "decision": "stay", "from_vm": None, "to_vm": None,
+                "reason": f"PLACEMENT_IMPOSSIBLE — passation vers {other_provider} refusée",
+                "topsis_score": None, "breach_type": None,
+            },
+            "D", current_provider, current_provider, assessment,
+        )
+        return
+
+    negotiation   = handoff_res.get("negotiation") or {}
+    local_topsis  = handoff_res.get("local_topsis") or {}
+    decision_kind = negotiation.get("decision")
+
+    # Bloc "negotiation" du reasoning d'audit : reprend les données déjà lues
+    # ci-dessus (negotiation, local_topsis) plus l'offre que NOUS avons émise
+    # (offer) et le provider contacté (other_provider) — rien de neuf n'est
+    # recalculé, seulement rassemblé pour le dashboard.
+    negotiation_data: Dict[str, Any] = {
+        "offre_locale":   offer.to_dict() if offer else None,
+        "offre_recue":    handoff_res.get("local_offer"),
+        "deadband":       negotiation.get("deadband_applied"),
+        "decision":       negotiation.get("decision"),
+        "provider_cible": other_provider,
+    }
+
+    if decision_kind == "prend_local_conforme":
+        # ── Chemin B : l'autre provider a des conformes, il choisit lui-même
+        # (isolation) sa VM par TOPSIS — nous ne faisons qu'appliquer son choix.
+        to_vm = local_topsis.get("to_vm")
+        di_res = {
+            "decision":     "migrate" if to_vm and to_vm != state.service_vm else "stay",
+            "from_vm":      state.service_vm if to_vm else None,
+            "to_vm":        to_vm,
+            "reason":       local_topsis.get("reason") or negotiation.get("reason"),
+            "topsis_score": local_topsis.get("topsis_score"),
+            "breach_type":  "inter_provider_handoff",
+        }
+        # Classement TOPSIS du RECEVEUR (isolation : c'est lui qui a fait
+        # tourner TOPSIS sur ses propres conformes) — voir /intent/relay,
+        # qui transmet vm_scores dans local_topsis quand decision.py y a
+        # réellement répondu.
+        topsis_data = {
+            "classement": local_topsis.get("vm_scores") or {},
+            "retenue":    to_vm,
+            "score":      local_topsis.get("topsis_score"),
+        }
+        await _finalize_multi_provider_decision(
+            client, prof, di_res, "B", other_provider, current_provider, assessment,
+            negotiation_data, topsis_data,
+        )
+        return
+
+    if decision_kind == "prend_local_meilleure":
+        # ── Chemin C : personne n'est conforme, l'offre de l'autre gagne.
+        to_vm = negotiation.get("winning_vm")
+        di_res = {
+            "decision":     "migrate" if to_vm and to_vm != state.service_vm else "stay",
+            "from_vm":      state.service_vm if to_vm else None,
+            "to_vm":        to_vm,
+            "reason":       negotiation.get("reason"),
+            "topsis_score": negotiation.get("offered_score"),
+            "breach_type":  "inter_provider_negotiation",
+        }
+        await _finalize_multi_provider_decision(
+            client, prof, di_res, "C", other_provider, current_provider, assessment,
+            negotiation_data,
+        )
+        return
+
+    if decision_kind == "cede_a_l_offre":
+        # ── Chemin C : personne n'est conforme, NOTRE offre gagne — c'est
+        # NOTRE best_effort_vm (calculé localement), pas une valeur reçue.
+        best_vm = assessment.best_effort_vm
+        if best_vm and best_vm != state.service_vm:
+            di_res = {
+                "decision": "migrate", "from_vm": state.service_vm, "to_vm": best_vm,
+                "reason": negotiation.get("reason") or "Négociation gagnée localement",
+                "topsis_score": assessment.best_effort_score,
+                "breach_type": "inter_provider_negotiation",
+            }
+        else:
+            di_res = {
+                "decision": "stay", "from_vm": None, "to_vm": None,
+                "reason": negotiation.get("reason")
+                          or "Négociation gagnée localement — VM déjà active",
+                "topsis_score": assessment.best_effort_score, "breach_type": None,
+            }
+        await _finalize_multi_provider_decision(
+            client, prof, di_res, "C", current_provider, current_provider, assessment,
+            negotiation_data,
+        )
+        return
+
+    # ── Chemin D : aucune_option, ou décision inattendue ───────────────────
+    di_res = {
+        "decision": "stay", "from_vm": None, "to_vm": None,
+        "reason": (
+            f"PLACEMENT_IMPOSSIBLE — {negotiation.get('reason') or 'aucune option exploitable'}"
+        ),
+        "topsis_score": None, "breach_type": None,
+    }
+    await _finalize_multi_provider_decision(
+        client, prof, di_res, "D", current_provider, current_provider, assessment,
+        negotiation_data,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,6 +1484,187 @@ async def receive_intent(payload: Dict[str, Any] = Body(...)):
         f"{'═'*60}"
     )
     return {"status": "accepted", "mode": state._mode, "slos": len(state.current_slos)}
+
+
+@app.post("/intent/relay", status_code=status.HTTP_200_OK)
+async def receive_intent_relay(payload: Dict[str, Any] = Body(...)):
+    """
+    Point de réception d'une passation inter-provider (fédération).
+
+    ⚠️ ENDPOINT PUREMENT OBSERVATOIRE. Il évalue la situation du provider
+    demandé (`acting_as_provider`) au regard de l'intention reçue et renvoie
+    le verdict de négociation — mais il NE MODIFIE AUCUN CHAMP de `state` et
+    NE DÉCLENCHE AUCUNE MIGRATION. Il lit, calcule, répond.
+
+    Le branchement de ce verdict sur une migration réelle est l'objet d'une
+    étape ultérieure. Tant qu'il n'existe pas, cet endpoint est dormant du
+    point de vue du cycle d'orchestration : ni `_run_flow` ni `_step8_decide`
+    ne l'appellent — il n'est atteint que par un appel externe explicite
+    (le microservice `provider_relay`, ou un `curl` de test).
+    """
+    acting_as_provider: Optional[str] = payload.get("acting_as_provider")
+    if acting_as_provider not in config.PROVIDER_REGISTRY:
+        logger.warning(
+            f"⚠️  /intent/relay — acting_as_provider inconnu : {acting_as_provider}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"acting_as_provider '{acting_as_provider}' inconnu de "
+                f"PROVIDER_REGISTRY {sorted(config.PROVIDER_REGISTRY.keys())}"
+            ),
+        )
+
+    if not state.last_collected:
+        logger.warning("⚠️  /intent/relay — hub pas encore chaud (last_collected vide)")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Aucune mesure collectée pour l'instant (last_collected vide)",
+        )
+
+    intent = SLOIntent.from_dict(payload["slo_intent"])
+    offer_data     = payload.get("offer")
+    received_offer = ProviderOffer.from_dict(offer_data) if offer_data else None
+    incumbent_provider: Optional[str] = payload.get("incumbent_provider")
+    # VM réellement active chez l'émetteur (en violation de ses SLOs) — voir
+    # le commentaire détaillé plus bas, à l'endroit où elle est utilisée.
+    incumbent_vm: Optional[str] = payload.get("incumbent_vm")
+
+    # Évaluation PURE (hub/provider_arbitration.py) : lit l'état courant du
+    # hub sans jamais le modifier. Mêmes candidats et mêmes prédictions que
+    # ceux qu'utiliserait le cycle d'orchestration normal pour ce cycle.
+    candidates  = _build_candidates(state.last_collected)
+    predictions = state.snapshot_predictions
+
+    assessment = evaluate_provider(
+        acting_as_provider, list(intent.slos), candidates, predictions
+    )
+    result = negotiate(
+        assessment, received_offer, incumbent_provider_id=incumbent_provider
+    )
+
+    # Trace de relais : marque acting_as_provider comme tenté, sans doubler
+    # l'entrée si l'appelant l'avait déjà fait avant l'envoi.
+    updated_intent = (
+        intent if intent.has_attempted(acting_as_provider)
+        else intent.with_attempt(acting_as_provider)
+    )
+
+    local_offer = assessment.to_offer()
+
+    # ── TOPSIS local, si des VMs conformes existent ────────────────────────
+    # Le receveur choisit LUI-MÊME sa VM parmi ses propres conformes —
+    # isolation : acting_as_provider ne décide jamais pour l'autre provider,
+    # et réciproquement personne ne décide à sa place ici.
+    local_topsis: Optional[Dict[str, Any]] = None
+    if assessment.compliant_vms:
+        restricted = [c for c in candidates if c["vm_id"] in assessment.compliant_vms]
+
+        # ── VM active à déclarer à decision_intelligence ────────────────
+        # ⚠️ CORRECTIF : declarer une VM CONFORME comme "service_vm" court-
+        # circuite TOPSIS. decision.py commence par chercher une violation
+        # SUR la VM active ; si elle est conforme (ce qui est toujours le
+        # cas ici, restricted ne contenant QUE des conformes), il ne trouve
+        # rien, franchit sa barrière "if not primary_violations:" et renvoie
+        # {"decision": "stay", "to_vm": None} sans jamais atteindre TOPSIS.
+        # Résultat observé en prod : le receveur retombe systématiquement
+        # sur le repli "première VM conforme" au lieu du meilleur choix
+        # TOPSIS, même avec plusieurs VMs conformes disponibles.
+        #
+        # Solution : déclarer la VM RÉELLEMENT active — celle de l'émetteur,
+        # qui VIOLE ses SLOs (c'est précisément pour ça qu'il a passé la
+        # main). decision.py y détecte une vraie violation, filtre les
+        # candidats sur les conformes (_filter_candidates), et TOPSIS
+        # s'exécute sur restricted. L'hystérésis _MIGRATION_MARGIN ne bloque
+        # rien : incumbent_vm est absente de `restricted` (elle n'est pas
+        # conforme chez CE provider), donc active_score = vm_scores.get(...,
+        # 0.0) = 0 — la migration est libre.
+        #
+        # Il faut aussi INJECTER cette VM dans current_data : sans ses
+        # métriques, decision.py ne trouve pas de ligne correspondante
+        # (vm_data = {}, valeurs à 0.0) et ne détecte toujours aucune
+        # violation. Elle vient de `candidates` (_build_candidates), pas de
+        # `restricted` — c'est la VM de L'AUTRE provider, jamais dans le
+        # pool restreint à CE provider.
+        #
+        # Divulgation acceptée : le receveur apprend l'identifiant de la VM
+        # active de l'émetteur. Divulgation marginale — il connaissait déjà
+        # `incumbent_provider`, donc déjà quel provider est en difficulté.
+        #
+        # Repli sûr : si incumbent_vm est absent, ou introuvable dans les
+        # mesures collectées (VM inconnue, hub pas synchronisé...), on
+        # revient au comportement précédent — jamais d'exception.
+        incumbent_candidate = next(
+            (c for c in candidates if c["vm_id"] == incumbent_vm), None
+        ) if incumbent_vm else None
+
+        if incumbent_candidate is not None:
+            decide_current_data = restricted + [incumbent_candidate]
+            decide_service_vm   = incumbent_vm
+        else:
+            decide_current_data = restricted
+            decide_service_vm   = assessment.compliant_vms[0]
+
+        di_payload = {
+            "current_data":       decide_current_data,
+            "predictions_map":    predictions,
+            "slos":               [s.dict() for s in intent.slos],
+            # Le receveur n'héberge pas encore le service : aucun cooldown à
+            # respecter pour une prise en charge initiale — sinon TOPSIS ne
+            # tournerait jamais sur ce chemin.
+            "service_vm":         decide_service_vm,
+            "cooldown_active":    False,
+            "reliability_scores": {
+                lc["vm_id"]: lc.get("reliability", 1.0) for lc in state.last_collected
+            },
+            "cycle":              state.cycle_count,
+            "mi_scores":          state.last_mi_scores,
+        }
+        async with httpx.AsyncClient() as di_client:
+            di_res = await _post(
+                di_client, f"{_URLS['decision_intelligence']}/decide", di_payload
+            )
+
+        if di_res and di_res.get("to_vm"):
+            local_topsis = {
+                "to_vm":        di_res["to_vm"],
+                "topsis_score": di_res.get("topsis_score"),
+                "reason":       di_res.get("reason"),
+                # Classement complet (toutes les VMs conformes du receveur,
+                # pas seulement la gagnante) — transmis à l'émetteur pour
+                # que son bloc d'audit "reasoning.topsis" (chemin B) puisse
+                # justifier "pourquoi cette VM plutôt qu'une autre" côté
+                # RECEVEUR. {} si decision.py ne l'a pas renvoyé (ancien
+                # format, ou chemin qui n'a jamais atteint TOPSIS).
+                "vm_scores":    di_res.get("vm_scores") or {},
+            }
+        else:
+            # decision_intelligence indisponible ou sans candidat : repli
+            # déterministe sur la première VM conforme, signalé dans reason.
+            local_topsis = {
+                "to_vm":        assessment.compliant_vms[0],
+                "topsis_score": None,
+                "reason": (
+                    "decision_intelligence indisponible ou sans candidat — "
+                    "repli sur la première VM conforme"
+                ),
+                "vm_scores":    {},
+            }
+
+    logger.info(
+        f"📡 /intent/relay — acting_as={C.CYAN}{acting_as_provider}{C.RESET} "
+        f"| décision : {C.YELLOW}{result.decision.value}{C.RESET} "
+        f"| {result.reason}"
+    )
+
+    return {
+        "acting_as_provider":  acting_as_provider,
+        "negotiation":         result.to_dict(),
+        "local_offer":         local_offer.to_dict() if local_offer else None,
+        "local_topsis":        local_topsis,
+        "attempted_providers": list(updated_intent.attempted_providers),
+        "timestamp":           datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/data")
