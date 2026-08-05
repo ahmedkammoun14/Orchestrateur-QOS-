@@ -38,10 +38,12 @@ In modern distributed environments, maintaining consistent performance is a chal
 - Dynamically discovers critical metrics via Mutual Information (MI k-NN, Kozachenko-Leonenko estimator).
 - Predicts future violations using ML models (ESN, LSTM, GRU, RNN) via a 3-level prediction cascade over a configurable horizon.
 - Makes optimal migration decisions toward the best VM (Edge or Cloud) using the multicriteria TOPSIS algorithm.
-- Arbitrates between **two independent infrastructure providers**, each spanning both tiers, through an HTTP negotiation protocol (see [Multi-Provider Federation](#multi-provider-federation)).
+- Arbitrates between **two independent infrastructure providers** — 8 VMs, 4 per provider, each spanning both tiers — through a **Contract Net Protocol** negotiation over HTTP (see [Multi-Provider Federation](#multi-provider-federation)).
+
+Each provider runs its **own complete orchestrator stack** (12 microservices), the second one offset by `PORT_OFFSET=100`. Neither is a master: whichever hosts the service is `ACTIVE`, the other is `STANDBY`, and the role follows the service across migrations.
 
 The system operates in two modes:
-- **Autonomous** — fixed business objective (latency < 100 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
+- **Autonomous** — fixed business objective (latency < 40 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
 - **Enhanced** — SLOs injected by the user via natural language (LLM also assigns each SLO's **weight** and decides the **merge_strategy** — REPLACE or ADDITIVE — against active SLOs), enriched by MI-driven secondary SLOs.
 
 ---
@@ -65,8 +67,10 @@ The system follows a **Hub-and-Spoke** pattern: the `Hub` (Orchestrator Core) ce
                   ▼
 [ PiCar-X ] ──► [ Latency Manager ] ──► [ HUB (Core) ] ──► [ Observability ]
                                               │  ▲
+                                              │  ├── [ Placement Arbiter ]  (:8011)
+                                              │  │      elects the winning bid
                                               │  └── [ Provider Relay ] ◄── peer orchestrator
-                                              │        (:8010, POST /handoff)
+                                              │        (:8010, Contract Net)
          ┌──────────┬──────────────┬──────────┴──────────────────┐
          │          │              │                              │
    [ Collector ] [ ML Predictor ] [ Metrics Manager ] [ Decision Intelligence ]
@@ -89,14 +93,22 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 
 ## Multi-Provider Federation
 
-The orchestrator arbitrates between **two independent infrastructure providers**. The partition is **transversal**: each provider owns one VM in *every* tier, so provider identity and edge/cloud tier are orthogonal dimensions.
+The orchestrator arbitrates between **two independent infrastructure providers**. The partition is **transversal**: each provider owns VMs in *every* tier, so provider identity and edge/cloud tier are orthogonal dimensions.
 
-| Provider | Edge VM | Cloud VM | Kubernetes PoP label |
+| Provider | Edge VMs | Cloud VM | Kubernetes PoP label |
 |---|---|---|---|
-| `provider-1` | edge1 | cloud1 | `space_1` |
-| `provider-2` | edge2 | cloud2 | `space_2` |
+| `provider-1` | edge1, edge1b, edge1c | cloud1 | `space_1` |
+| `provider-2` | edge2, edge2b, edge2c | cloud2 | `space_2` |
 
 Declared in `shared/config.py` → `PROVIDER_REGISTRY` (single source of truth; `PROVIDER_OF_VM` is derived from it).
+
+### Two processes, one federation
+
+Each provider runs a **complete, independent stack** of 12 microservices. `PORT_OFFSET` shifts the second one by +100 (hub 8000 → 8100, relay 8010 → 8110, …), and `REDIS_DB` isolates their state (DB 0 / DB 1). Two components are **shared**, not duplicated: the OpenStack client (`:8024`, it drives a single Kubernetes cluster) and the read-only Federation View (`:8500`).
+
+There is no master. The provider hosting the service is `ACTIVE` and drives the decision cycle; the other is `STANDBY` and only answers bids. The role **follows the service** — an inter-provider migration swaps the two.
+
+> **kubectl granularity.** The 8 VMs are simulated on 4 Kubernetes nodes: `edge1`, `edge1b` and `edge1c` share one physical node. `kubectl` therefore resolves to the *node* and always reports the canonical VM of that node. When our own `service_vm` sits on the same node as kubectl's answer, our value is the finer one and is kept; otherwise kubectl wins. See the placement-group table in `shared/config.py` and `NODE_VM_MAP` in `openstack_client.py`.
 
 ### Why TOPSIS scores cannot be compared across providers
 
@@ -104,40 +116,68 @@ TOPSIS normalises each criterion with **min-max over its own candidate pool**. A
 
 Each provider consequently runs TOPSIS **only on its own compliant VMs**, never on a mixed pool — `candidates_for_provider()` enforces the isolation.
 
-### The violation score — the only valid inter-provider metric
+### The Gap Grade — the only valid inter-provider metric
 
-To compare providers, the system uses a **normalised weighted mean of relative SLO excesses**:
+Cross-provider comparison uses an **augmented Tchebycheff scalarisation** (Steuer & Choo, 1983), computed over the **primary SLOs only**:
 
 ```
-violation_score = Σ(wᵢ × excessᵢ) / Σ(wᵢ)
+δᵢ = (vᵢ − τᵢ) / τᵢ        cost criteria    (lower is better)
+δᵢ = (τᵢ − vᵢ) / τᵢ        benefit criteria
+δᵢ floored at −1
+
+G = ( max(wᵢ·δᵢ) + ρ · Σ(wᵢ·δᵢ) ) / (1 + ρ)         ρ = GAP_GRADE_RHO = 0.1
 ```
 
-`0.0` means every SLO is satisfied; lower is better. The division by `Σ(wᵢ)` is not cosmetic — without it, a provider evaluated on fewer metrics would score artificially better than one evaluated on more.
+Weights are renormalised so `Σwᵢ = 1`. A negative `G` means every primary SLO is met with margin; a positive `G` quantifies the worst relative breach. The `max` term makes the metric **pessimistic** — a provider cannot hide one bad metric behind several good ones — while the small `ρ·Σ` term breaks ties between candidates sharing the same worst criterion.
 
-> **Two scores, opposite polarities.** TOPSIS closeness ∈ [0,1], **higher is better** (`max`). Violation score ∈ [0,+∞), **lower is better** (`min`). The two are never compared against one another.
+Unlike a TOPSIS closeness, `G` is measured against **absolute thresholds** rather than a candidate pool, which is precisely what makes it comparable across providers.
 
-### Negotiation protocol
+> **Two scores, opposite polarities.** TOPSIS closeness ∈ [0,1], **higher is better**, meaningful only *within* one provider's pool. Gap Grade ∈ [−1,+∞), **lower is better**, meaningful *across* providers. The two are never compared against one another.
 
-`negotiate()` (`hub/provider_arbitration.py`) applies a strict decision order:
+### Contract Net Protocol
 
-1. **Compliance wins outright** — if the local provider holds any VM satisfying *all* SLOs, it takes the service and TOPSIS elects which one. No score comparison happens at all.
-2. No offer received → fall back on the best local VM.
-3. Nothing usable locally → cede to the received offer.
-4. Otherwise → compare violation scores, **dead-band included**.
+Federated placement follows the **Contract Net Protocol** (Smith, *IEEE Trans. Computers*, 1980; later FIPA-standardised). The provider that detects the violation becomes the **initiator** — this is a role, not a fixed coordinator: any provider can play it.
 
-The **dead-band** (`NEGOTIATION_DEADBAND = 0.05`) protects the *incumbent provider*: a challenger must beat it by more than 0.05 in absolute terms. An absolute band is used rather than a relative margin — near a threshold, a relative margin lets a sub-millisecond difference trigger a migration.
+1. The initiator detects a violation on a **primary** SLO (the gate — secondaries never trigger a migration).
+2. It builds its own bid locally **and** broadcasts the SLO contract to its peers — **in parallel** (`asyncio.gather`), since the two are independent.
+3. Each peer evaluates *its own* VMs, runs TOPSIS on its compliant pool, and returns a single bid: champion VM + Gap Grade.
+4. The initiator forwards every bid to **its own** Placement Arbiter (`:8011`).
+5. The arbiter elects the winner, dead-band included, and returns the decision.
+6. The initiator applies it — local migration, or **award** to the winning peer, which then becomes `ACTIVE`.
+
+`SLO_ENFORCEMENT = "hard"`: a non-compliant placement is **never** elected. If no VM anywhere satisfies the primaries, the outcome is `INFEASIBLE` and the service stays where it is.
+
+The **dead-band** (`ARBITER_DEADBAND = 0.05`) protects the incumbent: a challenger must beat it by more than 0.05. The band is **absolute, not relative** — the Gap Grade is already normalised by the threshold, so 0.05 reads directly as *"must win by more than 5 % of the threshold"* (2 ms on a 40 ms SLO). It is an engineering parameter, not a measured one.
 
 Note the deliberate asymmetry: the dead-band guards **provider** changes; a VM change *within* the winning provider is guarded only by the temporal `MIGRATION_COOLDOWN_S`.
 
+### Shared SLO contract
+
+A client does not know which provider hosts the service, so an intention may legitimately land on a `STANDBY`. Two mechanisms keep the contract consistent across the federation:
+
+- **Propagation** — the hub receiving an intention forwards it to its peers (`/intent/propagate` → `/inbound/intent`), with an anti-loop guard on the inbound path.
+- **Adoption** — the broadcast carries the initiator's *complete* contract: primaries **and** secondaries, each with its `weight` and its `is_primary` flag. A `STANDBY` records it as its own current contract instead of using it once and discarding it — so the TOPSIS compliance filter keeps working identically on both sides.
+
+A `STANDBY` no longer recomputes its SLOs by MI: only the `ACTIVE` provider hosts the service, hence only it holds an exploitable history. The direct `/intent` path and the award path are both guarded by `intent_version` — a late intention can never overwrite a more recent one.
+
 ### Transport
 
-`services/provider_relay/` (port 8010) is a **pure transport gateway** — it carries `POST /handoff` between orchestrators and holds no decision logic whatsoever (an anti-loop guard returns 409 on a relayed intent bouncing back). HTTP/JSON serialisation also provides intent isolation: one provider cannot mutate the other's SLO objects by reference.
+`services/provider_relay/` (port 8010 / 8110) is a **pure transport gateway** — it carries messages between orchestrators and holds no decision logic whatsoever. Each outbound route has an `/inbound/…` counterpart on the peer, and the inbound side carries the anti-loop guard.
 
-`PROVIDER_ORCHESTRATOR_URL` is the only place in the codebase that knows the topology. Moving from a single process to N real orchestrators means changing those URLs — and nothing else.
+| Outbound | Inbound on the peer | Carries |
+|---|---|---|
+| `POST /broadcast` | `POST /inbound/evaluate` | SLO contract → returns the peer's bid |
+| `POST /award` | `POST /inbound/award` | placement decision → the peer becomes `ACTIVE` |
+| `POST /intent/propagate` | `POST /inbound/intent` | user intention + `intent_version` |
+| `POST /handoff` | `POST /inbound` | legacy direct handoff (pre-Contract-Net) |
+
+HTTP/JSON serialisation also provides intent isolation: one provider cannot mutate the other's SLO objects by reference.
+
+`ORCHESTRATOR_URL_PROVIDER_*` and `RELAY_URL_PROVIDER_*` are the only places in the codebase that know the topology. Scaling to N real orchestrators means changing those URLs — and nothing else.
 
 ### Feature flag
 
-`MULTI_PROVIDER_ENABLED` (default **`false`**) gates the entire state machine. When off, the cycle behaves exactly as before the extension. `start_all_multi.ps1` sets it to `true`.
+`MULTI_PROVIDER_ENABLED` (default **`false`**) gates the entire state machine. When off, the cycle behaves exactly as before the extension. `launch_provider.py` sets it to `true`.
 
 ---
 
@@ -150,7 +190,7 @@ Note the deliberate asymmetry: the dead-band guards **provider** changes; a VM c
 - **Transversal multi-provider arbitration**: two providers, each spanning both tiers, negotiating over HTTP with an absolute dead-band. TOPSIS stays confined to a single provider's compliant VMs; the normalised violation score is the only cross-provider comparison. See [Multi-Provider Federation](#multi-provider-federation).
 - **Compliance as a strict gate**: a VM satisfying *all* SLOs always outranks a non-compliant one, however small the latter's violation. The violation score only breaks ties *among non-compliant VMs* — it is never weighed against a compliant one.
 - **MI k-NN (Kozachenko-Leonenko)**: continuous Mutual Information estimator — replaces the old 2×2 contingency table. No discretization, detects non-linear dependencies, robust from ~15 points per class. Formula: `MI(X;Y) = H(X) − H(X|Y)`, normalized by `H(Y)` → score in [0, 1].
-- **3-level ML prediction cascade**: Level 1 — `POST /predict_sequence` (full window, horizon 7); Level 2 — `GET /predict?input_data=X` (single point); Level 3 — `last_value_fallback`. Each level activates only if the previous fails.
+- **3-level ML prediction cascade**: Level 1 — `POST /predict_sequence` (full window, horizon 7); Level 2 — `GET /predict?input_data=X` (single point); Level 3 — `last_value_fallback`. Each level activates only if the previous fails. Level 1 is **skipped silently** while the history is shorter than the model's `window_size`, which is what makes the warm-up period observable. Measured over a 10-minute two-provider session, *after* warm-up: **77.5 % Level 1**, 3 % Level 2, 19 % Level 3 — the residual falls concern latency only and trace back to contention on the single-worker latency API, not to a logic fault.
 - **ESN (Echo State Network)**: reservoir computing model with a recursive multi-step strategy for horizon > 1. Trained via `/main` endpoint on historical datasets. Fixed for correct 2D input shape (flatten before recursive loop).
 - **YAML_PER_VM mapping**: each VM maps to the correct Kubernetes YAML file matching its PoP label (`space_1` → edge1/cloud1, `space_2` → edge2/cloud2). Ensures pods land on the correct physical node after migration.
 - **5-step MI visualization**: the `metrics_manager` terminal displays a detailed step-by-step k-NN pipeline (H(X), H(X|Y=1), H(X|Y=0), weighted average, final score) with ASCII tables for each metric at every cycle.
@@ -295,10 +335,19 @@ BOOTSTRAP_MIN=5
 HISTORY_WINDOW=50             # must be >= each ML model's window_size (see note below)
 
 # Multi-provider federation
-MULTI_PROVIDER_ENABLED=false  # OFF by default; start_all_multi.ps1 sets it to true
+MULTI_PROVIDER_ENABLED=false  # OFF by default; launch_provider.py sets it to true
+PROVIDER_ID=provider-1        # identity of THIS stack — "all" disables the partition
+PORT_OFFSET=0                 # 100 for the provider-2 stack (hub 8100, relay 8110…)
+REDIS_DB=0                    # 1 for provider-2 — state isolation between stacks
 PROVIDER_RELAY_PORT=8010
-ORCHESTRATOR_URL_PROVIDER_1=http://localhost:8000   # same hub in single-process mode
-ORCHESTRATOR_URL_PROVIDER_2=http://localhost:8000   # point elsewhere for N real orchestrators
+PLACEMENT_ARBITER_PORT=8011
+FEDERATION_VIEW_PORT=8500
+ARBITER_DEADBAND=0.05         # ABSOLUTE band on the Gap Grade, not a relative margin
+SLO_ENFORCEMENT=hard          # "hard": never elect a non-compliant placement
+ORCHESTRATOR_URL_PROVIDER_1=http://localhost:8000
+ORCHESTRATOR_URL_PROVIDER_2=http://localhost:8100
+RELAY_URL_PROVIDER_1=http://localhost:8010
+RELAY_URL_PROVIDER_2=http://localhost:8110
 
 # ML APIs
 ML_RTT_URL=http://localhost:5001/predict
@@ -372,12 +421,32 @@ sudo service redis-server start
 
 # Ollama (local LLM fallback)
 ollama serve
-
-# Flush Redis before a clean restart
-redis-cli FLUSHDB
 ```
 
-### Launch Order (respect the order — the Hub checks health at startup)
+### Recommended — one command per provider
+
+`launch_provider.py` starts a **complete stack** (11 spokes + hub) in a single window, prefixing each line with its service name. It sets `PROVIDER_ID`, `PORT_OFFSET`, `REDIS_DB` and `MULTI_PROVIDER_ENABLED=true`, and **purges that provider's Redis database before starting**.
+
+```powershell
+# UTF-8 is required, otherwise the log-capture threads die on the first accented character
+$env:PYTHONIOENCODING="utf-8"; [Console]::OutputEncoding=[Text.Encoding]::UTF8
+
+python launch_provider.py --provider provider1    # hub 8000, relay 8010, arbiter 8011, Redis DB 0
+python launch_provider.py --provider provider2    # hub 8100, relay 8110, arbiter 8111, Redis DB 1
+```
+
+Then, once, the two shared components:
+
+```bash
+python -m infrastructure.openstack_client     # :8024 — deployed on the OpenStack master
+python -m services.federation_view.app        # :8500 — read-only federated view
+```
+
+> **Why the Redis purge matters.** Redis runs outside the stack and survives its shutdown. The metric lists keep the last `HISTORY_WINDOW` points (LTRIM), including the previous session's. On restart, the prediction window would hold yesterday's data, then a *mix* of two sessions — an artificial step in the middle of the window that the GRU has never seen in training, sending predictions far off. Purging removes that failure mode entirely; measured effect on the out-of-bounds clamp rate: **7.6 % → 2.3 %**. Use `--keep-redis` to opt out (not recommended).
+
+> **Warm-up.** Level 1 of the prediction cascade is skipped until the history reaches the model's `window_size`. At `look_back = 45` and a ~6 s cycle, that is **≈ 4 min 30** during which predictions come from `last_value_fallback` and proactive detection is inactive. Do not measure anything before that point.
+
+### Manual launch order (respect the order — the Hub checks health at startup)
 
 ```bash
 python -m services.database.app              # 1. Port 8006
@@ -390,11 +459,12 @@ python -m infrastructure.openstack_client    # 7. Port 8024
 python -m services.intent_manager.app        # 8. Port 8002
 python -m services.latency_manager.app       # 9. Port 8001
 python -m services.observability.app         # 10. Port 8009
-python -m services.provider_relay.app        # 11. Port 8010 (multi-provider only)
-python -m hub.orchestrator_core              # 12. Port 8000
+python -m services.placement_arbiter.app     # 11. Port 8011 (multi-provider only)
+python -m services.provider_relay.app        # 12. Port 8010 (multi-provider only)
+python -m hub.orchestrator_core              # 13. Port 8000
 ```
 
-On Windows, `start_all_multi.ps1` launches all of the above in separate windows, sets `MULTI_PROVIDER_ENABLED=true`, and tees each service's output to `logs/<run>/`.
+Add `PORT_OFFSET=100` to every command to obtain the provider-2 stack. `infrastructure.openstack_client` (`:8024`) is **shared** and must be started only once.
 
 > **After retraining any ML model, restart `ml_predictor`.** It reads each model's `window_size` **once, at startup** (`services/ml_predictor/app.py`). Retraining can change that value; the predictor would then send a wrongly-sized sequence, the API would answer `400`, and the cascade would fall through to `last_value_fallback` — silently, and permanently. The tell-tale sign is a prediction *exactly equal to the measurement and identical across all 7 horizons*: that is the fallback, not a well-fitted model.
 
@@ -414,11 +484,20 @@ On Windows, `start_all_multi.ps1` launches all of the above in separate windows,
 | History Loader | 8007 | Historical windowing |
 | Decision Intelligence | 8008 | TOPSIS + violation detection |
 | Observability | 8009 | Real-time dashboard + reasoning panel |
-| Provider Relay | 8010 | Inter-orchestrator transport — `POST /handoff` |
+| Provider Relay | 8010 | Inter-orchestrator transport (Contract Net) |
+| Placement Arbiter | 8011 | Elects the winning bid — `POST /arbitrate` |
+
+Every port above belongs to **one provider stack** and is shifted by `PORT_OFFSET` for the second one: provider-2's hub is 8100, its relay 8110, its arbiter 8111, its dashboard 8109.
+
+The following are **shared** by both stacks and started once:
+
+| Service | Port | Role |
+|---|---|---|
 | OpenStack Client | 8024 | kubectl migrations (on master 194.199.113.8) |
-| ML API — Latency | 5001 | ESN/LSTM model for latency prediction |
-| ML API — CPU | 5002 | ESN/LSTM model for cpu_usage prediction |
-| ML API — RAM | 5003 | ESN/LSTM model for ram_usage prediction |
+| Federation View | 8500 | Read-only federated view + operator controls (`/api/intent`, `/api/reset`) |
+| ML API — Latency | 5001 | GRU model for latency prediction |
+| ML API — CPU | 5002 | GRU model for cpu_usage prediction |
+| ML API — RAM | 5003 | GRU model for ram_usage prediction |
 
 ---
 
@@ -495,7 +574,9 @@ pytest tests/unit/
 pytest tests/integration/
 ```
 
-**184 tests**, across 19 unit modules. Multi-provider coverage: `test_provider_registry.py` (registry consistency), `test_provider_arbitration.py` (violation score, `negotiate()`, dead-band), `test_provider_relay.py` (transport + anti-loop guard), `test_hub_relay_endpoint.py`, `test_multi_provider_flow.py` (paths A/B/C/D), `test_multi_provider_reasoning.py` (audit block), `test_slo_intent.py` (immutable intent).
+**354 tests**, across 29 unit modules.
+
+Federation coverage: `test_provider_registry.py` (registry consistency), `test_provider_arbitration.py` (Gap Grade, dead-band), `test_gap_grade.py` (augmented Tchebycheff), `test_provider_bid.py` (bid construction), `test_relay_broadcast.py` and `test_provider_relay.py` (transport + anti-loop guard), `test_placement_arbiter.py` (election), `test_award_message.py` and `test_ceding_provider.py` (handover), `test_active_standby_role.py` (role follows the service), `test_federated_cycle.py` (end-to-end cycle), `test_multi_provider_flow.py` (paths A/B/C/D), `test_federated_reasoning.py` and `test_multi_provider_reasoning.py` (audit block), `test_node_granularity.py` (kubectl node vs simulated VM), `test_federation_view.py`, `test_slo_intent.py` (immutable intent).
 
 No test opens a socket: `_post`, `_post_audit` and `_execute_kubectl_migration` are mocked. Coroutines are driven through a local `_run()` helper, as `pytest-asyncio` is deliberately not a dependency.
 
@@ -535,8 +616,11 @@ qos-orchestrator/
 │   ├── metrics_manager/              # MI k-NN scoring + adaptive percentile
 │   ├── ml_predictor/                 # 3-level prediction cascade orchestrator
 │   ├── observability/                # Real-time SSE dashboard + reasoning panel
+│   ├── placement_arbiter/            # Bid election (:8011) — POST /arbitrate
+│   ├── federation_view/              # Read-only federated view (:8500, shared)
+│   │                                 # + operator controls: /api/intent, /api/reset
 │   └── provider_relay/               # Inter-orchestrator transport (:8010)
-│                                     # POST /handoff — no decision logic
+│                                     # broadcast / award / intent — no decision logic
 ├── shared/
 │   ├── config.py                     # Ports, METRICS_REGISTRY, SLO bounds
 │   ├── models.py                     # Pydantic models (SLO, RTTMeasurement…)
@@ -546,7 +630,9 @@ qos-orchestrator/
 │   └── integration/                  # Full hub → services cycle
 ├── infrastructure/openstack_client.py # kubectl migrations — deployed on master :8024
 │                                     # YAML_PER_VM: space_1→edge1/cloud1, space_2→edge2/cloud2
-├── start_all_multi.ps1               # Windows launcher — all services + log capture
+├── launch_provider.py                # Launcher — one full stack per provider,
+│                                     # single window, automatic Redis purge
+├── start_all_multi.ps1               # Legacy Windows launcher (single-process mode)
 ├── PLAN_MULTI_PROVIDER_TRANSVERSAL.md    # Design rationale & locked trade-offs (FR)
 ├── SUIVI_MULTI_PROVIDER_TRANSVERSAL.md   # Step-by-step verification journal (FR)
 ├── GUIDE_TEST_MULTI_PROVIDER.md          # Manual test scenarios (FR)
@@ -575,12 +661,23 @@ qos-orchestrator/
 - [x] 3-level ML prediction cascade (sequence → point → last_value_fallback)
 - [x] Transversal multi-provider partition — each provider spans both tiers (`PROVIDER_REGISTRY`)
 - [x] Normalised violation score as the only valid inter-provider comparison metric
-- [x] HTTP negotiation protocol with absolute dead-band (`negotiate()`, `NEGOTIATION_DEADBAND`)
+- [x] HTTP negotiation protocol with absolute dead-band — `negotiate()` (legacy handoff), then `arbitrate()` (`ARBITER_DEADBAND`)
 - [x] Provider Relay transport gateway with anti-loop guard (:8010)
 - [x] `MULTI_PROVIDER_ENABLED` feature flag — non-regression safety, OFF by default
 - [x] Reasoning panel in the dashboard — the 5 decision steps, per-VM justification
-- [ ] Distributed deployment — one orchestrator process per provider (only `PROVIDER_ORCHESTRATOR_URL` changes)
+- [x] Distributed deployment — one full orchestrator stack per provider (`PORT_OFFSET`, separate Redis DB)
+- [x] Contract Net Protocol — broadcast → bids → arbitration → award, initiator as a role
+- [x] Gap Grade — augmented Tchebycheff scalarisation (Steuer & Choo 1983) as the inter-provider metric
+- [x] Placement Arbiter as a dedicated microservice (`:8011`)
+- [x] Federated view with operator controls (`:8500`)
+- [x] Shared SLO contract — propagation to peers + adoption by the `STANDBY`, versioned by `intent_version`
+- [x] Bid and broadcast issued in parallel (`asyncio.gather`)
+- [x] 8 simulated VMs over 4 Kubernetes nodes, with kubectl-granularity handling
+- [x] Automatic Redis purge at stack startup — removes cross-session prediction drift
+- [ ] Version guard on the broadcast contract adoption (the `/intent` and award paths already have it)
 - [ ] Version the deployed per-VM latency scripts (see the versioning gap noted above)
+- [ ] Calibrate `MI_RELATIVE_THRESHOLD` by permutation test (currently a fixed 0.15)
+- [ ] Retrain the ML models on a dataset matching the real value and jump distributions
 - [ ] Experimental validation — negotiation overhead measurement
 - [ ] Docker + docker-compose containerization
 - [ ] Multi-user support and intent isolation
