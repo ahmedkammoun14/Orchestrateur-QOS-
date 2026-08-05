@@ -1,9 +1,22 @@
 import os
 from typing import Dict, Any
 
+# ── Déploiement distribué (multi-provider, multi-stack) ────────
+# PROVIDER_ID : quelle partition CE PROCESSUS orchestre. "all" (défaut) =
+# comportement mono-processus actuel, inchangé. "provider-1"/"provider-2" =
+# ne collecte/orchestre QUE les VMs de ce provider — permet de faire tourner
+# deux stacks orchestrateur complètes en parallèle sur le même PC.
+PROVIDER_ID: str = os.getenv("PROVIDER_ID", "all")
+
+# PORT_OFFSET : décale les ports PAR-PROVIDER pour que les deux stacks
+# coexistent sur localhost sans collision. Les ports PARTAGÉS (relais
+# inter-provider, client OpenStack/kubectl) ne sont PAS décalés — un seul
+# exemplaire de ces deux services suffit pour les deux stacks.
+PORT_OFFSET: int = int(os.getenv("PORT_OFFSET", 0))
+
 # ── Network ───────────────────────────────────────────────────
 HUB_HOST: str = os.getenv("HUB_HOST", "localhost")
-HUB_PORT: int = int(os.getenv("HUB_PORT", 8000))
+HUB_PORT: int = int(os.getenv("HUB_PORT", 8000)) + PORT_OFFSET
 
 # ── Hub endpoints ─────────────────────────────────────────────
 HUB_RTT_URL:    str = f"http://{HUB_HOST}:{HUB_PORT}/rtt"
@@ -12,18 +25,27 @@ HUB_STATS_URL:  str = f"http://{HUB_HOST}:{HUB_PORT}/status"
 CORE_URL:       str = f"http://{HUB_HOST}:{HUB_PORT}"
 
 # ── Ports services ────────────────────────────────────────────
-LATENCY_PORT                 = int(os.getenv("LATENCY_PORT",                 8001))
+# PORT_OFFSET s'applique à tous les ports PAR-PROVIDER ci-dessous, y compris
+# le relais (chaque provider a désormais SON relais). Seul le client
+# OpenStack/kubectl reste mutualisé et non décalé.
+LATENCY_PORT                 = int(os.getenv("LATENCY_PORT",                 8001)) + PORT_OFFSET
 LATENCY_MANAGER_PORT         = LATENCY_PORT
-INTENT_MANAGER_PORT          = int(os.getenv("INTENT_MANAGER_PORT",          8002))
-ML_PREDICTOR_PORT            = int(os.getenv("ML_PREDICTOR_PORT",            8003))
-METRICS_MANAGER_PORT         = int(os.getenv("METRICS_MANAGER_PORT",         8004))
-COLLECTOR_PORT               = int(os.getenv("COLLECTOR_PORT",               8005))
-DATABASE_PORT                = int(os.getenv("DATABASE_PORT",                8006))
-HISTORY_LOADER_PORT          = int(os.getenv("HISTORY_LOADER_PORT",          8007))
-DECISION_INTELLIGENCE_PORT   = int(os.getenv("DECISION_INTELLIGENCE_PORT",   8008))
-OBSERVABILITY_PORT           = int(os.getenv("OBSERVABILITY_PORT",           8009))
+INTENT_MANAGER_PORT          = int(os.getenv("INTENT_MANAGER_PORT",          8002)) + PORT_OFFSET
+ML_PREDICTOR_PORT            = int(os.getenv("ML_PREDICTOR_PORT",            8003)) + PORT_OFFSET
+METRICS_MANAGER_PORT         = int(os.getenv("METRICS_MANAGER_PORT",         8004)) + PORT_OFFSET
+COLLECTOR_PORT               = int(os.getenv("COLLECTOR_PORT",               8005)) + PORT_OFFSET
+DATABASE_PORT                = int(os.getenv("DATABASE_PORT",                8006)) + PORT_OFFSET
+HISTORY_LOADER_PORT          = int(os.getenv("HISTORY_LOADER_PORT",          8007)) + PORT_OFFSET
+DECISION_INTELLIGENCE_PORT   = int(os.getenv("DECISION_INTELLIGENCE_PORT",   8008)) + PORT_OFFSET
+OBSERVABILITY_PORT           = int(os.getenv("OBSERVABILITY_PORT",           8009)) + PORT_OFFSET
+PLACEMENT_ARBITER_PORT       = int(os.getenv("PLACEMENT_ARBITER_PORT",       8011)) + PORT_OFFSET
 OPENSTACK_CLIENT_PORT        = int(os.getenv("OPENSTACK_CLIENT_PORT",        8024))
-PROVIDER_RELAY_PORT          = int(os.getenv("PROVIDER_RELAY_PORT",          8010))
+
+# Relais : port PAR-PROVIDER (décalé), mais _RELAY_BASE_PORT sert aussi de
+# valeur par défaut à PROVIDER_RELAY_URLS ci-dessous (mono-processus : les
+# deux providers pointent sur l'unique relais de base).
+_RELAY_BASE_PORT = 8010
+PROVIDER_RELAY_PORT = int(os.getenv("PROVIDER_RELAY_PORT", _RELAY_BASE_PORT)) + PORT_OFFSET
 
 # ── URLs services ────────────────────────────────────────────
 DATABASE_SERVICE_URL              = f"http://{HUB_HOST}:{DATABASE_PORT}"
@@ -34,6 +56,7 @@ METRICS_MANAGER_SERVICE_URL       = f"http://{HUB_HOST}:{METRICS_MANAGER_PORT}"
 DECISION_INTELLIGENCE_SERVICE_URL = f"http://{HUB_HOST}:{DECISION_INTELLIGENCE_PORT}"
 OPENSTACK_CLIENT_SERVICE_URL      = f"http://{HUB_HOST}:{OPENSTACK_CLIENT_PORT}"
 PROVIDER_RELAY_SERVICE_URL        = f"http://{HUB_HOST}:{PROVIDER_RELAY_PORT}"
+PLACEMENT_ARBITER_SERVICE_URL     = f"http://{HUB_HOST}:{PLACEMENT_ARBITER_PORT}"
 
 # ── Redis ─────────────────────────────────────────────────────
 REDIS_HOST: str = os.getenv("REDIS_HOST",  "127.0.0.1")
@@ -45,14 +68,25 @@ HISTORY_WINDOW:   int = 50
 DECISIONS_FIFO:   int = 50
 HISTORY_SIZE:     int = int(os.getenv("HISTORY_SIZE", 100))
 
+# ── Suffixe par provider (classeurs Excel) ────────────────────
+# Chaque stack écrit dans SON propre classeur. Sans ce suffixe, les deux
+# providers ouvrent et réécrivent le MÊME fichier en boucle : openpyxl le
+# relit corrompu (« Bad magic number for file header »), le recrée, et des
+# lignes de mesure sont perdues à chaque collision.
+_TIMING_SUFFIX: str = "" if PROVIDER_ID == "all" else f"_{PROVIDER_ID.replace('-', '')}"
+
 # ── Excel export ──────────────────────────────────────────────
-EXCEL_PATH:   str = os.getenv("EXCEL_PATH",   "data/qos_history.xlsx")
+EXCEL_PATH:   str = os.getenv("EXCEL_PATH",   f"data/qos_history{_TIMING_SUFFIX}.xlsx")
 EXCEL_MAX_MB: int = int(os.getenv("EXCEL_MAX_MB", 200))
 
 # ── Profilage / mesures de performance ────────────────────────
 # Un fichier par mode (autonomous → par cycle, enhanced → par intention).
-TIMING_EXCEL_AUTONOMOUS_PATH: str = os.getenv("TIMING_EXCEL_AUTONOMOUS_PATH", "data/timings_autonomous.xlsx")
-TIMING_EXCEL_ENHANCED_PATH:   str = os.getenv("TIMING_EXCEL_ENHANCED_PATH",   "data/timings_enhanced.xlsx")
+TIMING_EXCEL_AUTONOMOUS_PATH: str = os.getenv(
+    "TIMING_EXCEL_AUTONOMOUS_PATH", f"data/timings_autonomous{_TIMING_SUFFIX}.xlsx"
+)
+TIMING_EXCEL_ENHANCED_PATH:   str = os.getenv(
+    "TIMING_EXCEL_ENHANCED_PATH", f"data/timings_enhanced{_TIMING_SUFFIX}.xlsx"
+)
 TIMING_EXCEL_MAX_MB:          int = int(os.getenv("TIMING_EXCEL_MAX_MB", 100))
 
 # ── Orchestration ─────────────────────────────────────────────
@@ -60,6 +94,68 @@ COLLECTION_INTERVAL:  float = float(os.getenv("COLLECTION_INTERVAL",  2.0))
 MIGRATION_COOLDOWN_S: float = float(os.getenv("MIGRATION_COOLDOWN_S", 5.0))
 BOOTSTRAP_MIN:        int   = int(os.getenv("BOOTSTRAP_MIN",          5))
 RAG_TIMEOUT:          float = float(os.getenv("RAG_TIMEOUT",          2.0))
+
+# Fréquence du « battement de cœur » de synchronisation kubectl.
+# La synchronisation a lieu si une violation primaire est détectée
+# (on doit alors savoir si l'on est ACTIF) OU tous les N cycles, ce qui
+# permet à un orchestrateur STANDBY de découvrir qu'il vient de recevoir
+# le service après une migration inter-provider.
+ACTIVE_VM_SYNC_EVERY_N_CYCLES: int = max(1, int(
+    os.getenv("ACTIVE_VM_SYNC_EVERY_N_CYCLES", 10)
+))
+
+# Fenêtre de grâce après un /award reçu : le temps que kubectl propage
+# effectivement la migration (delete + apply sur le cluster cible) avant
+# que _sync_active_vm ne recommence à faire autorité sur le rôle actif.
+# Sans elle, un sync qui tombe juste après l'award peut lire une VM
+# active encore périmée côté kubectl et démettre à tort le provider qui
+# vient d'être promu.
+AWARD_GRACE_PERIOD_S: float = float(os.getenv("AWARD_GRACE_PERIOD_S", 15.0))
+
+# ── Arbitrage de placement (services/placement_arbiter) ────────
+# Sévérité du contrat SLO appliquée par l'arbitre.
+#   "hard" : aucun placement non conforme n'est jamais élu ; si aucun
+#            provider n'est conforme → STAY + alerte d'infaisabilité.
+#   "soft" : le meilleur best-effort peut être élu (dégradation gracieuse).
+SLO_ENFORCEMENT: str = os.getenv("SLO_ENFORCEMENT", "hard").lower()
+
+# Écart de Gap Grade minimal pour qu'un challenger arrache le service au
+# provider en place. ABSOLU (et non relatif) : le Gap Grade étant déjà un
+# écart relatif au seuil, une marge en pourcentage n'exigerait presque rien
+# près du seuil et beaucoup trop loin de lui. 0.05 sur un seuil de 40 ms
+# = « il faut gagner plus de 2 ms ».
+#
+# NOTE : hub/provider_arbitration.py possède déjà NEGOTIATION_DEADBAND (0.05)
+# pour l'ANCIEN chemin 2-way — les deux coexistent jusqu'au lot 6, qui
+# retirera l'ancien chemin. Ne pas les confondre ni les fusionner ici.
+ARBITER_DEADBAND: float = float(os.getenv("ARBITER_DEADBAND", 0.05))
+
+# Délai d'attente du message d'attribution (award, lot 7). Court par
+# construction : l'award est une OPTIMISATION du suivi de placement, jamais
+# une dependance dure. Son echec fait retomber le gagnant sur la decouverte
+# par kubectl, c'est-a-dire le comportement anterieur au lot 7.
+AWARD_TIMEOUT_S: float = float(os.getenv("AWARD_TIMEOUT_S", 3.0))
+
+# ── Vue de fédération (lot 8a) ──────────────────────────────────
+# Vue de fédération — service UNIQUE, lancé une seule fois pour l'ensemble
+# des providers. Son port ne prend donc PAS PORT_OFFSET, contrairement aux
+# services de stack (même logique qu'openstack_client).
+FEDERATION_VIEW_PORT: int = int(os.getenv("FEDERATION_VIEW_PORT", 8500))
+
+# Cibles interrogées par la vue de fédération. Ajouter un provider N+1 =
+# ajouter UNE entrée ici, rien d'autre dans tout le service.
+FEDERATION_VIEW_TARGETS: Dict[str, Dict[str, str]] = {
+    "provider-1": {
+        "hub":            os.getenv("FV_HUB_P1", "http://localhost:8000"),
+        "observability":  os.getenv("FV_OBS_P1", "http://localhost:8009"),
+        "intent_manager": os.getenv("FV_IM_P1",  "http://localhost:8002"),
+    },
+    "provider-2": {
+        "hub":            os.getenv("FV_HUB_P2", "http://localhost:8100"),
+        "observability":  os.getenv("FV_OBS_P2", "http://localhost:8109"),
+        "intent_manager": os.getenv("FV_IM_P2",  "http://localhost:8102"),
+    },
+}
 
 # ── Décision proactive ────────────────────────────────────────
 PROACTIVE_FACTOR: float = float(os.getenv("PROACTIVE_FACTOR", 0.85))
@@ -89,6 +185,13 @@ PERCENTILE_NORMAL:    float = float(os.getenv("PERCENTILE_NORMAL",   75.0))
 PERCENTILE_VOLATILE:  float = float(os.getenv("PERCENTILE_VOLATILE", 85.0))
 MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.15))
 
+# Planchers de disponibilité absolue pour les SLOs secondaires cpu/ram en
+# mode AUTONOMOUS (percentile adaptatif désactivé pour ces deux métriques,
+# cf. metrics_handler._capacity_floor). Cohérent avec la convention déjà
+# utilisée par le LLM en mode ENHANCED (operator ">=", unit "cores"/"GB").
+AUTONOMOUS_CPU_FLOOR_CORES: float = float(os.getenv("AUTONOMOUS_CPU_FLOOR_CORES", 1.0))
+AUTONOMOUS_RAM_FLOOR_GB:    float = float(os.getenv("AUTONOMOUS_RAM_FLOOR_GB", 1.0))
+
 # ── SLO merger ────────────────────────────────────────────────
 REFINE_STRICT: float = float(os.getenv("REFINE_STRICT", 0.85))
 REFINE_RELAX:  float = float(os.getenv("REFINE_RELAX",  1.15))
@@ -114,16 +217,27 @@ ML_CPU_URL: str = os.getenv("ML_CPU_URL", "http://localhost:5002/predict")
 ML_RAM_URL: str = os.getenv("ML_RAM_URL", "http://localhost:5003/predict")
 
 # ── VMs OpenStack ─────────────────────────────────────────────
-VM_REGISTRY: Dict[str, Any] = {
+# Source globale, inchangée quel que soit PROVIDER_ID — décrit le parc
+# complet des 8 VMs. VM_REGISTRY (dérivé plus bas, après PROVIDER_REGISTRY)
+# est ce que CE processus collecte/orchestre réellement.
+ALL_VM_REGISTRY: Dict[str, Any] = {
     "edge1":  {"ip": "194.199.113.18", "port": 8200},
+    "edge1b": {"ip": "194.199.113.18", "port": 8201},
+    "edge1c": {"ip": "194.199.113.18", "port": 8202},
     "edge2":  {"ip": "194.199.113.28", "port": 8200},
+    "edge2b": {"ip": "194.199.113.28", "port": 8201},
+    "edge2c": {"ip": "194.199.113.28", "port": 8202},
     "cloud1": {"ip": "194.199.113.66", "port": 8200},
     "cloud2": {"ip": "194.199.113.69", "port": 8200},
 }
 
 VM_CLUSTER_MAP: Dict[str, str] = {
     "edge1":  "edge-cluster",
+    "edge1b": "edge-cluster",
+    "edge1c": "edge-cluster",
     "edge2":  "edge-cluster",
+    "edge2b": "edge-cluster",
+    "edge2c": "edge-cluster",
     "cloud1": "cloud-cluster",
     "cloud2": "cloud-cluster",
 }
@@ -137,8 +251,8 @@ VM_CLUSTER_MAP: Dict[str, str] = {
 # Purement DÉCLARATIF : aucun service ne lit encore ce registre à ce stade
 # → zéro changement de comportement runtime.
 PROVIDER_REGISTRY: Dict[str, Any] = {
-    "provider-1": {"vms": ["edge1", "cloud1"]},
-    "provider-2": {"vms": ["edge2", "cloud2"]},
+    "provider-1": {"vms": ["edge1", "edge1b", "edge1c", "cloud1"]},
+    "provider-2": {"vms": ["edge2", "edge2b", "edge2c", "cloud2"]},
 }
 
 # Dérivé (source unique = PROVIDER_REGISTRY) : lookup inverse VM → provider.
@@ -147,6 +261,42 @@ PROVIDER_OF_VM: Dict[str, str] = {
     for provider_id, profile in PROVIDER_REGISTRY.items()
     for vm_id in profile["vms"]
 }
+
+# Groupe de placement RÉEL (node Kubernetes) de chaque VM. Les VMs
+# simulées d'une même machine physique partagent le MÊME node : kubectl
+# ne peut pas les distinguer et renvoie toujours la VM canonique du node
+# (voir NODE_VM_MAP dans openstack_client.py, côté master).
+#
+# Sert à savoir QUAND la réponse de kubectl est moins précise que notre
+# propre suivi : si notre service_vm est sur le MÊME node que la VM
+# renvoyée par kubectl, notre valeur est la plus fine et doit être
+# conservée. Sinon, kubectl fait autorité.
+#
+# ⚠️ Cette table DOIT rester le miroir exact de NODE_VM_MAP côté master.
+VM_NODE_GROUP: Dict[str, str] = {
+    "edge1":  "pop1-worker-1", "edge1b": "pop1-worker-1", "edge1c": "pop1-worker-1",
+    "edge2":  "pop1-worker-2", "edge2b": "pop1-worker-2", "edge2c": "pop1-worker-2",
+    "cloud1": "pop2-worker-1",
+    "cloud2": "pop2-worker-2",
+}
+
+# VM_REGISTRY : parc effectivement collecté/orchestré par CE processus.
+# "all" (défaut) → tout le parc (ALL_VM_REGISTRY), comportement historique
+# inchangé. Sinon → uniquement les VMs du provider ciblé, PROVIDER_REGISTRY
+# faisant foi sur l'appartenance (permet à deux stacks orchestrateur de
+# coexister, chacune ne voyant que son provider).
+if PROVIDER_ID == "all":
+    VM_REGISTRY: Dict[str, Any] = ALL_VM_REGISTRY
+elif PROVIDER_ID in PROVIDER_REGISTRY:
+    VM_REGISTRY = {
+        vm_id: ALL_VM_REGISTRY[vm_id]
+        for vm_id in PROVIDER_REGISTRY[PROVIDER_ID]["vms"]
+    }
+else:
+    raise ValueError(
+        f"PROVIDER_ID={PROVIDER_ID!r} inconnu — attendu 'all' ou une clé de "
+        f"PROVIDER_REGISTRY ({sorted(PROVIDER_REGISTRY.keys())})"
+    )
 
 # ── Routage inter-orchestrateurs (passerelle de fédération) ───
 # Adresse de l'orchestrateur responsable de chaque provider. En mono-processus,
@@ -159,6 +309,16 @@ PROVIDER_ORCHESTRATOR_URL: Dict[str, str] = {
         f"http://{HUB_HOST}:{HUB_PORT}",
     )
     for provider_id in PROVIDER_REGISTRY
+}
+
+# Adresse du RELAIS de chaque provider (relais → relais, jamais relais → hub
+# d'un pair) : le hub d'un provider n'est joignable que par SON propre
+# relais, en localhost. Défaut sûr pour le mono-processus : les deux
+# entrées pointent sur l'unique relais de base (:8010) — le distribué
+# surcharge via RELAY_URL_PROVIDER_1/2 (une adresse par provider réel).
+PROVIDER_RELAY_URLS: Dict[str, str] = {
+    "provider-1": os.getenv("RELAY_URL_PROVIDER_1", f"http://{HUB_HOST}:{_RELAY_BASE_PORT}"),
+    "provider-2": os.getenv("RELAY_URL_PROVIDER_2", f"http://{HUB_HOST}:{_RELAY_BASE_PORT}"),
 }
 
 # Interrupteur de la machine à états multi-provider dans _step8_decide (hub).
@@ -179,6 +339,14 @@ OPENSTACK_MASTER_IP: str = os.getenv("OPENSTACK_MASTER_IP", "194.199.113.8")
 OPENSTACK_SSH_USER:  str = os.getenv("OPENSTACK_SSH_USER",  "ubuntu")
 OPENSTACK_SSH_KEY:   str = os.getenv("OPENSTACK_SSH_KEY",   "admin_log_2.pem")
 OPENSTACK_STAGE_DIR: str = os.getenv("OPENSTACK_STAGE_DIR", "~/stage")
+
+# ── Push d'état vers le bridge PiCar ──────────────────────────
+# Le hub ACTIF pousse sa VM de service au bridge PiCar à la fin de chaque
+# cycle (fire-and-forget, jamais bloquant — même contrat que _post_audit
+# vers observability). Sans ce push, le bridge doit interroger les deux
+# hubs en polling et retombe sur la VM CANONIQUE de kubectl (edge2 au lieu
+# de edge2b) dès qu'un hub tarde à répondre. Mettre à "" pour désactiver.
+PICAR_BRIDGE_URL: str = os.getenv("PICAR_BRIDGE_URL", "http://140.93.64.105:8080")
 
 # ─────────────────────────────────────────────────────────────
 # Metrics Registry — architecture primaire/secondaire
@@ -205,7 +373,7 @@ METRICS_REGISTRY: Dict[str, Any] = {
         "payload_key":          "rtt_ms",
         "unit":                 "ms",
         "operator":             "<",
-        "default_threshold":    100.0,
+        "default_threshold":    40.0,
         "bounds":               {"min": 5.0, "max": 2000.0},
         "always_active":        True,
         "is_primary_objective": True,

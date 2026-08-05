@@ -6,6 +6,8 @@ Endpoints :
   GET  /stream    → Server-Sent Events (métriques toutes les 2 s + audit)
   POST /audit     → reçoit un événement d'audit du hub
   GET  /audit/log → retourne l'historique complet des décisions
+  POST /reset     → relaie vers POST {config.CORE_URL}/reset (repasse le hub
+                     en mode autonomous) — bouton "Repasser en autonomous"
   GET  /health
 """
 
@@ -19,7 +21,7 @@ from typing import Any, Dict, List
 
 import httpx
 from fastapi import FastAPI, Request, Body
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from shared import config
 from shared.logging_utils import PrettyFormatter
@@ -135,6 +137,42 @@ async def get_audit_log() -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────
+#  Contrôle du hub — bouton "Repasser en autonomous" du dashboard
+# ─────────────────────────────────────────────────────────────
+
+@app.post("/reset")
+async def reset_to_autonomous():
+    """
+    Relaie un POST vers {config.CORE_URL}/reset : le hub y reconstruit les
+    SLOs bootstrap et repasse en mode autonomous. Simple proxy — aucune
+    logique de décision ici, on transmet la réponse du hub telle quelle.
+
+    Ne doit JAMAIS planter le service observability si le hub est
+    injoignable ou répond en erreur : dans ce cas on renvoie un statut
+    d'erreur explicite (502) plutôt que de laisser l'exception remonter.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{config.CORE_URL}/reset", timeout=5.0)
+        if r.status_code == 200:
+            return r.json()
+        logger.warning(f"⚠️  /reset — le hub a répondu HTTP {r.status_code}")
+        return JSONResponse(
+            status_code=502,
+            content={
+                "status": "error",
+                "detail": f"Le hub a répondu HTTP {r.status_code}",
+            },
+        )
+    except Exception as exc:
+        logger.error(f"❌ /reset — impossible de contacter le hub : {exc}")
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "detail": f"Hub injoignable : {exc}"},
+        )
+
+
+# ─────────────────────────────────────────────────────────────
 #  Polling hub /data → broadcast métriques toutes les 2 s
 # ─────────────────────────────────────────────────────────────
 
@@ -197,6 +235,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-path-d { background: #7f1d1d; color: #f87171; }
   #conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 4px; }
   #conn-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  /* Bouton "Repasser en autonomous" — visible seulement en mode enhanced */
+  .btn-reset {
+    margin-top: 4px; padding: 3px 10px; border-radius: 8px;
+    border: 1px solid var(--border); background: #1e293b; color: var(--text);
+    font-size: 11px; font-weight: 600; cursor: pointer;
+    transition: background .15s, opacity .15s;
+  }
+  .btn-reset:hover:not(:disabled) { background: #2d3748; border-color: var(--blue); }
+  .btn-reset:disabled { opacity: .5; cursor: not-allowed; }
 
   /* ── Layout ── */
   main { padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; }
@@ -286,6 +333,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="stat">
     <span class="stat-label">Mode</span>
     <span class="stat-value" id="h-mode">—</span>
+    <!-- Masqué par défaut : n'a de sens qu'en mode enhanced. Affiché/masqué
+         par updateHeader() dès que le mode réel est connu (voir #h-mode). -->
+    <button id="btn-autonomous" class="btn-reset" style="display:none"
+            title="Repasse l'orchestrateur en mode autonomous (SLOs bootstrap)">
+      Repasser en autonomous
+    </button>
   </div>
   <div class="stat">
     <span class="stat-label">Migrations proactives / réactives</span>
@@ -299,9 +352,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <span class="stat-value">
       <span class="badge badge-none" id="h-path-a" title="Le provider courant avait des VMs conformes — TOPSIS a départagé">INTRA 0</span>
       <span class="badge badge-none" id="h-path-b" title="Aucune VM conforme chez le provider courant — passation vers l'autre provider">INTER 0</span>
-      <span class="badge badge-none" id="h-path-c" title="Aucun provider conforme — décision par négociation sur le score de violation">NÉGO 0</span>
-      <span class="badge badge-none" id="h-path-d" title="Aucun provider ne peut satisfaire les SLOs — le service reste en place">IMPOSSIBLE 0</span>
+      <span class="badge badge-none" id="h-path-c" title="Aucun provider ne peut satisfaire les SLOs — le service reste en place (mode hard) ; la meilleure offre est signalée mais non actionnable">INFAISABLE 0</span>
+      <span class="badge badge-none" id="h-path-d" title="Aucune donnée exploitable (ML ou collecte indisponible) — aucune décision possible">SANS DONNÉES 0</span>
     </span>
+  </div>
+  <div class="stat" id="h-standby-wrap" style="display:none">
+    <span class="stat-label">Rôle</span>
+    <span class="stat-value"><span class="badge badge-none" id="h-role-badge">STANDBY</span></span>
   </div>
 </header>
 
@@ -316,12 +373,16 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- SLO weights -->
   <div class="chart-card">
     <div class="section-title">Poids SLOs actifs (TOPSIS)</div>
+    <div id="active-slos" style="margin-bottom:14px"></div>
     <canvas id="chart-slo" height="160"></canvas>
   </div>
 
   <!-- Raisonnement du cycle -->
   <div class="chart-card">
     <div class="section-title">Raisonnement du cycle</div>
+    <div id="standby-banner" style="display:none;margin-bottom:10px;padding:8px 12px;border-radius:6px;background:rgba(148,163,184,.12);color:#94a3b8;font-size:12px">
+      🟡 Ce provider est en <b>STANDBY</b> — il n'a pris aucune décision depuis le cycle affiché ci-dessous, il observe seulement. Le service est hébergé ailleurs.
+    </div>
     <div id="reasoning-panel">
       <span style="color:#64748b">Mode mono-provider — raisonnement multi-provider non actif</span>
     </div>
@@ -460,19 +521,49 @@ function updateActiveProviderTile(activeVm) {
   }
 }
 
+// SLOs actifs en TEMPS RÉEL, lus depuis /data (état vivant du hub) et non
+// depuis l'audit. Indispensable sur un provider STANDBY : il applique bien
+// les SLOs du LLM (propagés par /intent/propagate) mais ne poste AUCUN
+// audit, donc le panneau « Raisonnement » resterait figé sur ses anciennes
+// valeurs alors que son état interne est correct.
+function renderActiveSlos(slos) {
+  const box = document.getElementById('active-slos');
+  if (!box) return;
+  if (!slos || !slos.length) {
+    box.innerHTML = '<div class="reasoning-empty">Aucun SLO actif</div>';
+    return;
+  }
+  box.innerHTML = slos.map(s => {
+    const pct  = Math.round((s.weight || 0) * 100);
+    const kind = s.is_primary ? 'primaire' : 'secondaire';
+    const thr  = (s.threshold != null) ? Number(s.threshold).toFixed(1) : '—';
+    return `<div class="reasoning-row">
+      <span class="mono">${METRIC_LABELS[s.metric] || s.metric}</span>
+      <span class="mono" style="color:#94a3b8">${s.operator} ${thr}${s.unit || ''}</span>
+      <span style="color:#94a3b8">${kind}</span>
+      <span style="color:#f59e0b">poids ${pct}%</span>
+    </div>`;
+  }).join('');
+}
+
 // ── Mise à jour métriques ──────────────────────────────────────
 function updateMetrics(data) {
   const vms = data.vms || {};
   const slos = data.slos || [];
   const cycle = data.cycle || 0;
   currentSlos = slos;
+  renderActiveSlos(slos);
 
   // Header
-  const status = data.status || {};
   document.getElementById('h-cycle').textContent = cycle;
-  const activeVm = Object.entries(vms).find(([,d]) => d.is_active)?.[0] || '—';
-  document.getElementById('h-vm').textContent = activeVm;
-  updateActiveProviderTile(activeVm);
+  const role = data.role || 'active';
+  const hostingVm = data.hosting_vm || null;
+  const localActiveVm = Object.entries(vms).find(([,d]) => d.is_active)?.[0] || null;
+  const activeVm = localActiveVm || (role === 'standby' ? hostingVm : null) || '—';
+  document.getElementById('h-vm').textContent = activeVm + (role === 'standby' && activeVm !== '—' ? ' (standby)' : '');
+  updateActiveProviderTile(activeVm === '—' ? null : activeVm);
+  document.getElementById('h-standby-wrap').style.display = role === 'standby' ? '' : 'none';
+  document.getElementById('standby-banner').style.display = role === 'standby' ? '' : 'none';
 
   // Seuil latence depuis SLOs actifs
   const latSlo = slos.find(s => s.metric === 'latency');
@@ -504,41 +595,61 @@ function updateMetrics(data) {
       if (!el) return;
 
       const slo = slos.find(s => s.metric === m);
-      const thr = slo ? parseFloat(slo.threshold) : (SLO_DEFAULTS[m] || 100);
-      // Mode enhanced (LLM) : cpu_usage/ram_usage en cœurs/Go, operator ">=".
-      // Il faut convertir le % brut en disponibilité réelle (capacité de
-      // CETTE vm) avant de comparer — sinon on compare un % à un nombre de
-      // cœurs. La direction de violation s'inverse aussi : sous le seuil =
-      // violation (au lieu de : au-dessus = violation pour "<").
-      const capKey  = CAPACITY_KEYS[m];
-      const isFloor = !!(slo && (slo.operator === '>=' || slo.operator === '>') && capKey);
-      const unit    = slo ? slo.unit : (UNITS[m] || '');
+      // cpu_usage/ram_usage sont TOUJOURS affichées en disponibilité absolue
+      // (cœurs/Go), même sans SLO actif — pas seulement en mode enhanced.
+      // Seul le SEUIL de comparaison dépend de ce qui est disponible :
+      //   • SLO en cœurs/Go  → seuil utilisé tel quel (déjà une disponibilité)
+      //   • SLO en % (legacy) → seuil converti en disponibilité pour rester
+      //     cohérent avec l'affichage (capacité × (1 − seuil/100))
+      //   • pas de SLO       → pas de seuil : affichage neutre, sans
+      //     coloration de violation
+      const capKey     = CAPACITY_KEYS[m];
+      const hasCapacity = !!capKey;
+      const capacity    = hasCapacity ? vmData[capKey] : undefined;
+
+      let thr = null;
+      if (slo) {
+        if (hasCapacity && slo.unit !== 'cores' && slo.unit !== 'GB') {
+          thr = capacity ? capacity * (1 - parseFloat(slo.threshold) / 100) : null;
+        } else {
+          thr = parseFloat(slo.threshold);
+        }
+      } else if (!hasCapacity) {
+        thr = SLO_DEFAULTS[m] || 100;
+      }
+
+      const unit = hasCapacity ? (capKey === 'total_cores' ? 'cores' : 'GB') : (slo ? slo.unit : (UNITS[m] || ''));
 
       const toDisplay = (raw) => {
         if (raw === null || raw === undefined) return null;
-        if (!isFloor) return raw;
-        const capacity = vmData[capKey];
+        if (!hasCapacity) return raw;
         if (!capacity) return raw; // capacité inconnue — pas de conversion possible
         return capacity * (1 - raw / 100);
       };
-      const isBad = (displayVal) => isFloor ? displayVal < thr : displayVal > thr;
+      const isBad = (displayVal) => {
+        if (thr === null) return false; // pas de seuil → pas de violation à signaler
+        return hasCapacity ? displayVal < thr : displayVal > thr;
+      };
 
       const dVal = toDisplay(val);
 
       if (dVal !== null && dVal !== undefined) {
-        el.textContent = dVal.toFixed(isFloor ? 2 : 1) + ' ' + unit;
-        el.style.color = isBad(dVal) ? '#ef4444' : '#22c55e';
-        bar.style.width = Math.min(100, Math.max(0, (dVal / thr) * 100)) + '%';
-        bar.style.background = isBad(dVal) ? '#ef4444' : (COLORS[m] || '#3b82f6');
+        el.textContent = dVal.toFixed(hasCapacity ? 2 : 1) + ' ' + unit;
+        el.style.color = thr !== null ? (isBad(dVal) ? '#ef4444' : '#22c55e') : '#94a3b8';
+        const barPct = thr !== null
+          ? (dVal / thr) * 100
+          : (capacity ? (dVal / capacity) * 100 : 0); // sans seuil : % de la capacité totale
+        bar.style.width = Math.min(100, Math.max(0, barPct)) + '%';
+        bar.style.background = thr !== null ? (isBad(dVal) ? '#ef4444' : (COLORS[m] || '#3b82f6')) : (COLORS[m] || '#3b82f6');
       } else {
         el.textContent = '—'; bar.style.width = '0%';
       }
 
       const mp = (preds[m] || []).map(toDisplay).filter(p => p !== null);
       if (mp.length > 0) {
-        const firstPred = mp[0].toFixed(isFloor ? 2 : 1);
+        const firstPred = mp[0].toFixed(hasCapacity ? 2 : 1);
         // Le "pire cas" prédit est le pic pour un plafond, le creux pour un plancher.
-        const worstPred = (isFloor ? Math.min(...mp) : Math.max(...mp)).toFixed(isFloor ? 2 : 1);
+        const worstPred = (hasCapacity ? Math.min(...mp) : Math.max(...mp)).toFixed(hasCapacity ? 2 : 1);
         predEl.textContent = `${firstPred} → ${worstPred} ${unit}`;
         predEl.style.color = isBad(parseFloat(worstPred)) ? '#f59e0b' : '#94a3b8';
       } else {
@@ -580,12 +691,12 @@ const BREACH_FR = {
 
 // Libellés / infobulles des chemins multi-provider (voir provider_arbitration.py).
 // Même texte que les infobulles du compteur d'en-tête (une seule source de vérité).
-const PATH_LABELS = { A: 'INTRA', B: 'INTER', C: 'NÉGO', D: 'IMPOSSIBLE' };
+const PATH_LABELS = { A: 'INTRA', B: 'INTER', C: 'INFAISABLE', D: 'SANS DONNÉES' };
 const PATH_TITLES = {
   A: "Le provider courant avait des VMs conformes — TOPSIS a départagé.",
   B: "Aucune VM conforme chez le provider courant — passation vers l'autre provider.",
-  C: "Aucun provider conforme — décision par négociation sur le score de violation.",
-  D: "Aucun provider ne peut satisfaire les SLOs — le service reste en place.",
+  C: "Aucun provider ne peut satisfaire les SLOs — le service reste en place (mode hard) ; la meilleure offre est signalée mais non actionnable.",
+  D: "Aucune donnée exploitable (ML ou collecte indisponible) — aucune décision possible.",
 };
 
 // Badge de chemin affiché dans la colonne "Type" du journal d'audit. Le
@@ -624,12 +735,11 @@ function translateReason(e) {
   if (e.provider_path && e.provider_path !== 'A') {
     const used = e.provider_used || '—';
 
-    // Chemin C (négociation) : format à part, en 2 lignes — un en-tête
-    // gras/coloré ("qui a gagné"), puis le "reason" du hub tel quel (raison
-    // du POURQUOI). Sans "reason", seul l'en-tête est affiché.
+    // Chemin C — INFAISABLE. En mode hard, AUCUNE offre n'est actionnable :
+    // il n'y a pas de gagnant a nommer, la decision est toujours un maintien.
+    // Format en 2 lignes conserve : en-tete + "reason" du hub tel quel.
     if (e.provider_path === 'C') {
-      const color = PROVIDER_COLORS[e.provider_used] || '#a855f7';
-      const header = `<strong style="color:${color}">NÉGOCIATION — ${used} l'emporte</strong>`;
+      const header = `<strong style="color:#f59e0b">INFAISABLE — aucun provider ne satisfait les SLOs</strong>`;
       return e.reason ? `${header}<br><span style="color:#94a3b8">${e.reason}</span>` : header;
     }
 
@@ -638,7 +748,8 @@ function translateReason(e) {
       structured = `Aucune VM conforme localement — passation vers ${used}`
                  + (e.to_vm ? `, qui a sélectionné ${e.to_vm} par TOPSIS.` : '.');
     } else {
-      structured = `Aucun provider ne peut satisfaire les SLOs — le service reste sur `
+      structured = `Aucune donnee exploitable (ML ou collecte indisponible) — `
+                 + `aucune decision possible, le service reste sur `
                  + `${e.from_vm || e.to_vm || '—'}.`;
     }
     return e.reason ? `${structured} (${e.reason})` : structured;
@@ -933,6 +1044,17 @@ function updateHeader(auditData) {
                              '<span class="badge badge-none">—</span>';
   document.getElementById('h-topsis').textContent = score != null ? parseFloat(score).toFixed(4) : '—';
   document.getElementById('h-mode').textContent = auditData.mode || '—';
+
+  // Le bouton "Repasser en autonomous" n'a de sens qu'en mode enhanced —
+  // masqué en autonomous, et si le mode est absent/inconnu on ne touche pas
+  // à son état précédent plutôt que de le faire clignoter sur une donnée
+  // incomplète.
+  const resetBtn = document.getElementById('btn-autonomous');
+  if (auditData.mode === 'enhanced') {
+    resetBtn.style.display = '';
+  } else if (auditData.mode === 'autonomous') {
+    resetBtn.style.display = 'none';
+  }
 }
 
 // Compteur cumulé des chemins multi-provider — alimenté par le backend
@@ -952,6 +1074,30 @@ function updatePathCounts(counts) {
     el.className = 'badge ' + (n > 0 ? 'badge-path-' + key.toLowerCase() : 'badge-none');
   });
 }
+
+// ── Bouton "Repasser en autonomous" ─────────────────────────────
+// Même origine que le dashboard (le fetch cible /reset, servi par ce même
+// service observability) — pas de CORS. Le polling normal (updateHeader,
+// alimenté par les audits du hub) remet ensuite #h-mode et la visibilité du
+// bouton à jour ; on ne les force pas ici pour ne pas dupliquer cette
+// logique — voir updateHeader().
+document.getElementById('btn-autonomous').addEventListener('click', async (ev) => {
+  const btn = ev.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const resp = await fetch('/reset', { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    btn.textContent = (resp.ok && data.status !== 'error') ? '✓ autonomous' : '✗ erreur';
+  } catch (err) {
+    btn.textContent = '✗ erreur';
+  }
+  setTimeout(() => {
+    btn.textContent = original;
+    btn.disabled = false;
+  }, 2000);
+});
 
 // ── SSE ───────────────────────────────────────────────────────
 const dot = document.getElementById('conn-dot');

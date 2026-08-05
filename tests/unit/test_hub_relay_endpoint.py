@@ -25,8 +25,14 @@ client = TestClient(hub_core.app)
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0) -> dict:
-    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit, weight=weight).dict()
+def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0,
+              is_primary=True) -> dict:
+    # is_primary=True par défaut : ces tests portent sur le CONTRAT — le SLO
+    # doit pouvoir disqualifier une VM. Depuis que la conformité ne retient que
+    # les primaires (hub/provider_arbitration.py::evaluate_vm), un SLO laissé au
+    # défaut False de shared.models.SLO ne disqualifierait plus rien.
+    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit,
+               weight=weight, is_primary=is_primary).dict()
 
 
 def _intent_payload(slos: list, attempted=(), intent_id="t1") -> dict:

@@ -75,6 +75,13 @@ def calls():
 # ── Passation nominale ────────────────────────────────────────
 
 def test_passation_nominale_appelle_la_bonne_url(monkeypatch, calls):
+    """
+    Routage relais → relais (pas relais → hub) : /handoff appelle désormais
+    /inbound du relais du provider cible (config.PROVIDER_RELAY_URLS), qui
+    livrera lui-même au hub local. Avant ce correctif, /handoff appelait
+    directement PROVIDER_ORCHESTRATOR_URL[target]/intent/relay — le hub d'un
+    pair n'est plus jamais joignable directement.
+    """
     _install_fake_post(
         monkeypatch, calls,
         response=_FakeResponse(200, {"negotiation": {"decision": "prend_local_conforme"}}),
@@ -84,7 +91,7 @@ def test_passation_nominale_appelle_la_bonne_url(monkeypatch, calls):
 
     assert r.status_code == 200
     assert len(calls) == 1
-    expected_url = f"{config.PROVIDER_ORCHESTRATOR_URL['provider-2']}/intent/relay"
+    expected_url = f"{config.PROVIDER_RELAY_URLS['provider-2']}/inbound"
     assert calls[0]["url"] == expected_url
     assert calls[0]["json"]["acting_as_provider"] == "provider-2"
 
@@ -170,9 +177,48 @@ def test_reponse_relayee_contient_relayed_by_et_target_orchestrator(monkeypatch,
 
     body = r.json()
     assert body["relayed_by"] == "provider_relay"
-    assert body["target_orchestrator"] == f"{config.PROVIDER_ORCHESTRATOR_URL['provider-2']}/intent/relay"
+    assert body["target_orchestrator"] == f"{config.PROVIDER_RELAY_URLS['provider-2']}/inbound"
     # La réponse d'origine de l'orchestrateur cible n'est pas perdue au passage.
     assert body["negotiation"]["decision"] == "cede_a_l_offre"
+
+
+# ── /inbound : reçu d'un relais pair, livré au hub local ───────
+
+def test_inbound_livre_au_hub_local_et_renvoie_sa_reponse(monkeypatch, calls):
+    """
+    /inbound est le pendant symétrique de /handoff côté réception : reçu
+    d'un relais pair, il livre tel quel au hub LOCAL (config.CORE_URL), et
+    ne réinterprète jamais le contenu.
+    """
+    _install_fake_post(
+        monkeypatch, calls,
+        response=_FakeResponse(200, {"negotiation": {"decision": "prend_local_conforme"}}),
+    )
+
+    body_in = {
+        "slo_intent": {"intent_id": "t1", "slos": [], "mode": "enhanced",
+                        "created_at": "2026-07-22T10:00:00", "attempted_providers": []},
+        "offer": None,
+        "acting_as_provider": "provider-2",
+        "incumbent_provider": "provider-1",
+        "incumbent_vm": "edge1",
+    }
+    r = client.post("/inbound", json=body_in)
+
+    assert r.status_code == 200
+    assert len(calls) == 1
+    assert calls[0]["url"] == f"{config.CORE_URL}/intent/relay"
+    assert calls[0]["json"] == body_in
+    assert r.json()["negotiation"]["decision"] == "prend_local_conforme"
+
+
+def test_inbound_hub_local_injoignable_502(monkeypatch, calls):
+    _install_fake_post(monkeypatch, calls, raise_exc=httpx.ConnectError("connection refused"))
+
+    r = client.post("/inbound", json={"acting_as_provider": "provider-2"})
+
+    assert r.status_code == 502
+    assert len(calls) == 1
 
 
 # ── Santé / topologie ─────────────────────────────────────────
@@ -182,6 +228,7 @@ def test_health_expose_la_table_de_routage_complete():
 
     assert r.status_code == 200
     body = r.json()
-    assert body["status"]  == "healthy"
-    assert body["service"] == "provider_relay"
-    assert body["routes"]  == dict(config.PROVIDER_ORCHESTRATOR_URL)
+    assert body["status"]      == "healthy"
+    assert body["service"]     == "provider_relay"
+    assert body["peer_relays"] == dict(config.PROVIDER_RELAY_URLS)
+    assert body["local_hub"]   == config.CORE_URL

@@ -85,9 +85,15 @@ class IntentToHubPayload(BaseModel):
 
 def validate_provider_registry() -> None:
     """
-    Valide la cohérence de config.PROVIDER_REGISTRY : chaque VM de VM_REGISTRY
-    est couverte exactement une fois, aucune VM n'est assignée à deux providers,
-    aucune VM inconnue n'est déclarée. Lève ValueError si incohérent.
+    Valide la cohérence de config.PROVIDER_REGISTRY : chaque VM du parc
+    GLOBAL (ALL_VM_REGISTRY) est couverte exactement une fois, aucune VM
+    n'est assignée à deux providers, aucune VM inconnue n'est déclarée.
+    Lève ValueError si incohérent.
+
+    Contre ALL_VM_REGISTRY et non VM_REGISTRY : ce dernier est filtré par
+    PROVIDER_ID (déploiement distribué, un processus par provider) et ne
+    contient alors que 4 VMs — la validation casserait à tort si elle
+    comparait PROVIDER_REGISTRY (topologie globale, 8 VMs) à ce sous-ensemble.
 
     NON invoquée au démarrage pour l'instant (registre purement déclaratif) —
     définie et testée, câblage éventuel dans une étape ultérieure.
@@ -100,8 +106,8 @@ def validate_provider_registry() -> None:
         if not vms:
             raise ValueError(f"{provider_id} : aucune VM déclarée")
         for vm_id in vms:
-            if vm_id not in config.VM_REGISTRY:
-                raise ValueError(f"{provider_id} : VM '{vm_id}' absente de VM_REGISTRY")
+            if vm_id not in config.ALL_VM_REGISTRY:
+                raise ValueError(f"{provider_id} : VM '{vm_id}' absente de ALL_VM_REGISTRY")
             if vm_id in seen:
                 raise ValueError(
                     f"VM '{vm_id}' assignée à la fois à '{seen[vm_id]}' et '{provider_id}'"

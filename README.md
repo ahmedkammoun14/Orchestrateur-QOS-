@@ -13,6 +13,7 @@ An autonomous QoS orchestration system for microservices, enabling adaptive Qual
 - [Overview](#overview)
 - [Academic Context](#academic-context)
 - [Architecture](#architecture)
+- [Multi-Provider Federation](#multi-provider-federation)
 - [Key Technical Features](#key-technical-features)
 - [PiCar-X Demo — Position-Based Latency](#picar-x-demo--position-based-latency)
 - [Tech Stack](#tech-stack)
@@ -37,6 +38,7 @@ In modern distributed environments, maintaining consistent performance is a chal
 - Dynamically discovers critical metrics via Mutual Information (MI k-NN, Kozachenko-Leonenko estimator).
 - Predicts future violations using ML models (ESN, LSTM, GRU, RNN) via a 3-level prediction cascade over a configurable horizon.
 - Makes optimal migration decisions toward the best VM (Edge or Cloud) using the multicriteria TOPSIS algorithm.
+- Arbitrates between **two independent infrastructure providers**, each spanning both tiers, through an HTTP negotiation protocol (see [Multi-Provider Federation](#multi-provider-federation)).
 
 The system operates in two modes:
 - **Autonomous** — fixed business objective (latency < 100 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
@@ -62,7 +64,9 @@ The system follows a **Hub-and-Spoke** pattern: the `Hub` (Orchestrator Core) ce
                   │
                   ▼
 [ PiCar-X ] ──► [ Latency Manager ] ──► [ HUB (Core) ] ──► [ Observability ]
-                                              │
+                                              │  ▲
+                                              │  └── [ Provider Relay ] ◄── peer orchestrator
+                                              │        (:8010, POST /handoff)
          ┌──────────┬──────────────┬──────────┴──────────────────┐
          │          │              │                              │
    [ Collector ] [ ML Predictor ] [ Metrics Manager ] [ Decision Intelligence ]
@@ -83,12 +87,68 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 
 ---
 
+## Multi-Provider Federation
+
+The orchestrator arbitrates between **two independent infrastructure providers**. The partition is **transversal**: each provider owns one VM in *every* tier, so provider identity and edge/cloud tier are orthogonal dimensions.
+
+| Provider | Edge VM | Cloud VM | Kubernetes PoP label |
+|---|---|---|---|
+| `provider-1` | edge1 | cloud1 | `space_1` |
+| `provider-2` | edge2 | cloud2 | `space_2` |
+
+Declared in `shared/config.py` → `PROVIDER_REGISTRY` (single source of truth; `PROVIDER_OF_VM` is derived from it).
+
+### Why TOPSIS scores cannot be compared across providers
+
+TOPSIS normalises each criterion with **min-max over its own candidate pool**. A score of 0.87 therefore means "best *within this pool*" — it carries no absolute meaning. Comparing a score computed on `{edge1, cloud1}` against one computed on `{edge2, cloud2}` is mathematically unsound.
+
+Each provider consequently runs TOPSIS **only on its own compliant VMs**, never on a mixed pool — `candidates_for_provider()` enforces the isolation.
+
+### The violation score — the only valid inter-provider metric
+
+To compare providers, the system uses a **normalised weighted mean of relative SLO excesses**:
+
+```
+violation_score = Σ(wᵢ × excessᵢ) / Σ(wᵢ)
+```
+
+`0.0` means every SLO is satisfied; lower is better. The division by `Σ(wᵢ)` is not cosmetic — without it, a provider evaluated on fewer metrics would score artificially better than one evaluated on more.
+
+> **Two scores, opposite polarities.** TOPSIS closeness ∈ [0,1], **higher is better** (`max`). Violation score ∈ [0,+∞), **lower is better** (`min`). The two are never compared against one another.
+
+### Negotiation protocol
+
+`negotiate()` (`hub/provider_arbitration.py`) applies a strict decision order:
+
+1. **Compliance wins outright** — if the local provider holds any VM satisfying *all* SLOs, it takes the service and TOPSIS elects which one. No score comparison happens at all.
+2. No offer received → fall back on the best local VM.
+3. Nothing usable locally → cede to the received offer.
+4. Otherwise → compare violation scores, **dead-band included**.
+
+The **dead-band** (`NEGOTIATION_DEADBAND = 0.05`) protects the *incumbent provider*: a challenger must beat it by more than 0.05 in absolute terms. An absolute band is used rather than a relative margin — near a threshold, a relative margin lets a sub-millisecond difference trigger a migration.
+
+Note the deliberate asymmetry: the dead-band guards **provider** changes; a VM change *within* the winning provider is guarded only by the temporal `MIGRATION_COOLDOWN_S`.
+
+### Transport
+
+`services/provider_relay/` (port 8010) is a **pure transport gateway** — it carries `POST /handoff` between orchestrators and holds no decision logic whatsoever (an anti-loop guard returns 409 on a relayed intent bouncing back). HTTP/JSON serialisation also provides intent isolation: one provider cannot mutate the other's SLO objects by reference.
+
+`PROVIDER_ORCHESTRATOR_URL` is the only place in the codebase that knows the topology. Moving from a single process to N real orchestrators means changing those URLs — and nothing else.
+
+### Feature flag
+
+`MULTI_PROVIDER_ENABLED` (default **`false`**) gates the entire state machine. When off, the cycle behaves exactly as before the extension. `start_all_multi.ps1` sets it to `true`.
+
+---
+
 ## Key Technical Features
 
 - **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 4 OpenStack VMs.
-- **Position-based simulated latency**: `latency_ms = VM_BASE_MS + VM_K_MS_PER_CM × distance_cm(car, VM)` (`infrastructure/vm_agent.py`) — the closer the vehicle, the lower the latency. Default coefficient `K` is **20 ms/cm for edge VMs, 40 ms/cm for cloud VMs** (edge is structurally favored).
+- **Position-based simulated latency**: the closer the vehicle, the lower the latency. Two implementations coexist — see [PiCar-X Demo](#picar-x-demo--position-based-latency) — the versioned reference (`infrastructure/vm_agent.py`, unbounded linear) and the **clamped per-tier model** actually deployed on the VMs, which bounds latency between a floor `B` and a ceiling `A` distinct for edge and cloud.
 - **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM). Uses **ML predictions** as input values — not raw measurements — to anticipate future state.
 - **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision pool. If TOPSIS selects it despite a violation → STAY (it remains the best option). This prevents unnecessary migrations when the current VM is still the least-bad choice.
+- **Transversal multi-provider arbitration**: two providers, each spanning both tiers, negotiating over HTTP with an absolute dead-band. TOPSIS stays confined to a single provider's compliant VMs; the normalised violation score is the only cross-provider comparison. See [Multi-Provider Federation](#multi-provider-federation).
+- **Compliance as a strict gate**: a VM satisfying *all* SLOs always outranks a non-compliant one, however small the latter's violation. The violation score only breaks ties *among non-compliant VMs* — it is never weighed against a compliant one.
 - **MI k-NN (Kozachenko-Leonenko)**: continuous Mutual Information estimator — replaces the old 2×2 contingency table. No discretization, detects non-linear dependencies, robust from ~15 points per class. Formula: `MI(X;Y) = H(X) − H(X|Y)`, normalized by `H(Y)` → score in [0, 1].
 - **3-level ML prediction cascade**: Level 1 — `POST /predict_sequence` (full window, horizon 7); Level 2 — `GET /predict?input_data=X` (single point); Level 3 — `last_value_fallback`. Each level activates only if the previous fails.
 - **ESN (Echo State Network)**: reservoir computing model with a recursive multi-step strategy for horizon > 1. Trained via `/main` endpoint on historical datasets. Fixed for correct 2D input shape (flatten before recursive loop).
@@ -109,12 +169,29 @@ Two exceptions to the pure Hub-and-Spoke model have been validated for performan
 
 ## PiCar-X Demo — Position-Based Latency
 
-The demo replaces traditional network RTT measurement with **distance-based simulated latency**. As the PiCar-X vehicle moves along its track, latency to each VM is computed from the Euclidean distance on a 2D map:
+The demo replaces traditional network RTT measurement with **distance-based simulated latency**. As the PiCar-X vehicle moves along its track, latency to each VM is computed from the Euclidean distance on a 2D map.
+
+**Deployed model (clamped, per tier).** Latency is a linear interpolation between a floor `B` (vehicle on top of the VM) and a ceiling `A` (vehicle beyond `D_MAX`), saturating at both ends:
 
 ```
-latency_ms = VM_BASE_MS + K × distance_cm(car_position, vm_position)
-K = 20 ms/cm (edge VMs)  |  K = 40 ms/cm (cloud VMs)
+L(d) = ((clamp(d, D_MIN, D_MAX) − D_MIN) / (D_MAX − D_MIN)) × (A − B) + B
+
+D_MIN = 3   D_MAX = 80
+edge  : B = 5   A = 150      →   5–150 ms
+cloud : B = 50  A = 230      →  50–230 ms
 ```
+
+Saturation is what makes the demo controllable: each tier has a *guaranteed* range, so the edge tier is structurally favoured (its floor is 10× lower) without ever letting a distant VM report an unbounded latency.
+
+The distance at which a VM still meets a latency SLO of threshold `T` — its **conformity radius** — follows directly:
+
+```
+D_slo(T) = D_MIN + (T − B) / (A − B) × (D_MAX − D_MIN)      valid iff  B < T < A
+```
+
+At `T = 100 ms` this yields a radius of **53.4** for an edge VM against **24.4** for a cloud VM: the edge covers more than twice the ground. Raising `T` to 150 would make every edge VM compliant everywhere (`T ≥ A_edge`), so no latency violation could ever fire — the useful window is roughly 80–120 ms.
+
+> **Versioning gap.** The clamped model above lives in the per-VM scripts deployed on the OpenStack nodes, which are **not tracked in this repository**. The versioned `infrastructure/vm_agent.py` still implements the earlier unbounded form `latency_ms = VM_BASE_MS + VM_K_MS_PER_CM × distance_cm`. Cloning this repo therefore reproduces the orchestrator, not the exact demo physics.
 
 ### VM Positions on the Map
 
@@ -215,7 +292,13 @@ REDIS_PORT=6379
 MIGRATION_COOLDOWN_S=5        # 5s for demo, 60s recommended for production
 PROACTIVE_FACTOR=0.85
 BOOTSTRAP_MIN=5
-HISTORY_WINDOW=50
+HISTORY_WINDOW=50             # must be >= each ML model's window_size (see note below)
+
+# Multi-provider federation
+MULTI_PROVIDER_ENABLED=false  # OFF by default; start_all_multi.ps1 sets it to true
+PROVIDER_RELAY_PORT=8010
+ORCHESTRATOR_URL_PROVIDER_1=http://localhost:8000   # same hub in single-process mode
+ORCHESTRATOR_URL_PROVIDER_2=http://localhost:8000   # point elsewhere for N real orchestrators
 
 # ML APIs
 ML_RTT_URL=http://localhost:5001/predict
@@ -307,8 +390,13 @@ python -m infrastructure.openstack_client    # 7. Port 8024
 python -m services.intent_manager.app        # 8. Port 8002
 python -m services.latency_manager.app       # 9. Port 8001
 python -m services.observability.app         # 10. Port 8009
-python -m hub.orchestrator_core              # 11. Port 8000
+python -m services.provider_relay.app        # 11. Port 8010 (multi-provider only)
+python -m hub.orchestrator_core              # 12. Port 8000
 ```
+
+On Windows, `start_all_multi.ps1` launches all of the above in separate windows, sets `MULTI_PROVIDER_ENABLED=true`, and tees each service's output to `logs/<run>/`.
+
+> **After retraining any ML model, restart `ml_predictor`.** It reads each model's `window_size` **once, at startup** (`services/ml_predictor/app.py`). Retraining can change that value; the predictor would then send a wrongly-sized sequence, the API would answer `400`, and the cascade would fall through to `last_value_fallback` — silently, and permanently. The tell-tale sign is a prediction *exactly equal to the measurement and identical across all 7 horizons*: that is the fallback, not a well-fitted model.
 
 ---
 
@@ -325,9 +413,9 @@ python -m hub.orchestrator_core              # 11. Port 8000
 | Database | 8006 | Redis persistence |
 | History Loader | 8007 | Historical windowing |
 | Decision Intelligence | 8008 | TOPSIS + violation detection |
-| Observability | 8009 | Real-time dashboard |
+| Observability | 8009 | Real-time dashboard + reasoning panel |
+| Provider Relay | 8010 | Inter-orchestrator transport — `POST /handoff` |
 | OpenStack Client | 8024 | kubectl migrations (on master 194.199.113.8) |
-| Provider Relay | 8010 | Inter-provider handoff gateway (federation) |
 | ML API — Latency | 5001 | ESN/LSTM model for latency prediction |
 | ML API — CPU | 5002 | ESN/LSTM model for cpu_usage prediction |
 | ML API — RAM | 5003 | ESN/LSTM model for ram_usage prediction |
@@ -407,6 +495,10 @@ pytest tests/unit/
 pytest tests/integration/
 ```
 
+**184 tests**, across 19 unit modules. Multi-provider coverage: `test_provider_registry.py` (registry consistency), `test_provider_arbitration.py` (violation score, `negotiate()`, dead-band), `test_provider_relay.py` (transport + anti-loop guard), `test_hub_relay_endpoint.py`, `test_multi_provider_flow.py` (paths A/B/C/D), `test_multi_provider_reasoning.py` (audit block), `test_slo_intent.py` (immutable intent).
+
+No test opens a socket: `_post`, `_post_audit` and `_execute_kubectl_migration` are mocked. Coroutines are driven through a local `_run()` helper, as `pytest-asyncio` is deliberately not a dependency.
+
 ---
 
 ## Project Structure
@@ -414,7 +506,9 @@ pytest tests/integration/
 ```text
 qos-orchestrator/
 ├── hub/
-│   └── orchestrator_core.py          # Central hub — decision loop
+│   ├── orchestrator_core.py          # Central hub — decision loop
+│   └── provider_arbitration.py       # Pure module — per-provider evaluation,
+│                                     # violation score, negotiate() + dead-band
 ├── infrastructure/
 │   ├── ml_apis/                      # External ML prediction APIs
 │   │   ├── ml_api_rtt.py             # ESN/LSTM latency model — port 5001
@@ -440,7 +534,9 @@ qos-orchestrator/
 │   ├── latency_manager/              # RTT proxy PiCar → Hub
 │   ├── metrics_manager/              # MI k-NN scoring + adaptive percentile
 │   ├── ml_predictor/                 # 3-level prediction cascade orchestrator
-│   └── observability/                # Real-time SSE dashboard
+│   ├── observability/                # Real-time SSE dashboard + reasoning panel
+│   └── provider_relay/               # Inter-orchestrator transport (:8010)
+│                                     # POST /handoff — no decision logic
 ├── shared/
 │   ├── config.py                     # Ports, METRICS_REGISTRY, SLO bounds
 │   ├── models.py                     # Pydantic models (SLO, RTTMeasurement…)
@@ -448,9 +544,12 @@ qos-orchestrator/
 ├── tests/
 │   ├── unit/                         # TOPSIS, MI, violation_detector, LLM handler
 │   └── integration/                  # Full hub → services cycle
-├── openstack_client.py               # kubectl migrations — deployed on master :8024
+├── infrastructure/openstack_client.py # kubectl migrations — deployed on master :8024
 │                                     # YAML_PER_VM: space_1→edge1/cloud1, space_2→edge2/cloud2
-├── DOCUMENTATION.md                  # Full technical documentation (FR)
+├── start_all_multi.ps1               # Windows launcher — all services + log capture
+├── PLAN_MULTI_PROVIDER_TRANSVERSAL.md    # Design rationale & locked trade-offs (FR)
+├── SUIVI_MULTI_PROVIDER_TRANSVERSAL.md   # Step-by-step verification journal (FR)
+├── GUIDE_TEST_MULTI_PROVIDER.md          # Manual test scenarios (FR)
 └── requirements.txt
 ```
 
@@ -474,6 +573,15 @@ qos-orchestrator/
 - [x] YAML_PER_VM mapping — correct Kubernetes nodeSelector per VM (space_1/space_2 PoP labels)
 - [x] ESN recursive strategy fixed — flatten guarantees 2D input shape in multi-step prediction
 - [x] 3-level ML prediction cascade (sequence → point → last_value_fallback)
+- [x] Transversal multi-provider partition — each provider spans both tiers (`PROVIDER_REGISTRY`)
+- [x] Normalised violation score as the only valid inter-provider comparison metric
+- [x] HTTP negotiation protocol with absolute dead-band (`negotiate()`, `NEGOTIATION_DEADBAND`)
+- [x] Provider Relay transport gateway with anti-loop guard (:8010)
+- [x] `MULTI_PROVIDER_ENABLED` feature flag — non-regression safety, OFF by default
+- [x] Reasoning panel in the dashboard — the 5 decision steps, per-VM justification
+- [ ] Distributed deployment — one orchestrator process per provider (only `PROVIDER_ORCHESTRATOR_URL` changes)
+- [ ] Version the deployed per-VM latency scripts (see the versioning gap noted above)
+- [ ] Experimental validation — negotiation overhead measurement
 - [ ] Docker + docker-compose containerization
 - [ ] Multi-user support and intent isolation
 - [ ] Public REST API documentation (enriched Swagger UI)

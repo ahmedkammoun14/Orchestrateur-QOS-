@@ -40,8 +40,14 @@ def _run(coro):
 
 # ── Helpers de construction (repris de test_multi_provider_flow.py) ──
 
-def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0) -> dict:
-    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit, weight=weight).dict()
+def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0,
+              is_primary=True) -> dict:
+    # is_primary=True par défaut : ces tests portent sur le CONTRAT — le SLO
+    # doit pouvoir disqualifier une VM. Depuis que la conformité ne retient que
+    # les primaires (hub/provider_arbitration.py::evaluate_vm), un SLO laissé au
+    # défaut False de shared.models.SLO ne disqualifierait plus rien.
+    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit,
+               weight=weight, is_primary=is_primary).dict()
 
 
 def _candidate(vm_id: str, latency: float, cores=4, ram=8) -> dict:
@@ -63,6 +69,23 @@ def _ctx(vm_ids=("edge1", "cloud1", "edge2", "cloud2")) -> "hub_core._FlowContex
 
 def _prof() -> "hub_core.StepProfiler":
     return hub_core.StepProfiler()
+
+
+async def _run_decide_multi_provider(client, ctx, prof) -> None:
+    """
+    Depuis le lot 6a, _step8_decide (flag ON) dispatche vers
+    _decide_federated, pas _decide_multi_provider : cette dernière devient
+    injoignable par CE chemin (code mort en attente de retrait au lot 6b),
+    mais reste appelable directement, comportement strictement inchangé.
+
+    Ces tests, écrits pour le bloc d'audit "reasoning" multi-provider AVANT
+    le lot 6a, testent explicitement _decide_multi_provider — on l'appelle
+    donc directement ici, en reproduisant le seul pré-traitement que faisait
+    autrefois _step8_decide avant de lui déléguer (construction de
+    current_data depuis state.last_collected).
+    """
+    current_data = hub_core._build_candidates(hub_core.state.last_collected)
+    await hub_core._decide_multi_provider(client, ctx, prof, current_data)
 
 
 def _prime(service_vm: str, candidates: list, predictions: dict, slos=None, cycle=5) -> None:
@@ -162,7 +185,7 @@ def test_chemin_a_reasoning_present_compliant_vms_et_negotiation_none(monkeypatc
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert len(audits) == 1
     reasoning = audits[0]["reasoning"]
@@ -199,7 +222,7 @@ def test_vm_active_renseignee_meme_sur_un_maintien(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     audit = audits[0]
     assert audit["decision"] == "stay"
@@ -238,7 +261,7 @@ def test_evaluations_fideles_a_evaluate_provider(monkeypatch):
     preds = _preds(edge1=20.0, cloud1=40.0, edge2=50.0, cloud2=55.0)
     _prime("edge1", candidates, preds)
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     # Référence : même appel que celui fait en interne par _decide_multi_provider
     # (current_data passe par _build_candidates, PAS les candidats bruts —
@@ -282,7 +305,7 @@ def test_chemin_b_negotiation_renseignee_avec_provider_cible_et_decision(monkeyp
         _preds(edge1=40.0, cloud1=45.0, edge2=20.0, cloud2=25.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     reasoning   = audits[0]["reasoning"]
     negotiation = reasoning["negotiation"]
@@ -320,7 +343,7 @@ def test_chemin_c_offre_locale_et_recue_et_deadband(monkeypatch):
         _preds(edge1=40.0, cloud1=32.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     reasoning   = audits[0]["reasoning"]
     negotiation = reasoning["negotiation"]
@@ -348,7 +371,7 @@ def test_chemin_d_passation_echouee_reasoning_present_negotiation_degradee(monke
         _preds(edge1=40.0, cloud1=45.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
 
     assert len(audits) == 1
     reasoning = audits[0]["reasoning"]
@@ -376,7 +399,7 @@ def test_relais_leve_exception_audit_quand_meme_poste(monkeypatch):
         _preds(edge1=40.0, cloud1=45.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
 
     assert len(audits) == 1
     reasoning = audits[0]["reasoning"]
@@ -433,7 +456,7 @@ def test_serialisabilite_json_chemin_a(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     json.dumps(audits[0])   # ne doit pas lever
 
@@ -463,7 +486,7 @@ def test_serialisabilite_json_chemin_c(monkeypatch):
         _preds(edge1=40.0, cloud1=32.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     payload_json = json.dumps(audits[0], indent=2, ensure_ascii=False)   # ne doit pas lever
 
@@ -498,7 +521,7 @@ def test_reasoning_topsis_reflete_vm_scores_chemin_a(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     topsis = audits[0]["reasoning"]["topsis"]
     assert topsis["classement"] == {"edge1": 0.12, "cloud1": 0.87}
@@ -530,7 +553,7 @@ def test_reasoning_topsis_vaut_classement_vide_quand_vm_scores_absent(monkeypatc
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     topsis = audits[0]["reasoning"]["topsis"]
     assert topsis == {"classement": {}, "retenue": None, "score": None}
@@ -562,6 +585,6 @@ def test_reasoning_topsis_vide_sur_chemin_c(monkeypatch):
         _preds(edge1=40.0, cloud1=32.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert audits[0]["reasoning"]["topsis"] == {"classement": {}, "retenue": None, "score": None}

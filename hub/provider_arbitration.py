@@ -93,6 +93,25 @@ NEGOTIATION_DEADBAND: float = 0.05
 # de la VM avant toute comparaison au seuil. Même règle que _filter_candidates.
 _ABSOLUTE_UNITS = ("cores", "GB")
 
+# ── GAP GRADE v2 (lot 2) ────────────────────────────────────────
+# Plancher de l'écart normalisé, appliqué UNIQUEMENT du côté MARGE.
+# Les critères de COÛT (latence, opérateur <) sont déjà bornés à −1 par
+# la physique : v ≥ 0 implique (v − τ)/τ ≥ −1. Les critères de BÉNÉFICE
+# (disponibilité cpu/ram, opérateur ≥) ne le sont pas : une VM à 12.8
+# cœurs face à un seuil de 2.5 donne δ = −4.12. Ce plancher rend aux
+# critères de bénéfice la borne que les critères de coût possèdent déjà,
+# et restitue aux poids du LLM leur signification.
+# Le côté VIOLATION (δ > 0) reste volontairement NON borné : une
+# violation catastrophique DOIT dominer.
+DELTA_FLOOR: float = -1.0
+
+# Coefficient d'augmentation de la fonction de Tchebycheff. Le terme max()
+# décide (non compensatoire) ; ce petit terme additif restaure la
+# discrimination entre deux VMs dont le pire critère est identique, sans
+# rendre de pouvoir compensatoire. ρ trop grand ferait dériver la formule
+# vers la somme pondérée, et la compensation reviendrait.
+GAP_GRADE_RHO: float = 0.1
+
 
 # ── Structures de résultat ────────────────────────────────────
 
@@ -163,6 +182,128 @@ class ProviderAssessment:
             provider_id     = self.provider_id,
             vm_id           = self.best_effort_vm,
             violation_score = self.best_effort_score,
+        )
+
+
+# ── Bid unifié (lot 3) — PlacementPlan + Gap Grade ─────────────
+#
+# Objet d'échange entre orchestrateurs pour l'arbitrage N-providers (lot 5).
+# Chaque provider élit LUI-MÊME sa meilleure VM (TOPSIS si conforme, Gap
+# Grade sinon) et calcule LUI-MÊME son Gap Grade — un microservice arbitre
+# compare ensuite ces bids sur la seule base du Gap Grade, jamais du score
+# TOPSIS (non comparable entre pools, voir en tête de ce module).
+
+def placement_action(vm_id: Optional[str], incumbent_vm: Optional[str]) -> str:
+    """
+    Règle déterministe de PlacementPlan.action :
+        vm_id is None            → "none"    (rien à proposer)
+        incumbent_vm is None     → "deploy"  (aucun service en place)
+        vm_id == incumbent_vm    → "stay"    (déjà en place)
+        sinon                    → "migrate"
+    """
+    if vm_id is None:
+        return "none"
+    if incumbent_vm is None:
+        return "deploy"
+    if vm_id == incumbent_vm:
+        return "stay"
+    return "migrate"
+
+
+@dataclass(frozen=True)
+class PlacementPlan:
+    """VM élue par CE provider et action qui en découle. AUCUNE migration ici : c'est une proposition."""
+    provider_id:  str
+    vm_id:        Optional[str]          # None si aucun plan (rien d'évaluable)
+    action:       str                    # "migrate" | "stay" | "deploy" | "none"
+    topsis_score: Optional[float]
+    vm_scores:    Dict[str, float]       # classement complet — AUDIT SEULEMENT, jamais comparé entre providers
+    reason:       str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider_id":  self.provider_id,
+            "vm_id":        self.vm_id,
+            "action":       self.action,
+            "topsis_score": self.topsis_score,
+            "vm_scores":    dict(self.vm_scores),
+            "reason":       self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlacementPlan":
+        return cls(
+            provider_id  = data["provider_id"],
+            vm_id        = data.get("vm_id"),
+            action       = data["action"],
+            topsis_score = data.get("topsis_score"),
+            vm_scores    = dict(data.get("vm_scores") or {}),
+            reason       = data.get("reason", ""),
+        )
+
+
+@dataclass(frozen=True)
+class GapGrade:
+    """
+    Grandeur COMPARABLE entre providers (normalisée par le seuil SLO, global
+    et partagé — contrairement au score TOPSIS). Voir compute_gap_grade.
+
+    ⚠️ `value` NE PERMET PAS de conclure à la conformité (son signe peut être
+    négatif malgré une violation, voir compute_gap_grade) : `is_compliant`
+    est un champ SÉPARÉ, jamais déduit de `value`.
+    """
+    value:        Optional[float]        # None si non évaluable
+    is_compliant: bool
+    evaluable:    bool
+    coverage:     Tuple[str, ...]        # métriques réellement évaluées
+    detail:       Dict[str, float]       # δ signé (après plancher) par métrique
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "value":        self.value,
+            "is_compliant": self.is_compliant,
+            "evaluable":    self.evaluable,
+            "coverage":     list(self.coverage),
+            "detail":       dict(self.detail),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GapGrade":
+        return cls(
+            value        = data.get("value"),
+            is_compliant = bool(data.get("is_compliant", False)),
+            evaluable    = bool(data.get("evaluable", False)),
+            coverage     = tuple(data.get("coverage") or ()),
+            detail       = dict(data.get("detail") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderBid:
+    """Offre complète d'un provider pour un jeu de SLOs donné — SEUL objet destiné à traverser le réseau (lot 4)."""
+    provider_id:    str
+    intent_id:      Optional[str]
+    placement_plan: PlacementPlan
+    gap_grade:      GapGrade
+    timestamp:      str                   # ISO 8601 UTC
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider_id":    self.provider_id,
+            "intent_id":      self.intent_id,
+            "placement_plan": self.placement_plan.to_dict(),
+            "gap_grade":      self.gap_grade.to_dict(),
+            "timestamp":      self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ProviderBid":
+        return cls(
+            provider_id    = data["provider_id"],
+            intent_id      = data.get("intent_id"),
+            placement_plan = PlacementPlan.from_dict(data["placement_plan"]),
+            gap_grade      = GapGrade.from_dict(data["gap_grade"]),
+            timestamp      = data["timestamp"],
         )
 
 
@@ -267,6 +408,33 @@ def _representative_value(
     return value, from_predictions
 
 
+def to_slo_unit(
+    metric:    str,
+    slo:       Dict[str, Any],
+    candidate: Dict[str, Any],
+    value:     float,
+) -> float:
+    """
+    Convertit une valeur BRUTE (telle que prédite ou mesurée — un POURCENTAGE
+    pour cpu_usage/ram_usage) vers l'unité DU SLO, pour qu'elle soit
+    comparable à son seuil.
+
+    Extrait la conversion déjà appliquée par _representative_value afin de
+    l'utiliser sur une valeur ISOLÉE : LA GATE
+    (orchestrator_core._step5_check_violations) doit tester CHACUNE des 7
+    prédictions séparément, pas leur moyenne pondérée.
+
+    ⚠️ UNE SEULE implémentation de la conversion dans tout le projet — deux
+    conversions divergentes seraient pires que l'absence de conversion.
+    Si `candidate` ne porte pas la capacité de la VM (VM injoignable, agent
+    non à jour), _to_criterion_value retombe sur le % brut : même repli
+    silencieux qu'ailleurs, jamais d'exception.
+    """
+    if slo.get("unit") in _ABSOLUTE_UNITS:
+        return _SELECTOR._to_criterion_value(metric, candidate, value)
+    return value
+
+
 def _excess(value: float, threshold: float, operator: str) -> float:
     """
     Dépassement RELATIF du seuil, toujours ≥ 0 (0 = seuil respecté).
@@ -278,6 +446,200 @@ def _excess(value: float, threshold: float, operator: str) -> float:
     if operator in (">", ">="):
         return max(0.0, (threshold - value) / threshold)
     return 0.0
+
+
+# ── GAP GRADE v2 — fonctions pures, NON BRANCHÉES (lot 2) ─────
+#
+# ⚠️ AJOUT PUR : ni signed_excess ni compute_gap_grade ne sont appelées par
+# evaluate_vm, evaluate_provider, negotiate ou tout autre code de
+# production. _excess et violation_score restent le chemin actif ; ce
+# nouveau chemin sera branché dans un lot ultérieur. Aucun comportement
+# runtime ne change avec cet ajout.
+
+def signed_excess(value: float, threshold: float, operator: str) -> float:
+    """
+    Écart SIGNÉ et normalisé par le seuil, plancher côté marge (voir
+    DELTA_FLOOR). δ < 0 = marge sous l'objectif · δ > 0 = violation ·
+    PLUS BAS = MEILLEUR.
+
+    Contrairement à _excess (toujours ≥ 0, utilisée par evaluate_vm), cette
+    fonction conserve le signe : c'est ce qui permet à compute_gap_grade de
+    départager deux VMs conformes, que _excess écrase toutes les deux à 0.0.
+    """
+    if threshold <= 0:
+        # Normalisation relative indéfinie.
+        return 0.0
+    if operator in ("<", "<="):
+        delta = (value - threshold) / threshold
+    elif operator in (">", ">="):
+        delta = (threshold - value) / threshold
+    else:
+        return 0.0
+    return max(DELTA_FLOOR, delta)
+
+
+def _retained_primary_slos(
+    slos:   List[Any],
+    values: Dict[str, Optional[float]],
+) -> List[Tuple[Dict[str, Any], str, float, float]]:
+    """
+    SLOs retenus pour le Gap Grade, sous forme (slo, metric, threshold,
+    value). Filtre : is_primary vrai · metric dans METRICS_REGISTRY ·
+    threshold > 0 · values.get(metric) non None.
+
+    Extrait de compute_gap_grade (lot 3) — build_gap_grade a besoin du MÊME
+    filtrage pour produire `coverage`/`detail` ; dupliquer cette boucle
+    créerait un risque de divergence silencieuse entre les deux.
+    """
+    retained: List[Tuple[Dict[str, Any], str, float, float]] = []
+    for raw in slos:
+        slo = _as_slo_dict(raw)
+        if not slo.get("is_primary"):
+            continue
+        metric = slo.get("metric")
+        if metric not in config.METRICS_REGISTRY:
+            continue
+        threshold_raw = slo.get("threshold")
+        threshold     = float(threshold_raw) if threshold_raw is not None else 0.0
+        if threshold <= 0:
+            continue
+        value = values.get(metric)
+        if value is None:
+            continue
+        retained.append((slo, metric, threshold, value))
+    return retained
+
+
+def compute_gap_grade(
+    slos: List[Any],
+    values: Dict[str, Optional[float]],
+    rho: float = GAP_GRADE_RHO,
+) -> Optional[float]:
+    """
+    Gap Grade : agrégation NON COMPENSATOIRE des écarts signés des SLOs
+    PRIMAIRES, par une fonction de Tchebycheff augmentée.
+
+        G = ( max(wᵢ·δᵢ) + ρ · Σ(wᵢ·δᵢ) ) / (1 + ρ)
+
+    Le terme max() est NON COMPENSATOIRE : c'est le PIRE critère pondéré qui
+    décide, et un excédent sur un autre critère ne peut jamais le racheter
+    (contrairement à une somme pondérée classique). Le terme ρ·Σ(...) ne sert
+    qu'à DÉPARTAGER deux VMs dont le pire critère est à égalité — ρ est
+    volontairement petit (GAP_GRADE_RHO) pour ne jamais rendre de pouvoir
+    compensatoire au terme additif.
+
+    ⚠️ Le SIGNE de G ne permet PAS de conclure à la conformité en multi-SLO :
+    une VM peut violer un SLO secondaire dans le pire critère tout en restant
+    G < 0 grâce à une large marge sur un autre critère pondéré plus lourd (le
+    terme max() choisit le pire *pondéré*, pas le pire brut). Le drapeau
+    is_compliant (vm_satisfies_slo) reste donc OBLIGATOIRE dans tout usage de
+    ce score ; il ne doit JAMAIS être déduit du signe de G.
+
+    Ne retient que les SLOs PRIMAIRES (is_primary vrai), de métrique connue
+    de METRICS_REGISTRY, de seuil > 0, et pour lesquels `values` fournit une
+    valeur non None. Retourne None si aucun SLO n'est retenu — jamais 0.0,
+    qui est une valeur de Gap Grade légitime et serait indiscernable d'un
+    « non évaluable ».
+
+    Propriété de non-régression : avec un SEUL SLO primaire retenu, quel que
+    soit son poids (> 0), compute_gap_grade retourne EXACTEMENT δ (après
+    normalisation les poids valent 1, donc G = δ(1+ρ)/(1+ρ) = δ) — le mode
+    AUTONOME (latence seule) est donc mathématiquement inchangé par rapport
+    à un simple signed_excess.
+    """
+    retained = _retained_primary_slos(slos, values)
+
+    if not retained:
+        return None
+
+    deltas  = [signed_excess(value, threshold, slo["operator"]) for slo, _, threshold, value in retained]
+    weights = [float(slo.get("weight") or 0.0) for slo, _, _, _ in retained]
+
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        weights      = [1.0] * len(retained)
+        total_weight = float(len(retained))
+
+    # Normalisation OBLIGATOIRE : sans elle, un unique SLO de poids 0.6
+    # renverrait 0.6·δ au lieu de δ, et la propriété de non-régression du
+    # mode autonome (voir docstring ci-dessus) serait fausse.
+    weights = [w / total_weight for w in weights]
+
+    terms = [w * d for w, d in zip(weights, deltas)]
+    return (max(terms) + rho * sum(terms)) / (1 + rho)
+
+
+# ── Bid unifié (lot 3) — fonctions pures BRANCHÉES par /evaluate ─
+#
+# Contrairement à signed_excess/compute_gap_grade (lot 2, non branchées),
+# ces deux fonctions SONT appelées par le nouvel endpoint /evaluate
+# (hub/orchestrator_core.py). evaluate_vm/evaluate_provider/negotiate,
+# eux, restent intégralement le chemin de /intent/relay — inchangés.
+
+def slo_values_for_vm(
+    vm_id:           str,
+    slos:            List[Any],
+    candidate:       Dict[str, Any],
+    predictions_map: Dict[str, Any],
+) -> Dict[str, Optional[float]]:
+    """
+    Construit {métrique -> valeur représentative} pour UNE VM, au format
+    attendu par compute_gap_grade.
+
+    ⚠️ Réutilise _representative_value — NE JAMAIS reconstruire les valeurs
+    à la main. Un SLO peut être exprimé en ressource ABSOLUE (unit "cores"
+    ou "GB") alors que le collector mesure un POURCENTAGE d'usage ;
+    _representative_value applique déjà la conversion
+    disponible = capacité_totale × (1 − usage/100) quand slo["unit"] est
+    dans _ABSOLUTE_UNITS. Recalculer cette valeur sans passer par elle
+    donnerait un Gap Grade silencieusement FAUX (aucune exception levée) —
+    ex. comparer 20 (le %) à un seuil de 2.5 cœurs au lieu de 3.2 (les
+    cœurs réellement disponibles).
+
+    Ne retient que les SLOs primaires de métrique connue de METRICS_REGISTRY
+    (même filtre que compute_gap_grade) ; valeur None si non valorisable.
+    """
+    values: Dict[str, Optional[float]] = {}
+    for raw in slos:
+        slo = _as_slo_dict(raw)
+        if not slo.get("is_primary"):
+            continue
+        metric = slo.get("metric")
+        if metric not in config.METRICS_REGISTRY:
+            continue
+        value, _from_predictions = _representative_value(
+            vm_id, metric, slo, candidate, predictions_map
+        )
+        values[metric] = value
+    return values
+
+
+def build_gap_grade(
+    slos:         List[Any],
+    values:       Dict[str, Optional[float]],
+    is_compliant: bool,
+    evaluable:    bool,
+) -> GapGrade:
+    """
+    Assemble la structure GapGrade à partir de valeurs déjà calculées
+    (slo_values_for_vm). `is_compliant`/`evaluable` viennent TOUJOURS de la
+    logique de conformité existante (evaluate_provider) — jamais déduits du
+    signe de `value` (voir l'avertissement de compute_gap_grade).
+    """
+    retained = _retained_primary_slos(slos, values)
+    value    = compute_gap_grade(slos, values)
+    coverage = tuple(metric for _, metric, _, _ in retained)
+    detail   = {
+        metric: signed_excess(v, threshold, slo["operator"])
+        for slo, metric, threshold, v in retained
+    }
+    return GapGrade(
+        value        = value,
+        is_compliant = is_compliant,
+        evaluable    = evaluable,
+        coverage     = coverage,
+        detail       = detail,
+    )
 
 
 # ── Évaluation d'une VM ───────────────────────────────────────
@@ -318,6 +680,17 @@ def evaluate_vm(
 
     for slo in applicable:
         metric = slo["metric"]
+        # ⚠️ La CONFORMITÉ ne porte QUE sur les SLOs PRIMAIRES — règle métier.
+        # Un secondaire est issu du MI : son seuil est un percentile inféré
+        # sur l'historique d'UNE VM, jamais un engagement pris envers le
+        # client. Lui laisser un droit de veto écarte des VMs qui respectent
+        # le contrat (ex. latence 32 ms < 40 ms recalée pour « cpu 0.46 <
+        # 1.0 cœur »), et peut réduire un provider entier au silence puisque
+        # sans VM conforme il ne propose plus aucune offre.
+        # Les secondaires gardent TOUTE leur influence ailleurs : pondération
+        # de TOPSIS (services/decision_intelligence/topsis.py, qui lit le
+        # poids de tous les SLOs sans filtre) et violation_score ci-dessous.
+        is_primary = bool(slo.get("is_primary"))
         value, from_predictions = _representative_value(
             vm_id, metric, slo, candidate, predictions_map
         )
@@ -327,17 +700,19 @@ def evaluate_vm(
             # Règle _filter_candidates : absence de prédiction ⇒ NON conforme.
             # On ne promet pas le respect d'un SLO sur la foi d'une mesure
             # passée ; seule une prédiction engage sur l'état futur.
-            satisfies_all = False
+            if is_primary:
+                satisfies_all = False
 
         if value is None:
             # Métrique non valorisable : ni prédiction ni mesure. Elle ne peut
             # ni confirmer la conformité, ni contribuer au score.
-            satisfies_all = False
+            if is_primary:
+                satisfies_all = False
             continue
 
         valorised += 1
 
-        if not vm_satisfies_slo(value, slo):
+        if is_primary and not vm_satisfies_slo(value, slo):
             satisfies_all = False
 
         threshold_raw = slo.get("threshold")

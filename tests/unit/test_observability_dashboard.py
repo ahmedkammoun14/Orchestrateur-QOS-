@@ -66,7 +66,10 @@ def test_dashboard_injecte_provider_of_vm_et_provider_registry():
     assert "PROVIDER_REGISTRY" in html
     for vm_id in config.PROVIDER_OF_VM:
         assert vm_id in html
-    assert set(config.PROVIDER_OF_VM.keys()) == {"edge1", "cloud1", "edge2", "cloud2"}
+    # Invariant : PROVIDER_OF_VM couvre exactement les VMs enregistrées
+    # (indépendant du nombre de VMs — 4, 8, … — pour ne pas re-casser à chaque
+    # ajout de VM simulée).
+    assert set(config.PROVIDER_OF_VM.keys()) == set(config.VM_REGISTRY.keys())
 
 
 # ── 2. Tuile "Provider actif" ──────────────────────────────────

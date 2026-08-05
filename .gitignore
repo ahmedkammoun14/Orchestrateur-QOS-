@@ -154,3 +154,6 @@ redis.conf
 
 # Dossier local (non versionné)
 /abc/
+
+# Captures video de demo (trop volumineuses pour git)
+*.mp4

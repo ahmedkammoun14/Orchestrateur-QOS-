@@ -39,8 +39,14 @@ def _run(coro):
 
 # ── Helpers de construction ────────────────────────────────────
 
-def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0) -> dict:
-    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit, weight=weight).dict()
+def _slo_dict(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0,
+              is_primary=True) -> dict:
+    # is_primary=True par défaut : ces tests portent sur le CONTRAT — le SLO
+    # doit pouvoir disqualifier une VM. Depuis que la conformité ne retient que
+    # les primaires (hub/provider_arbitration.py::evaluate_vm), un SLO laissé au
+    # défaut False de shared.models.SLO ne disqualifierait plus rien.
+    return SLO(metric=metric, operator=operator, threshold=threshold, unit=unit,
+               weight=weight, is_primary=is_primary).dict()
 
 
 def _candidate(vm_id: str, latency: float, cores=4, ram=8) -> dict:
@@ -62,6 +68,23 @@ def _ctx(vm_ids=("edge1", "cloud1", "edge2", "cloud2")) -> "hub_core._FlowContex
 
 def _prof() -> "hub_core.StepProfiler":
     return hub_core.StepProfiler()
+
+
+async def _run_decide_multi_provider(client, ctx, prof) -> None:
+    """
+    Depuis le lot 6a, _step8_decide (flag ON) dispatche vers
+    _decide_federated, pas _decide_multi_provider : cette dernière devient
+    injoignable par CE chemin (code mort en attente de retrait au lot 6b),
+    mais reste appelable directement, comportement strictement inchangé.
+
+    Ces tests, écrits pour la machine à états multi-provider AVANT le lot
+    6a, testent explicitement _decide_multi_provider — on l'appelle donc
+    directement ici, en reproduisant le seul pré-traitement que faisait
+    autrefois _step8_decide avant de lui déléguer (construction de
+    current_data depuis state.last_collected).
+    """
+    current_data = hub_core._build_candidates(hub_core.state.last_collected)
+    await hub_core._decide_multi_provider(client, ctx, prof, current_data)
 
 
 def _prime(service_vm: str, candidates: list, predictions: dict, slos=None, cycle=5) -> None:
@@ -236,7 +259,7 @@ def test_chemin_a_decide_recoit_exactement_les_vms_conformes(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     decide_calls = [c for c in calls if c["url"].endswith("/decide")]
     assert len(decide_calls) == 1
@@ -261,7 +284,7 @@ def test_chemin_a_n_appelle_pas_le_relais(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert [c for c in calls if c["url"].endswith("/handoff")] == []
 
@@ -295,7 +318,7 @@ def test_chemin_bc_appelle_handoff_avec_bon_target_et_attempted(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", fake_post)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     handoff_calls = [c for c in calls if c["url"].endswith("/handoff")]
     assert len(handoff_calls) == 1
@@ -321,7 +344,7 @@ def test_prend_local_conforme_migre_vers_local_topsis_to_vm(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", fake_post)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert hub_core.state.service_vm == "cloud2"
     assert hub_core.state.last_decision["decision"] == "migrate"
@@ -343,7 +366,7 @@ def test_prend_local_meilleure_migre_vers_negotiation_winning_vm(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", fake_post)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert hub_core.state.service_vm == "edge2"
     assert hub_core.state.last_decision["decision"] == "migrate"
@@ -370,7 +393,7 @@ def test_cede_a_l_offre_migre_vers_notre_best_effort_vm(monkeypatch):
         _preds(edge1=40.0, cloud1=32.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert hub_core.state.service_vm == "cloud1"
     assert hub_core.state.last_decision["decision"] == "migrate"
@@ -397,7 +420,7 @@ def test_cede_a_l_offre_stay_si_best_effort_vm_deja_actif(monkeypatch):
         _preds(edge1=32.0, cloud1=40.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert hub_core.state.service_vm == "edge1"
     assert hub_core.state.last_decision["decision"] == "stay"
@@ -418,7 +441,7 @@ def test_aucune_option_reste_stay_avec_placement_impossible(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", fake_post)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert hub_core.state.last_decision["decision"] == "stay"
     assert "PLACEMENT_IMPOSSIBLE" in hub_core.state.last_decision["reason"]
@@ -442,7 +465,7 @@ def test_relais_injoignable_stay_sans_exception_warning_journalise(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", _fake_post_unreachable)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
 
     assert hub_core.state.last_decision["decision"] == "stay"
     assert any("passation" in m.lower() or "relais" in m.lower() or "relay" in m.lower()
@@ -463,7 +486,7 @@ def test_relais_409_anti_boucle_stay_sans_exception(monkeypatch):
     monkeypatch.setattr(hub_core, "_post", _fake_post_409)
     _prime_provider_1_sans_conforme()
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))   # ne doit pas lever
 
     assert hub_core.state.last_decision["decision"] == "stay"
     assert len(warnings) > 0
@@ -481,7 +504,7 @@ def test_vm_active_hors_registre_replie_sur_mono_provider(monkeypatch):
 
     _prime("vm-fantome", [_candidate("edge1", 20.0)], _preds(edge1=20.0))
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert len(mono_calls) == 1
     assert any("PROVIDER_OF_VM" in m for m in warnings)
@@ -508,7 +531,7 @@ def test_cooldown_actif_stay_immediat_sans_evaluation_ni_passation(monkeypatch):
     _prime_provider_1_sans_conforme()
     hub_core.state.last_migration_ts = time.monotonic()   # cooldown actif
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert post_calls == []
     assert eval_calls == []
@@ -543,7 +566,7 @@ def test_audit_contient_provider_path_et_provider_used_chemin_a(monkeypatch):
         _preds(edge1=20.0, cloud1=25.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert len(audits) == 1
     assert audits[0]["provider_path"] == "A"
@@ -577,7 +600,7 @@ def test_audit_contient_provider_path_et_provider_used_chemin_c(monkeypatch):
         _preds(edge1=40.0, cloud1=32.0, edge2=50.0, cloud2=55.0),
     )
 
-    _run(hub_core._step8_decide(client=None, ctx=_ctx(), prof=_prof()))
+    _run(_run_decide_multi_provider(client=None, ctx=_ctx(), prof=_prof()))
 
     assert len(audits) == 1
     assert audits[0]["provider_path"] == "C"

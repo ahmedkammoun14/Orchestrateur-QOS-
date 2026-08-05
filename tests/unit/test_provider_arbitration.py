@@ -31,13 +31,21 @@ from hub.provider_arbitration import (
 
 # ── Helpers ───────────────────────────────────────────────────
 
-def _slo(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0) -> SLO:
+def _slo(metric="latency", operator="<", threshold=30.0, unit="ms", weight=1.0,
+         is_primary=True) -> SLO:
+    # is_primary=True par défaut : ces tests portent tous sur le CONTRAT — le
+    # SLO doit pouvoir disqualifier une VM. Depuis que la conformité ne retient
+    # que les primaires (hub/provider_arbitration.py::evaluate_vm), un SLO
+    # laissé au défaut False de shared.models.SLO ne disqualifierait plus rien
+    # et le test deviendrait vide de sens. Passer is_primary=False
+    # explicitement pour tester un secondaire.
     return SLO(
         metric=metric,
         operator=operator,
         threshold=threshold,
         unit=unit,
         weight=weight,
+        is_primary=is_primary,
     )
 
 

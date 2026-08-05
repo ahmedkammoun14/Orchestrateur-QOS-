@@ -9,6 +9,11 @@ from scipy.special import digamma
 from shared import config
 from shared.models import SLO
 
+# Unités de ressource ABSOLUE : le seuil est déjà exprimé dans l'unité finale
+# (cœurs / Go) et ne doit PAS être borné par les bounds du registre, qui sont
+# en POURCENTAGE. Miroir de hub/provider_arbitration.py::_ABSOLUTE_UNITS.
+_ABSOLUTE_UNITS = ("cores", "GB")
+
 logger = logging.getLogger("MetricsHandler")
 
 
@@ -365,33 +370,21 @@ class MetricsHandler:
 
             # ── SLO SECONDAIRE : adaptatif SI corrélation MI ─────────
             if is_correlated:
-                vals = [p.get(metric) for p in history if p.get(metric) is not None]
-                threshold = self._adaptive_percentile(vals)
-                if threshold is None:
+                slo = self._build_secondary_slo(metric, reg, mi_score, history)
+                if slo is None:
                     logger.debug(
                         f"🔍 {metric} corrélée (MI={mi_score:.3f}) mais "
                         "historique insuffisant — SLO secondaire ignoré"
                     )
                     continue
 
-                threshold = self._clamp_to_bounds(metric, threshold)
-                slo = SLO(
-                    metric=metric,
-                    operator=reg["operator"],
-                    threshold=threshold,
-                    unit=reg["unit"],
-                    target=threshold * 0.9,
-                    weight=mi_score,
-                    window="5m",
-                    is_primary=False,
-                )
                 final_slos.append(slo)
                 active_metrics.append(metric)
                 secondary_metrics.append(metric)
                 logger.debug(
                     f"📈 SLO SECONDAIRE — {metric} "
-                    f"| seuil adaptatif : {threshold:.2f} {reg['unit']} "
-                    f"| MI : {mi_score:.3f} | opérateur : {reg['operator']}"
+                    f"| seuil adaptatif : {slo.threshold:.2f} {slo.unit} "
+                    f"| MI : {mi_score:.3f} | opérateur : {slo.operator}"
                 )
             else:
                 logger.debug(
@@ -446,8 +439,23 @@ class MetricsHandler:
         covered_metrics: set = set()
         for s in slos:
             s.is_primary = True
-            s.threshold  = self._clamp_to_bounds(s.metric, s.threshold)
-            s.target     = min(s.target, s.threshold * 0.95)
+            # ⚠️ Pas de _clamp_to_bounds sur une unité ABSOLUE : les bounds du
+            # registre sont en POURCENTAGE (cpu_usage → min 1.0, max 99.0).
+            # Les y confronter transformait « >= 0.5 cores » en « >= 1.0 »,
+            # doublant silencieusement l'exigence du client. Même garde que
+            # _build_secondary_slo, qui documente déjà ce piège.
+            if s.unit not in _ABSOLUTE_UNITS:
+                s.threshold = self._clamp_to_bounds(s.metric, s.threshold)
+            # La cible de DÉTECTION doit toujours se déclencher AVANT la
+            # rupture du contrat. Pour un critère de COÛT (« < »), cela veut
+            # dire une cible plus BASSE que le seuil ; pour un critère de
+            # BÉNÉFICE (« >= »), une cible plus HAUTE. Appliquer min() dans les
+            # deux cas retardait la détection des critères de bénéfice
+            # (« >= 0.5 » détecté à 0.475, donc après coup).
+            if s.operator in (">", ">="):
+                s.target = max(s.target, s.threshold * 1.05)
+            else:
+                s.target = min(s.target, s.threshold * 0.95)
             # Poids issu directement du LLM : l'analyse de l'intention pondère
             # les critères selon leur importance métier (ex. latence dominante
             # pour une alerte temps réel). Repli à 1.0 si le LLM n'a pas fourni
@@ -478,33 +486,21 @@ class MetricsHandler:
                 if mi_score <= config.MI_RELATIVE_THRESHOLD:
                     continue
 
-                vals = [p.get(metric) for p in history if p.get(metric) is not None]
-                threshold = self._adaptive_percentile(vals)
-                if threshold is None:
+                slo = self._build_secondary_slo(metric, reg, mi_score, history)
+                if slo is None:
                     logger.debug(
                         f"🔍 {metric} corrélée (MI={mi_score:.3f}) mais "
                         "historique insuffisant — SLO secondaire ignoré"
                     )
                     continue
 
-                threshold = self._clamp_to_bounds(metric, threshold)
-                slo = SLO(
-                    metric=metric,
-                    operator=reg["operator"],
-                    threshold=threshold,
-                    unit=reg["unit"],
-                    target=threshold * 0.9,
-                    weight=mi_score,
-                    window="5m",
-                    is_primary=False,
-                )
                 final_slos.append(slo)
                 active_metrics.append(metric)
                 secondary_metrics.append(metric)
 
                 logger.debug(
                     f"📈 SLO SECONDAIRE — {metric} "
-                    f"| seuil adaptatif : {threshold:.2f} {reg['unit']} "
+                    f"| seuil adaptatif : {slo.threshold:.2f} {slo.unit} "
                     f"| MI : {mi_score:.3f}"
                 )
 
@@ -537,6 +533,62 @@ class MetricsHandler:
             return val
         b = self.registry[metric]["bounds"]
         return max(b["min"], min(b["max"], val))
+
+    def _capacity_floor(self, metric: str) -> Optional[Tuple[str, float]]:
+        """
+        Retourne (unité, plancher de disponibilité) si `metric` a une
+        capacité physique associée (cpu_usage → cœurs, ram_usage → Go) —
+        sinon None, auquel cas l'ancien percentile adaptatif en % reste
+        utilisé (comportement inchangé pour toute autre métrique).
+        """
+        table = {
+            "cpu_usage": ("cores", config.AUTONOMOUS_CPU_FLOOR_CORES),
+            "ram_usage": ("GB",    config.AUTONOMOUS_RAM_FLOOR_GB),
+        }
+        return table.get(metric)
+
+    def _build_secondary_slo(
+        self,
+        metric: str,
+        reg: Dict[str, Any],
+        mi_score: float,
+        history: List[Dict[str, Any]],
+    ) -> Optional[SLO]:
+        """
+        Construit le SLO secondaire adaptatif pour `metric`. Bascule
+        automatiquement en disponibilité absolue (cœurs/Go, operator ">=")
+        si `_capacity_floor` renvoie une entrée — cohérent avec les SLOs
+        primaires du LLM en mode ENHANCED, qui utilisent déjà cette
+        convention pour cpu_usage/ram_usage. Sinon conserve le percentile
+        adaptatif historique en %.
+        """
+        floor = self._capacity_floor(metric)
+        if floor is not None:
+            unit, threshold = floor
+            operator = ">="
+            # Pas de _clamp_to_bounds ici : les bounds du registre sont en %
+            # (ex. {"min":1.0,"max":99.0}), pas en cœurs/Go — clamp non
+            # pertinent et potentiellement faux pour un plancher de capacité.
+        else:
+            vals = [p.get(metric) for p in history if p.get(metric) is not None]
+            threshold = self._adaptive_percentile(vals)
+            if threshold is None:
+                return None
+            threshold = self._clamp_to_bounds(metric, threshold)
+            unit = reg["unit"]
+            operator = reg["operator"]
+
+        target = threshold * 1.1 if operator in (">", ">=") else threshold * 0.9
+        return SLO(
+            metric=metric,
+            operator=operator,
+            threshold=threshold,
+            unit=unit,
+            target=target,
+            weight=mi_score,
+            window="5m",
+            is_primary=False,
+        )
 
     def _normalize_weights(self, slos: List[SLO]) -> List[SLO]:
         """Normalise les poids pour qu'ils somment à 1.0."""

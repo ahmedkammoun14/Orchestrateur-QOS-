@@ -12,17 +12,41 @@ STAGE_DIR = "/home/ubuntu/stage"
 # Mapping VM → cluster kubectl
 VM_CLUSTER_MAP: Dict[str, str] = {
     "edge1":  "edge-cluster",
+    "edge1b": "edge-cluster",
+    "edge1c": "edge-cluster",
     "edge2":  "edge-cluster",
+    "edge2b": "edge-cluster",
+    "edge2c": "edge-cluster",
     "cloud1": "cloud-cluster",
     "cloud2": "cloud-cluster",
 }
 
-# Mapping node Kubernetes → vm_id
+# Mapping node Kubernetes → vm_id. Une seule VM CANONIQUE par node physique :
+# les VMs simulées (edge1b/edge1c, edge2b/edge2c) partagent le node de leur
+# machine hôte (plusieurs instances de l'agent VM sur la même machine, à des
+# ports différents) — le retour node→VM est donc volontairement ambigu ici et
+# renvoie la VM canonique du node, pas l'instance précise.
 NODE_VM_MAP: Dict[str, str] = {
     "pop1-worker-1": "edge1",
     "pop1-worker-2": "edge2",
     "pop2-worker-1": "cloud1",
     "pop2-worker-2": "cloud2",
+}
+
+# Fichier YAML de déploiement par VM — déclaratif, aligné sur la version déjà
+# déployée sur le master. Un YAML par PROVIDER (espace de déploiement), pas
+# par VM individuelle : toutes les VMs d'un même provider (transversal
+# edge+cloud) partagent le même fichier, cohérent avec l'axe provider
+# orthogonal à l'axe cluster déjà en place ailleurs dans le projet.
+YAML_PER_VM: Dict[str, str] = {
+    "edge1":  "tc-stream-source-cloud1.yaml",  # space_1 (provider-1)
+    "edge1b": "tc-stream-source-cloud1.yaml",
+    "edge1c": "tc-stream-source-cloud1.yaml",
+    "cloud1": "tc-stream-source-cloud1.yaml",
+    "edge2":  "tc-stream-source-cloud.yaml",   # space_2 (provider-2)
+    "edge2b": "tc-stream-source-cloud.yaml",
+    "edge2c": "tc-stream-source-cloud.yaml",
+    "cloud2": "tc-stream-source-cloud.yaml",
 }
 
 K8S_NAMESPACE       = "tc"

@@ -1,0 +1,6 @@
+2. Fenêtre PowerShell 1 — provider-1 :
+
+.\venv\Scripts\python.exe launch_provider.py --provider provider1
+3. Fenêtre PowerShell 2 — provider-2 :
+
+.\venv\Scripts\python.exe launch_provider.py --provider provider2
