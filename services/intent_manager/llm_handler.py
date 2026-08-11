@@ -157,6 +157,10 @@ class LLMHandler:
     async def _level1_llm(self, text: str, context: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
         rag_summary = {
             "active_slos": context.get("active_slos", []),
+            # Intention PRECEDENTE — permet de decider merge_strategy sur le
+            # sens (meme usage ou usage different) plutot que sur la seule
+            # formulation. None au tout premier appel.
+            "last_intention": context.get("last_intention"),
             "service_vm":  context.get("service_vm", "unknown"),
             "cycle":       context.get("cycle", 0),
         }
@@ -210,16 +214,20 @@ class LLMHandler:
             "porte la valeur métier de l'intention (ex: la latence pour une alerte, le "
             "CPU pour du calcul intensif).\n"
             "6. Détermine aussi merge_strategy — comment tes SLOs doivent se combiner avec "
-            "active_slos :\n"
-            "   - \"replace\" : l'intention donne des valeurs précises et complètes pour les "
-            "métriques qu'elle mentionne (même reliées par \"et\"/\"aussi\" dans la phrase) — "
-            "elle se suffit à elle-même, les anciens SLOs non mentionnés doivent disparaître.\n"
-            "   - \"additive\" : l'intention utilise un langage relatif qui n'a de sens QUE "
-            "par rapport à active_slos (ex: \"minimal\", \"encore plus bas\", \"pareil mais "
-            "plus strict\", \"aussi rapide qu'avant\") — calcule alors la nouvelle valeur à "
-            "partir de active_slos, et les métriques non concernées par l'intention restent "
-            "inchangées.\n"
-            "   Par défaut, si l'intention est autonome et chiffrée : \"replace\".\n"
+            "active_slos. Commence par comparer last_intention (l'intention PRÉCÉDENTE, "
+            "éventuellement absente) avec l'intention courante :\n"
+            "   - Si last_intention est absente, vide ou nulle : \"replace\".\n"
+            "   - \"additive\" : les deux intentions portent sur le MÊME usage ET la nouvelle "
+            "se réfère à la précédente (ex: \"encore plus bas\", \"pareil mais plus strict\", "
+            "\"aussi rapide qu'avant\") — calcule alors la nouvelle valeur à partir "
+            "d'active_slos, et les métriques non concernées restent inchangées.\n"
+            "   - \"replace\" : les deux intentions décrivent des usages DIFFÉRENTS (ex: "
+            "\"upscaling 4K par IA\" puis \"je regarde un direct\"), même si la nouvelle "
+            "emploie un langage relatif comme \"le plus faible possible\" — elle se suffit "
+            "alors à elle-même et les anciens SLOs doivent disparaître.\n"
+            "   - \"replace\" aussi quand l'intention donne des valeurs précises et complètes "
+            "pour les métriques qu'elle mentionne, même reliées par \"et\"/\"aussi\".\n"
+            "   En cas de doute : \"replace\".\n"
             "7. Le NOMBRE de SLOs varie selon l'intention : très souvent 1 ou 2 "
             "suffisent. N'ajoute cpu_usage et/ou ram_usage QUE si le service "
             "réalisateur est réellement gourmand en calcul ou en mémoire. Une "

@@ -11,6 +11,7 @@ An autonomous QoS orchestration system for microservices, enabling adaptive Qual
 
 ## Table of Contents
 - [Overview](#overview)
+- [What This Repository Contains — and What It Does Not](#what-this-repository-contains--and-what-it-does-not)
 - [Academic Context](#academic-context)
 - [Architecture](#architecture)
 - [Multi-Provider Federation](#multi-provider-federation)
@@ -43,8 +44,28 @@ In modern distributed environments, maintaining consistent performance is a chal
 Each provider runs its **own complete orchestrator stack** (12 microservices), the second one offset by `PORT_OFFSET=100`. Neither is a master: whichever hosts the service is `ACTIVE`, the other is `STANDBY`, and the role follows the service across migrations.
 
 The system operates in two modes:
-- **Autonomous** — fixed business objective (latency < 40 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
+- **Autonomous** — fixed business objective (latency < 28 ms, `shared/config.py` `METRICS_REGISTRY["latency"]["default_threshold"]`), secondary SLOs discovered automatically by MI.
 - **Enhanced** — SLOs injected by the user via natural language (LLM also assigns each SLO's **weight** and decides the **merge_strategy** — REPLACE or ADDITIVE — against active SLOs), enriched by MI-driven secondary SLOs.
+
+> **Start here:** [`ETAPES_LANCEMENT_PROJET.md`](ETAPES_LANCEMENT_PROJET.md) is the operational runbook — the exact order in which to train the ML models, start the infrastructure, launch the two providers, and run the demo, with the troubleshooting table for the failures we actually hit.
+
+---
+
+## What This Repository Contains — and What It Does Not
+
+This repository holds the **orchestrator** and nothing else: the twelve microservices, the hub, the shared configuration, and the test suite. That is the contribution.
+
+Everything that runs *outside* the orchestrator is deliberately **not versioned here**:
+
+| Component | Where it actually lives | Why it is not in the repo |
+|---|---|---|
+| Per-VM agents (`/ping`, `/metrics`) | the 8 OpenStack VMs | one deployed copy per VM, edited in place; a versioned copy diverges silently from what runs |
+| PiCar bridge + HTML simulator | Raspberry Pi, `~/Projet_PFE/multiProvider/` | same reason — the PiCar is the source of truth |
+| `openstack_client.py` (kubectl) | the OpenStack master `194.199.113.8` | holds cluster-specific `NODE_VM_MAP` and YAML paths |
+| ML prediction APIs (`:5001/:5002/:5003`) | separate `Api-Model-Predict` project | own training datasets (192 000 rows), own lifecycle |
+| Training datasets, logs, measurement exports | local disk | volume, and they are session artefacts, not source |
+
+The consequence is explicit: **cloning this repository reproduces the orchestrator, not the demo.** Reproducing the demo requires the physical infrastructure described in [Real Infrastructure](#real-infrastructure) and the deployment steps in [`ETAPES_LANCEMENT_PROJET.md`](ETAPES_LANCEMENT_PROJET.md).
 
 ---
 
@@ -147,7 +168,7 @@ Federated placement follows the **Contract Net Protocol** (Smith, *IEEE Trans. C
 
 `SLO_ENFORCEMENT = "hard"`: a non-compliant placement is **never** elected. If no VM anywhere satisfies the primaries, the outcome is `INFEASIBLE` and the service stays where it is.
 
-The **dead-band** (`ARBITER_DEADBAND = 0.05`) protects the incumbent: a challenger must beat it by more than 0.05. The band is **absolute, not relative** — the Gap Grade is already normalised by the threshold, so 0.05 reads directly as *"must win by more than 5 % of the threshold"* (2 ms on a 40 ms SLO). It is an engineering parameter, not a measured one.
+The **dead-band** (`ARBITER_DEADBAND = 0.05`) protects the incumbent: a challenger must beat it by more than 0.05. The band is **absolute, not relative** — the Gap Grade is already normalised by the threshold, so 0.05 reads directly as *"must win by more than 5 % of the threshold"* (1.4 ms on a 28 ms SLO). It is an engineering parameter, not a measured one.
 
 Note the deliberate asymmetry: the dead-band guards **provider** changes; a VM change *within* the winning provider is guarded only by the temporal `MIGRATION_COOLDOWN_S`.
 
@@ -183,8 +204,8 @@ HTTP/JSON serialisation also provides intent isolation: one provider cannot muta
 
 ## Key Technical Features
 
-- **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 4 OpenStack VMs.
-- **Position-based simulated latency**: the closer the vehicle, the lower the latency. Two implementations coexist — see [PiCar-X Demo](#picar-x-demo--position-based-latency) — the versioned reference (`infrastructure/vm_agent.py`, unbounded linear) and the **clamped per-tier model** actually deployed on the VMs, which bounds latency between a floor `B` and a ceiling `A` distinct for edge and cloud.
+- **End-to-end QoS pipeline**: real flow from the PiCar-X (Raspberry Pi) → `latency_manager` → `hub` → automatic decision across 8 OpenStack VMs split over two providers.
+- **Position-based simulated latency**: the closer the vehicle, the lower the latency. The deployed model is **clamped per tier** — see [PiCar-X Demo](#picar-x-demo--position-based-latency) — bounding latency between a floor `B` and a ceiling `A` distinct for edge and cloud.
 - **7-step TOPSIS**: multicriteria VM selection (Min-Max normalization, weighting, Euclidean distances to ideal solutions A⁺ and A⁻). Criteria: SLO metrics (latency, CPU, RAM). Uses **ML predictions** as input values — not raw measurements — to anticipate future state.
 - **Active VM as TOPSIS candidate**: the currently active VM is always included in the decision pool. If TOPSIS selects it despite a violation → STAY (it remains the best option). This prevents unnecessary migrations when the current VM is still the least-bad choice.
 - **Transversal multi-provider arbitration**: two providers, each spanning both tiers, negotiating over HTTP with an absolute dead-band. TOPSIS stays confined to a single provider's compliant VMs; the normalised violation score is the only cross-provider comparison. See [Multi-Provider Federation](#multi-provider-federation).
@@ -229,72 +250,80 @@ The distance at which a VM still meets a latency SLO of threshold `T` — its **
 D_slo(T) = D_MIN + (T − B) / (A − B) × (D_MAX − D_MIN)      valid iff  B < T < A
 ```
 
-At `T = 100 ms` this yields a radius of **53.4** for an edge VM against **24.4** for a cloud VM: the edge covers more than twice the ground. Raising `T` to 150 would make every edge VM compliant everywhere (`T ≥ A_edge`), so no latency violation could ever fire — the useful window is roughly 80–120 ms.
-
-> **Versioning gap.** The clamped model above lives in the per-VM scripts deployed on the OpenStack nodes, which are **not tracked in this repository**. The versioned `infrastructure/vm_agent.py` still implements the earlier unbounded form `latency_ms = VM_BASE_MS + VM_K_MS_PER_CM × distance_cm`. Cloning this repo therefore reproduces the orchestrator, not the exact demo physics.
+Inverting the relation gives the **conformity radius** used to size the demo. At the operating threshold `θ = 28 ms`, an edge VM stays compliant within **19.8 cm** and a cloud VM is compliant nowhere (`θ < B_cloud = 50`) — which is precisely what forces the service onto the edge tier and makes the federation necessary rather than decorative.
 
 ### VM Positions on the Map
 
-| VM | x (cm) | y (cm) | Type |
-|---|---|---|---|
-| edge1 | -20 | +50 | Edge (blue square) |
-| edge2 | +30 | -10 | Edge (blue square) |
-| cloud1 | -20 | -10 | Cloud (orange diamond) |
-| cloud2 | +30 | +50 | Cloud (orange diamond) |
+The 8 VMs were repositioned by k-means over the recorded trajectory so that every provider covers a distinct arc of the lap. Coordinates are in centimetres, in the simulator's frame:
 
-### Components
+| VM | x | y | Tier | Provider |
+|---|---|---|---|---|
+| edge1 | +3 | −9 | Edge | provider-1 |
+| edge1b | +34 | +19 | Edge | provider-1 |
+| edge1c | −6 | +51 | Edge | provider-1 |
+| cloud1 | −4 | +34 | Cloud | provider-1 |
+| edge2 | +31 | −8 | Edge | provider-2 |
+| edge2b | +4 | +23 | Edge | provider-2 |
+| edge2c | −23 | +30 | Edge | provider-2 |
+| cloud2 | +18 | +4 | Cloud | provider-2 |
 
-**`infrastructure/picar_bridge.py`** — Flask server on the PiCar (port 8080):
+At `θ = 28 ms`, provider-1 alone covers **45.6 %** of the lap and provider-2 **47.1 %**; together they reach **92.7 %**. Neither provider can hold the service for a full lap on its own — the inter-provider handover is a physical necessity of the layout, not a staged event.
+
+### Components — deployed, not versioned
+
+**`picar_bridge_QoS1.py`** — Flask server on the Raspberry Pi (port 8080):
 
 | Route | Method | Description |
 |---|---|---|
 | `/` | GET | Serves the HTML simulator |
 | `/Trajectoire.jpg` | GET | Serves the track image |
-| `/tick` | POST | Receives `{x, y}`, pings 4 VMs in parallel, sends RTT to hub |
-| `/vm-status` | GET | Proxies `GET :8000/status` from hub → returns `service_vm` |
+| `/tick` | POST | Receives `{x, y}`, pings the 8 VMs in parallel, forwards RTT to **both** latency managers |
+| `/active-vm-push` | POST | Receives the active hub's state at the end of each cycle |
+| `/vm-status` | GET | Returns the precise active VM — push, then hub polling, then last known value |
 
-**`infrastructure/vm_ping/`** — one script per VM (edge1/edge2/cloud1/cloud2):
+The active-VM resolution is three-tiered on purpose. The push is preferred because the hub emits it at the exact moment its cycle closes, so `service_vm`, `cycle` and `last_decision` are mutually consistent; polling is the fallback when pushes are lost (they are fire-and-forget, never retried). The former kubectl fallback was **removed**: `openstack_client` resolves to the Kubernetes *node* and would report `edge1` while the service actually ran on `edge1c`.
+
+**Per-VM agent** — one process per simulated VM:
 
 | Port | Description |
 |---|---|
-| 5001 | `POST /ping {x,y}` → computes distance, sleeps `latency_ms/1000`, returns latency |
-| 8200 | `GET /metrics` → CPU/RAM via psutil |
+| 5001–5003 | `POST /ping {x,y}` → computes distance, sleeps `latency_ms/1000`, returns latency |
+| 8200–8202 | `GET /metrics` → CPU/RAM via psutil |
 
-**`infrastructure/picarx_sim.html`** — visual trajectory simulator:
-- Animated car on a looped track
-- Real-time latency displayed next to each VM
-- **"Service active on" badge** — shows the VM hosting the service (polls `/vm-status` every 3s)
-- **Cyan highlight** — active VM glows with a halo and `★ [ACTIVE]` label on the canvas
+Three VMs share one physical host (`edge1`, `edge1b`, `edge1c` on `194.199.113.18`), hence three port pairs per host.
 
-Access: `http://140.93.64.105:8080/`
+**`picarx_sim_QoS.html`** — visual trajectory simulator: animated car on the recorded track, real-time latency next to each VM, active-VM badge with cyan halo, and the active provider tile.
 
 ### Demo Flow
 
 ```
 Browser (PC)
-    │  GET http://140.93.64.105:8080/          → HTML simulator
-    │  POST /tick {x,y}  every 2s              → real-time latencies
-    │  GET /vm-status    every 3s              → active VM badge
+    │  GET  http://<picar>:8080/               → HTML simulator
+    │  POST /tick {x,y}      every 2 s         → real-time latencies
+    │  GET  /vm-status       every 2 s         → active VM badge
     ▼
-picar_bridge.py (PiCar :8080)
-    │  POST /ping {x,y} × 4 VMs in parallel   → simulated latency
-    │  POST /rtt {measurements}                → triggers hub cycle
-    │  GET  http://140.93.89.92:8000/status   → current service_vm
-    ▼
-VMs (port 5001) + Hub (port 8000)
+picar_bridge_QoS1.py (PiCar :8080)
+    │  POST /ping {x,y} × 8 VMs in parallel    → simulated latency
+    │  POST :8001/rtt   (provider-1 VMs)       ┐ partitioned by provider,
+    │  POST :8101/rtt   (provider-2 VMs)       ┘ throttled to one send per 5 s
+    ▲  POST /active-vm-push  from the ACTIVE hub, end of each cycle
+    │
+    └── Hub provider-1 :8000        Hub provider-2 :8100
 ```
+
+The effective cycle is **6.0 s** — `SEND_INTERVAL_S = 5 s` quantised by the browser's 2 s tick — of which ~4.7 s is orchestration work. Every timing parameter in the demo is dimensioned against that figure.
 
 ### Starting the Demo
 
-```bash
-# On the PiCar (pi@140.93.64.105)
-cd ~/Projet_PFE/trajectoire
-python picar_bridge.py
+See [`ETAPES_LANCEMENT_PROJET.md`](ETAPES_LANCEMENT_PROJET.md) for the full ordered runbook. In outline:
 
-# On each VM (e.g. edge1)
-ssh -i ~/projet_PFE/admin_log_2.pem ubuntu@194.199.113.18
-cd ~/projet_PFE/trajectoire
-python edge1_ping.py
+```bash
+# On each OpenStack VM
+ssh -i ~/projet_PFE/admin_log_2.pem ubuntu@194.199.113.18   # edge1 / edge1b / edge1c
+./launch_edge1_machine.sh
+
+# On the Raspberry Pi
+cd ~/Projet_PFE/multiProvider && python3 picar_bridge_QoS1.py
 ```
 
 ---
@@ -344,6 +373,7 @@ PLACEMENT_ARBITER_PORT=8011
 FEDERATION_VIEW_PORT=8500
 ARBITER_DEADBAND=0.05         # ABSOLUTE band on the Gap Grade, not a relative margin
 SLO_ENFORCEMENT=hard          # "hard": never elect a non-compliant placement
+AWARD_GRACE_PERIOD_S=90       # see note below — MUST exceed kubectl propagation time
 ORCHESTRATOR_URL_PROVIDER_1=http://localhost:8000
 ORCHESTRATOR_URL_PROVIDER_2=http://localhost:8100
 RELAY_URL_PROVIDER_1=http://localhost:8010
@@ -367,34 +397,48 @@ INTENT_MODEL=qwen2.5:latest
 OPENSTACK_MASTER_IP=194.199.113.8
 OPENSTACK_SSH_USER=ubuntu
 OPENSTACK_STAGE_DIR=~/stage
+
+# Infrastructure endpoints
+PICAR_BRIDGE_URL=http://140.93.64.105:8080
+ALL_VM_REGISTRY_JSON=            # optional JSON override of the 8 VM endpoints;
+                                 # rejected at startup if any VM is missing
 ```
+
+> **`AWARD_GRACE_PERIOD_S` is the parameter most likely to break the demo.** After an award, the receiving hub must not re-evaluate its role until kubectl has actually propagated the pod. Propagation was measured at **25–85 s**, against a default grace of 15 s. Too short, and the receiver demotes itself, later re-adopts the node's canonical VM, and then "migrates" to where the service already is — the parasitic `edge1 → edge1c` transitions. Set it to **90** for the demo:
+>
+> ```powershell
+> $env:AWARD_GRACE_PERIOD_S="90"
+> ```
+
+> **Guard the trained latency model.** `check_and_retrain_model()` retrains automatically after 3 consecutive RMSE above `RMSE_THRESHOLD`, on the ~800 rows of the current session — silently overwriting the model trained on 192 000 rows. Before a demo, disable it:
+>
+> ```bash
+> curl "http://localhost:5001/update_configs?new_rmse_patience=999999&new_rmse_threshold=999999"
+> ```
 
 ---
 
 ## Real Infrastructure
 
-| Node | IP |
-|---|---|
-| OpenStack Master | `194.199.113.8` |
-| Raspberry Pi (PiCar-X) | `140.93.64.105` |
-| edge1 | `194.199.113.18` |
-| edge2 | `194.199.113.28` |
-| cloud1 | `194.199.113.66` |
-| cloud2 | `194.199.113.69` |
+Eight simulated VMs over **four physical hosts**, plus the master, the PiCar and the orchestrator PC:
 
-Kubernetes clusters: `edge-cluster` & `cloud-cluster`
+| Role | Host | Simulated VMs | Ping ports | Agent ports |
+|---|---|---|---|---|
+| Edge host 1 | `194.199.113.18` | edge1, edge1b, edge1c | 5001–5003 | 8200–8202 |
+| Edge host 2 | `194.199.113.28` | edge2, edge2b, edge2c | 5001–5003 | 8200–8202 |
+| Cloud 1 | `194.199.113.66` | cloud1 | 5001 | 8200 |
+| Cloud 2 | `194.199.113.69` | cloud2 | 5001 | 8200 |
+| OpenStack master | `194.199.113.8` | — kubectl + `openstack_client :8024` | | |
+| Raspberry Pi (PiCar-X) | `140.93.64.105` | — bridge `:8080` | | |
+| Orchestrator PC | `140.93.89.92` | — both provider stacks | | |
+
+Kubernetes clusters: `edge-cluster` & `cloud-cluster`.
+
+Cloud VMs are provisioned at **16 cores / 16 GB**. The earlier 8 GB sizing left available RAM straddling a 6 GB SLO threshold, which produced compliance flapping between consecutive cycles.
+
+> **kubectl granularity.** Three simulated VMs share one Kubernetes node, so kubectl can only ever name the node's canonical VM. Anything that needs the *precise* VM must ask the hub, never the master — this is why the PiCar bridge no longer falls back on `openstack_client`.
 
 > **WSL note**: use `chmod 400` on the PEM key from WSL. Replace `localhost` with the Windows IP (`140.93.89.92`) to access services from WSL.
-
-### Start VM agents
-
-```bash
-chmod 400 ~/projet_PFE/admin_log_2.pem
-ssh -i ~/projet_PFE/admin_log_2.pem ubuntu@194.199.113.18  # edge1
-cd ~/projet_PFE/trajectoire
-python edge1_ping.py
-# Repeat for edge2 (113.28), cloud1 (113.66), cloud2 (113.69)
-```
 
 ---
 
@@ -435,12 +479,13 @@ python launch_provider.py --provider provider1    # hub 8000, relay 8010, arbite
 python launch_provider.py --provider provider2    # hub 8100, relay 8110, arbiter 8111, Redis DB 1
 ```
 
-Then, once, the two shared components:
+Then, once, the shared component:
 
 ```bash
-python -m infrastructure.openstack_client     # :8024 — deployed on the OpenStack master
 python -m services.federation_view.app        # :8500 — read-only federated view
 ```
+
+`openstack_client` (`:8024`) is also shared, but it is **not started from this repository** — it runs on the OpenStack master, where kubectl and the cluster YAMLs live. See [`ETAPES_LANCEMENT_PROJET.md`](ETAPES_LANCEMENT_PROJET.md).
 
 > **Why the Redis purge matters.** Redis runs outside the stack and survives its shutdown. The metric lists keep the last `HISTORY_WINDOW` points (LTRIM), including the previous session's. On restart, the prediction window would hold yesterday's data, then a *mix* of two sessions — an artificial step in the middle of the window that the GRU has never seen in training, sending predictions far off. Purging removes that failure mode entirely; measured effect on the out-of-bounds clamp rate: **7.6 % → 2.3 %**. Use `--keep-redis` to opt out (not recommended).
 
@@ -455,16 +500,15 @@ python -m services.collector.app             # 3. Port 8005
 python -m services.metrics_manager.app       # 4. Port 8004
 python -m services.ml_predictor.app          # 5. Port 8003
 python -m services.decision_intelligence.app # 6. Port 8008
-python -m infrastructure.openstack_client    # 7. Port 8024
-python -m services.intent_manager.app        # 8. Port 8002
-python -m services.latency_manager.app       # 9. Port 8001
-python -m services.observability.app         # 10. Port 8009
-python -m services.placement_arbiter.app     # 11. Port 8011 (multi-provider only)
-python -m services.provider_relay.app        # 12. Port 8010 (multi-provider only)
-python -m hub.orchestrator_core              # 13. Port 8000
+python -m services.intent_manager.app        # 7. Port 8002
+python -m services.latency_manager.app       # 8. Port 8001
+python -m services.observability.app         # 9. Port 8009
+python -m services.placement_arbiter.app     # 10. Port 8011 (multi-provider only)
+python -m services.provider_relay.app        # 11. Port 8010 (multi-provider only)
+python -m hub.orchestrator_core              # 12. Port 8000
 ```
 
-Add `PORT_OFFSET=100` to every command to obtain the provider-2 stack. `infrastructure.openstack_client` (`:8024`) is **shared** and must be started only once.
+Add `PORT_OFFSET=100` to every command to obtain the provider-2 stack. `openstack_client` (`:8024`) must already be running **on the master** before the hub starts — the hub health-checks it.
 
 > **After retraining any ML model, restart `ml_predictor`.** It reads each model's `window_size` **once, at startup** (`services/ml_predictor/app.py`). Retraining can change that value; the predictor would then send a wrongly-sized sequence, the API would answer `400`, and the cascade would fall through to `last_value_fallback` — silently, and permanently. The tell-tale sign is a prediction *exactly equal to the measurement and identical across all 7 horizons*: that is the fallback, not a well-fitted model.
 
@@ -590,19 +634,6 @@ qos-orchestrator/
 │   ├── orchestrator_core.py          # Central hub — decision loop
 │   └── provider_arbitration.py       # Pure module — per-provider evaluation,
 │                                     # violation score, negotiate() + dead-band
-├── infrastructure/
-│   ├── ml_apis/                      # External ML prediction APIs
-│   │   ├── ml_api_rtt.py             # ESN/LSTM latency model — port 5001
-│   │   ├── ml_api_cpu.py             # ESN/LSTM CPU model    — port 5002
-│   │   └── ml_api_ram.py             # ESN/LSTM RAM model    — port 5003
-│   ├── picar_bridge.py               # PiCar Flask bridge (port 8080)
-│   ├── picarx_sim.html               # HTML trajectory simulator
-│   ├── Trajectoire.jpg               # Track image
-│   └── vm_ping/                      # Per-VM ping + metrics scripts
-│       ├── edge1_ping.py             # ping :5001 + agent :8200
-│       ├── edge2_ping.py
-│       ├── cloud1_ping.py
-│       └── cloud2_ping.py
 ├── services/
 │   ├── collector/                    # Real-time metrics collection (EMA timeout)
 │   ├── database/                     # Redis persistence (atomic pipeline)
@@ -625,19 +656,21 @@ qos-orchestrator/
 │   ├── config.py                     # Ports, METRICS_REGISTRY, SLO bounds
 │   ├── models.py                     # Pydantic models (SLO, RTTMeasurement…)
 │   └── redis_keys.py                 # Redis key constants
+├── scripts/                          # Timing export & comparison utilities
 ├── tests/
 │   ├── unit/                         # TOPSIS, MI, violation_detector, LLM handler
 │   └── integration/                  # Full hub → services cycle
-├── infrastructure/openstack_client.py # kubectl migrations — deployed on master :8024
-│                                     # YAML_PER_VM: space_1→edge1/cloud1, space_2→edge2/cloud2
 ├── launch_provider.py                # Launcher — one full stack per provider,
 │                                     # single window, automatic Redis purge
+├── start_provider.ps1                # PowerShell wrapper around launch_provider.py
+├── start_relay.ps1                   # Relay-only launcher (debug)
 ├── start_all_multi.ps1               # Legacy Windows launcher (single-process mode)
-├── PLAN_MULTI_PROVIDER_TRANSVERSAL.md    # Design rationale & locked trade-offs (FR)
-├── SUIVI_MULTI_PROVIDER_TRANSVERSAL.md   # Step-by-step verification journal (FR)
-├── GUIDE_TEST_MULTI_PROVIDER.md          # Manual test scenarios (FR)
+├── ETAPES_LANCEMENT_PROJET.md        # Operational runbook — training, startup, demo (FR)
+├── README.md
 └── requirements.txt
 ```
+
+Deployed elsewhere and intentionally absent from this tree: the per-VM agents, the PiCar bridge and simulator, `openstack_client.py`, and the three ML prediction APIs. See [What This Repository Contains](#what-this-repository-contains--and-what-it-does-not).
 
 ---
 
@@ -674,10 +707,13 @@ qos-orchestrator/
 - [x] Bid and broadcast issued in parallel (`asyncio.gather`)
 - [x] 8 simulated VMs over 4 Kubernetes nodes, with kubectl-granularity handling
 - [x] Automatic Redis purge at stack startup — removes cross-session prediction drift
+- [x] Latency model retrained on the deployed geometry — MAE **50.79 ms → 2.94 ms**, 97.5 % decision accuracy, 0 false alarms. The original model had been trained on a distribution centred at 118 ms while the active VM operates at 5–31 ms, which is what made migrations appear late
+- [x] Precise active-VM reporting on the PiCar dashboard — hub push preferred, kubectl fallback removed (it could only name the canonical VM of a node)
 - [ ] Version guard on the broadcast contract adoption (the `/intent` and award paths already have it)
-- [ ] Version the deployed per-VM latency scripts (see the versioning gap noted above)
+- [ ] Single shared history load for MI and prediction — removes a redundant call and the read/write race on the metric keys. Measured as cycle-time neutral (3 034 ms vs 3 051 ms); deliberately deferred rather than touch the core loop late in the project
+- [ ] Version the deployed per-VM and PiCar scripts in a dedicated infrastructure repository
 - [ ] Calibrate `MI_RELATIVE_THRESHOLD` by permutation test (currently a fixed 0.15)
-- [ ] Retrain the ML models on a dataset matching the real value and jump distributions
+- [ ] Retrain the CPU and RAM models on the deployed geometry, as was done for latency
 - [ ] Experimental validation — negotiation overhead measurement
 - [ ] Docker + docker-compose containerization
 - [ ] Multi-user support and intent isolation

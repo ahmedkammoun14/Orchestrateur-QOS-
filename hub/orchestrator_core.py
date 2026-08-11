@@ -74,6 +74,13 @@ class OrchestratorState:
         # récente. Les hubs tournant sur la MÊME machine, time.time() est
         # directement comparable entre eux — aucune dérive d'horloge à gérer.
         self.intent_version: Optional[float] = None
+        # Texte brut de la DERNIERE intention appliquee. Publie par /status
+        # pour que le LLM puisse comparer l'intention precedente a la
+        # nouvelle et decider si elles portent sur le meme usage
+        # (merge_strategy additive) ou sur deux usages distincts (replace).
+        # Sans lui, le LLM ne voit que des seuils chiffres et juge sur la
+        # seule formulation de la phrase courante.
+        self.last_intention_text: Optional[str] = None
         self.bootstrap_cycles: int = 0
         self.BOOTSTRAP_MIN: int = 5
         self.current_slos: List[Dict[str, Any]] = []
@@ -114,7 +121,12 @@ class OrchestratorState:
                 "reliability":  coll.get("reliability"),
                 "total_cores":  coll.get("total_cores"),
                 "total_ram_gb": coll.get("total_ram_gb"),
-                "is_active":    (vm_id == self.service_vm),
+                # Un hub STANDBY n'heberge rien : service_vm y est un reliquat
+                # de l'epoque ou il etait actif (la demission ne rafraichit que
+                # hosting_vm). Sans ce garde, le payload annonce role="standby"
+                # ET is_active=true — contradictoire — et le consommateur ne
+                # peut pas retomber sur hosting_vm.
+                "is_active":    (vm_id == self.service_vm) and self.is_active,
                 "predictions": {
                     "latency":   preds.get("latency",   {}).get("predictions", []),
                     "cpu_usage": preds.get("cpu_usage", {}).get("predictions", []),
@@ -124,6 +136,10 @@ class OrchestratorState:
         return {
             "vms":           vms_data,
             "slos":          self.current_slos,
+            # Publie le mode : sans lui, un tableau de bord STANDBY ne peut
+            # pas l'afficher. Le frontend ne le recevait que par les audits,
+            # emis uniquement par le hub ACTIF.
+            "mode":          self._mode,
             "mi_scores":     self.last_mi_scores,
             "last_decision": self.last_decision,
             "cycle":         self.cycle_count,
@@ -2201,6 +2217,13 @@ async def receive_intent(payload: Dict[str, Any] = Body(...)):
     }
     state._mode          = "enhanced"
     state.intent_version = incoming_version
+    # Ecrit APRES que le LLM ait deja tourne : au moment de son appel, le hub
+    # contenait encore l'intention precedente — c'est precisement ce dont il
+    # a besoin. On ne remplace que si le champ est fourni, pour ne pas
+    # effacer la memoire lors d'un appel programmatique sans texte.
+    _texte = payload.get("intention")
+    if isinstance(_texte, str) and _texte.strip():
+        state.last_intention_text = _texte.strip()
     intent_id = payload.get("intent_id", "—")
 
     # Mémorise le timing de réception (mesuré par intent_manager) pour qu'il soit
@@ -2727,6 +2750,7 @@ async def get_status():
         "cooldown_active":  state.check_cooldown(),
         "slos_count":       len(state.current_slos),
         "active_slos":      state.current_slos,
+        "last_intention":   state.last_intention_text,
         "last_decision":    state.last_decision.get("decision"),
         "timestamp":        datetime.now(timezone.utc).isoformat(),
     }

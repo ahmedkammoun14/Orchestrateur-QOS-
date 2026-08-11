@@ -157,3 +157,38 @@ redis.conf
 
 # Captures video de demo (trop volumineuses pour git)
 *.mp4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nettoyage version finale PFE — le dépôt ne porte plus que l'orchestrateur
+# (code source + tests) et sa documentation de lancement.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Infrastructure : les agents VM, les ponts PiCar et les APIs ML sont DÉPLOYÉS
+# sur les machines physiques (8 VMs OpenStack, Raspberry Pi, master kubectl).
+# Les exemplaires qui font foi vivent là-bas, pas ici : les versionner créait
+# une divergence silencieuse avec ce qui tourne réellement.
+/infrastructure/
+
+# Notes de travail, plans, journaux de suivi et brouillons de rapport
+/preparation_rapport/
+/data/
+/logs/
+/scripts/timings/
+PLAN_*.md
+SUIVI_*.md
+GUIDE_TEST_MULTI_PROVIDER.md
+PRESENTATION_MULTI_VM.md
+ETAT_ET_PIPELINE_*.md
+ETUDE_PARAMETRES_DEMO_MULTI_VM.md
+Tchebycheff_explication.md
+Formule_Demo_QOS.pdf
+
+# Fichiers de travail bruts
+*.txt
+!requirements.txt
+!hub/requirements.txt
+!services/**/requirements.txt
+
+# Exports de mesures
+*.xlsx
+*.csv

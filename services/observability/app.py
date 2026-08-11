@@ -556,6 +556,10 @@ function updateMetrics(data) {
 
   // Header
   document.getElementById('h-cycle').textContent = cycle;
+  // Le mode vient desormais de /data, interroge par TOUS les tableaux.
+  // L'audit (updateHeader) reste la source du hub actif ; le test evite
+  // d'ecraser sa valeur si le champ est absent (hub non encore mis a jour).
+  if (data.mode) document.getElementById('h-mode').textContent = data.mode;
   const role = data.role || 'active';
   const hostingVm = data.hosting_vm || null;
   const localActiveVm = Object.entries(vms).find(([,d]) => d.is_active)?.[0] || null;

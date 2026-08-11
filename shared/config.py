@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Dict, Any
 
@@ -220,7 +221,7 @@ ML_RAM_URL: str = os.getenv("ML_RAM_URL", "http://localhost:5003/predict")
 # Source globale, inchangée quel que soit PROVIDER_ID — décrit le parc
 # complet des 8 VMs. VM_REGISTRY (dérivé plus bas, après PROVIDER_REGISTRY)
 # est ce que CE processus collecte/orchestre réellement.
-ALL_VM_REGISTRY: Dict[str, Any] = {
+_ALL_VM_REGISTRY_DEFAUT: Dict[str, Any] = {
     "edge1":  {"ip": "194.199.113.18", "port": 8200},
     "edge1b": {"ip": "194.199.113.18", "port": 8201},
     "edge1c": {"ip": "194.199.113.18", "port": 8202},
@@ -230,6 +231,21 @@ ALL_VM_REGISTRY: Dict[str, Any] = {
     "cloud1": {"ip": "194.199.113.66", "port": 8200},
     "cloud2": {"ip": "194.199.113.69", "port": 8200},
 }
+
+# Surcharge par environnement — permet de pointer l'orchestrateur sur des
+# VMs simulees en local (meme parc, memes ids, ports differents) sans
+# toucher au code. Variable absente => parc reel, comportement inchange.
+_registry_json = os.getenv("ALL_VM_REGISTRY_JSON", "").strip()
+if _registry_json:
+    ALL_VM_REGISTRY: Dict[str, Any] = json.loads(_registry_json)
+    manquantes = set(_ALL_VM_REGISTRY_DEFAUT) - set(ALL_VM_REGISTRY)
+    if manquantes:
+        raise ValueError(
+            f"ALL_VM_REGISTRY_JSON incomplet — VMs manquantes : "
+            f"{sorted(manquantes)}"
+        )
+else:
+    ALL_VM_REGISTRY = _ALL_VM_REGISTRY_DEFAUT
 
 VM_CLUSTER_MAP: Dict[str, str] = {
     "edge1":  "edge-cluster",
@@ -373,7 +389,7 @@ METRICS_REGISTRY: Dict[str, Any] = {
         "payload_key":          "rtt_ms",
         "unit":                 "ms",
         "operator":             "<",
-        "default_threshold":    40.0,
+        "default_threshold":    28.0,
         "bounds":               {"min": 5.0, "max": 2000.0},
         "always_active":        True,
         "is_primary_objective": True,
