@@ -45,6 +45,19 @@ class MetricsHandler:
 
     def __init__(self):
         self.registry = config.METRICS_REGISTRY
+        # Dernier score MI RÉELLEMENT mesuré, et le rang de l'évaluation où il
+        # l'a été. Sert à traverser les fenêtres sans contraste — voir
+        # compute_mi_scores.
+        #
+        # L'âge se compte en ÉVALUATIONS MI (_mi_pass), jamais en cycles
+        # d'orchestration : la MI ne tourne que chez le provider ACTIF, un
+        # STANDBY saute tout le calcul alors que cycle_count continue de
+        # monter. Mesuré le 24/08/2026 : des âges de 24 « cycles » pour des
+        # évaluations pourtant consécutives — la rétention n'était jamais
+        # appliquée (0 score tenu, 34 périmés).
+        self._last_scores: Dict[str, float] = {}
+        self._last_pass:   Dict[str, int]   = {}
+        self._mi_pass:     int              = 0
 
     # ─────────────────────────────────────────────────────────────
     # MI — Information Mutuelle Normalisée
@@ -62,6 +75,7 @@ class MetricsHandler:
         include_primaries=False : saute les métriques primaires du registre (AUTONOMOUS).
         skip_metrics : ensemble de noms de métriques à sauter (ENHANCED — métriques LLM).
         """
+        self._mi_pass += 1          # horloge de la rétention — voir __init__
         mi_results = {}
         y_vals = [1 if p.get("is_violation", False) else 0 for p in history]
 
@@ -94,16 +108,46 @@ class MetricsHandler:
             x_vals   = [p.get(metric) for p in history if p.get(metric) is not None]
             synced_y = [y_vals[i] for i, p in enumerate(history) if p.get(metric) is not None]
 
+            # Fenêtre sans contraste (tous les cycles en violation, ou aucun) :
+            # la MI n'est pas MESURABLE ici, ce qui n'est pas la même chose que
+            # MESURÉE NULLE. Émettre 0.0 faisait disparaître un SLO secondaire
+            # valide au seul motif que la voiture traverse une zone où tout
+            # viole — le contrat clignotait (0.27 → 0.00 → 0.27) sans qu'aucune
+            # dépendance n'ait changé. Mesuré : 25 % des cycles.
+            # On conserve donc le dernier score RÉELLEMENT mesuré, avec une
+            # péremption : au-delà de MI_HOLD_CYCLES sans mesure possible,
+            # l'information est trop vieille et on retombe à 0.
             if len(x_vals) < 5 or len(set(synced_y)) < 2:
-                logger.debug(
-                    f"🔍 Données insuffisantes pour MI — métrique : {metric} "
-                    f"| points : {len(x_vals)}"
-                )
-                mi_results[metric] = 0.0
+                held = self._last_scores.get(metric)
+                if held is None:
+                    logger.debug(
+                        f"🔍 {metric} — fenêtre sans contraste et aucun score "
+                        f"antérieur à conserver → 0.0"
+                    )
+                    mi_results[metric] = 0.0
+                    continue
+                age = self._mi_pass - self._last_pass.get(metric, 0)
+                if age <= config.MI_HOLD_CYCLES:
+                    logger.debug(
+                        f"⏸  {metric} — fenêtre sans contraste "
+                        f"({len(x_vals)} pts, une seule classe), score précédent "
+                        f"conservé : {held:.4f} (âge {age} évaluation(s))"
+                    )
+                    mi_results[metric] = held
+                else:
+                    logger.debug(
+                        f"🔍 {metric} — fenêtre sans contraste et dernier score "
+                        f"périmé (âge {age} > {config.MI_HOLD_CYCLES}) → 0.0"
+                    )
+                    mi_results[metric] = 0.0
+                    self._last_scores.pop(metric, None)
+                    self._last_pass.pop(metric, None)
                 continue
 
             score = self._compute_mi(x_vals, synced_y, metric, cycle)
             mi_results[metric] = score
+            self._last_scores[metric] = score
+            self._last_pass[metric]   = self._mi_pass
 
         # ── Tableau récapitulatif MI ─────────────────────────────────
         mi_rows = [

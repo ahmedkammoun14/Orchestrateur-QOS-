@@ -65,7 +65,32 @@ REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB:   int = int(os.getenv("REDIS_DB",   0))
 
 # ── Persistence ───────────────────────────────────────────────
-HISTORY_WINDOW:   int = 50
+# Fenêtre lue par le calcul MI. Ramenée de 50 à 25 : à 6 s/cycle, 50 points
+# couvrent 2 migrations, donc majoritairement des cycles où la VM était LOIN et
+# n'hébergeait pas le service — violation certaine quelle que soit la charge, et
+# MI saturée à 0. 25 points restent dans l'épisode d'hébergement courant.
+HISTORY_WINDOW:   int = int(os.getenv("HISTORY_WINDOW", 25))
+
+# Fenêtre lue par les PRÉDICTIONS ML — distincte de celle du MI, car les deux
+# ont des besoins OPPOSÉS :
+#   • MI  : fenêtre COURTE (25). Plus long couvre plusieurs migrations, donc
+#           des cycles où la VM était loin : violation certaine, MI saturée à 0.
+#   • ML  : fenêtre LONGUE. predictor.py n'atteint le Niveau 1 (predict_sequence)
+#           que si len(history) >= window_size du modèle — 39 pour delay, 45
+#           pour cpu et ram. En dessous, il retombe au Niveau 2 (point unique)
+#           puis au repli, qui recopie la mesure : la prédiction devient
+#           l'observation et toute anticipation disparaît.
+# Les deux ont partagé HISTORY_WINDOW jusqu'au 24/08/2026 ; le ramener à 25
+# pour le MI a rendu le Niveau 1 inatteignable. Garder cette valeur >= au plus
+# grand window_size des trois modèles (curl :5001..5003/hyperparameters).
+ML_HISTORY_WINDOW: int = int(os.getenv("ML_HISTORY_WINDOW", 60))
+
+# Profondeur CONSERVÉE dans Redis (LTRIM de redis_client.store_metrics).
+# Doit couvrir le plus gourmand des deux lecteurs, sinon la base tronque et
+# aucune fenêtre plus longue n'est servable : ramener HISTORY_WINDOW à 25 avait
+# tronqué le stockage à 25 points, rendant les 60 du ML impossibles à obtenir
+# quoi qu'on demande au history_loader.
+METRICS_RETENTION: int = max(HISTORY_WINDOW, ML_HISTORY_WINDOW)
 DECISIONS_FIFO:   int = 50
 HISTORY_SIZE:     int = int(os.getenv("HISTORY_SIZE", 100))
 
@@ -119,6 +144,19 @@ AWARD_GRACE_PERIOD_S: float = float(os.getenv("AWARD_GRACE_PERIOD_S", 15.0))
 #            provider n'est conforme → STAY + alerte d'infaisabilité.
 #   "soft" : le meilleur best-effort peut être élu (dégradation gracieuse).
 SLO_ENFORCEMENT: str = os.getenv("SLO_ENFORCEMENT", "hard").lower()
+
+# Chemin MONO-PROVIDER, aucune VM locale ne satisfait les SLOs → STAY.
+#
+# Le repli « best_effort » (élire la moins mauvaise VM) a été RETIRÉ le
+# 24/08/2026 : migrer vers une VM qui viole elle aussi le contrat déplace le
+# service sans le rétablir, et le chemin fédéré ne le fait pas — un provider
+# sans VM conforme ne soumet AUCUNE offre (_build_local_bid, cas B) et
+# l'arbitre renvoie STAY + alerte INFAISABLE. Les deux chemins appliquent
+# désormais la même règle de dernier recours.
+#
+# ⚠️ Les données de la campagne UC2 ont été produites avec l'ancien repli.
+# Elles ne sont plus reproductibles avec ce code — les rejouer suppose de
+# restaurer la politique retirée.
 
 # Écart de Gap Grade minimal pour qu'un challenger arrache le service au
 # provider en place. ABSOLU (et non relatif) : le Gap Grade étant déjà un
@@ -186,6 +224,13 @@ PERCENTILE_NORMAL:    float = float(os.getenv("PERCENTILE_NORMAL",   75.0))
 PERCENTILE_VOLATILE:  float = float(os.getenv("PERCENTILE_VOLATILE", 85.0))
 MI_RELATIVE_THRESHOLD: float = float(os.getenv("MI_RELATIVE_THRESHOLD", 0.15))
 
+# Nombre de cycles pendant lesquels un score MI reste valable quand la fenêtre
+# d'historique ne permet plus de le recalculer (aucun contraste : tous les
+# cycles en violation, ou aucun — mesuré sur 25 % des cycles). Au-delà,
+# l'information est trop vieille et le score retombe à 0. À 6 s/cycle, 10
+# cycles ≈ 1 minute. Voir MetricsHandler.compute_mi_scores.
+MI_HOLD_CYCLES: int = int(os.getenv("MI_HOLD_CYCLES", 10))
+
 # Planchers de disponibilité absolue pour les SLOs secondaires cpu/ram en
 # mode AUTONOMOUS (percentile adaptatif désactivé pour ces deux métriques,
 # cf. metrics_handler._capacity_floor). Cohérent avec la convention déjà
@@ -209,8 +254,38 @@ INTENT_MODEL: str = os.getenv("INTENT_MODEL", "qwen2.5:latest")
 
 # ── LAAS vLLM (primary) ───────────────────────────────────────
 LAAS_LLM_URL:   str = os.getenv("LAAS_LLM_URL",   "https://pfcalcul.laas.fr/vllm/v1/chat/completions")
-LAAS_MODEL:     str = os.getenv("LAAS_MODEL",      "Qwen3/Qwen--Qwen3.6-27B-FP16")
+
+LAAS_MODEL:     str = os.getenv("LAAS_MODEL",      "Qwen3/Qwen--Qwen3.8-27B-FP16")
 LAAS_LLM_PROXY: str = os.getenv("LAAS_LLM_PROXY", "")  # e.g. https://user:pass@proxy.laas.fr:443
+
+# ── Seuils de latence ancrés sur les mesures (17/08/2026) ─────
+# OFF par défaut : le prompt reste MOT POUR MOT celui des campagnes d'août,
+# donc aucun run n'est invalidé par ce code.
+#
+# Problème corrigé quand ON : la règle 2 du prompt impose au LLM la bande
+# « temps réel ≈ 50-100 ms », un a priori issu du web et sans rapport avec
+# ce banc (latence edge 5-150 ms, rayon de conformité 28 ms). Conséquence
+# mesurée : « reduce latency as much as possible » produit `latency < 50`,
+# soit PLUS PERMISSIF que le défaut autonome de 28 ms — l'intention relâche
+# le contrat au lieu de le durcir. Que la valeur vienne d'un a priori et non
+# d'un raisonnement est établi : LAAS Qwen3.6-27B (14/08) et Ollama
+# qwen2.5-7B (17/08) ont répondu 50.0/45.0 au dixième près.
+#
+# ON : les percentiles RÉELLEMENT MESURÉS sur le parc sont injectés dans le
+# prompt, et le LLM place son seuil dedans. Il garde la sémantique (quelle
+# métrique, quel sens, quelle importance) ; le banc fournit l'échelle.
+# Volontairement, aucun verrou de non-régression n'est ajouté : il écraserait
+# les relâchements LÉGITIMES (« encrypt even if it increases latency » doit
+# pouvoir monter à 200 ms).
+INTENT_GROUNDED_THRESHOLDS: bool = os.getenv(
+    "INTENT_GROUNDED_THRESHOLDS", "false"
+).lower() == "true"
+
+# Nombre de points par VM lus pour établir la distribution. En dessous de
+# GROUNDED_MIN_SAMPLES points au total, l'ancrage est abandonné et le prompt
+# d'origine est utilisé — un percentile sur 4 points ne veut rien dire.
+GROUNDED_HISTORY_SIZE: int = int(os.getenv("GROUNDED_HISTORY_SIZE", 50))
+GROUNDED_MIN_SAMPLES:  int = int(os.getenv("GROUNDED_MIN_SAMPLES",  40))
 
 # ── ML APIs ───────────────────────────────────────────────────
 ML_RTT_URL: str = os.getenv("ML_RTT_URL", "http://localhost:5001/predict")

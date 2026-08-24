@@ -81,7 +81,7 @@ class RedisClient:
         issued atomically:
 
         - ``LPUSH  metrics:{vm_id}:{metric}  <value>``
-        - ``LTRIM  metrics:{vm_id}:{metric}  0  HISTORY_WINDOW-1``
+        - ``LTRIM  metrics:{vm_id}:{metric}  0  METRICS_RETENTION-1``
         - ``EXPIRE metrics:{vm_id}:{metric}  METRICS_TTL``
 
         Additionally, a full JSON snapshot is always appended to the
@@ -110,9 +110,12 @@ class RedisClient:
                 if val is not None:
                     key = redis_keys.METRICS_KEY.format(vm_id=vm_id, metric=metric)
                     pipe.lpush(key, val)
-                    pipe.ltrim(key, 0, config.HISTORY_WINDOW - 1)
+                    pipe.ltrim(key, 0, config.METRICS_RETENTION - 1)
                     # Pas de EXPIRE : les données sont conservées indéfiniment.
-                    # LTRIM borne la mémoire à HISTORY_WINDOW entrées par clé.
+                    # LTRIM borne la mémoire à METRICS_RETENTION entrées par clé
+                    # — le MAX des fenêtres lues (MI 25, ML 60). Trancher au
+                    # seul HISTORY_WINDOW rendait les 60 points du ML
+                    # inobtenables : la base ne les avait tout simplement plus.
 
             # Full history snapshot (all metrics + metadata in one entry)
             hist_key = redis_keys.HISTORY_KEY.format(vm_id=vm_id)
@@ -123,7 +126,7 @@ class RedisClient:
                 "timestamp":   timestamp,
             })
             pipe.lpush(hist_key, snapshot)
-            pipe.ltrim(hist_key, 0, config.HISTORY_WINDOW - 1)
+            pipe.ltrim(hist_key, 0, config.METRICS_RETENTION - 1)
 
             pipe.execute()
             self._logger.info(

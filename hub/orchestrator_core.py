@@ -94,6 +94,13 @@ class OrchestratorState:
         # « par intention ». Voir _persist_timing.
         self.pending_intent_timing: Optional[Dict[str, Any]] = None
         self.cycle_count: int = 0
+        # Numéro du cycle EN COURS D'EXÉCUTION, figé à l'entrée de _run_flow.
+        # `cycle_count` s'incrémente à chaque lot reçu, y compris ceux qui sont
+        # abandonnés parce qu'un cycle tourne déjà : un cycle long le voit donc
+        # changer sous ses pieds, et deux étapes du MÊME cycle s'étiquetaient
+        # avec deux numéros différents. Symptôme : la feuille Prédictions et le
+        # fichier de temps décalés d'une unité sur une partie des cycles.
+        self.flow_cycle: int = 0
         self.last_decision: Dict[str, Any] = {}
         self.last_mi_scores: Dict[str, float] = {}
         self.last_collected: List[Dict[str, Any]] = []
@@ -410,8 +417,39 @@ async def _sync_active_vm(client: httpx.AsyncClient) -> None:
                     #   • mon_node != node_hote → le service a changé de NODE
                     #                           (ex. cloud1 → edge1) : kubectl
                     #                           est plus juste que notre suivi.
-                    if (not was_active) or (node_hote is None) or (mon_node != node_hote):
+                    #
+                    # ⚠️ SAUF juste après NOTRE PROPRE migration. Un changement
+                    # de node prend quelques secondes à se propager : pendant
+                    # cette fenêtre kubectl décrit encore l'ANCIEN node, et le
+                    # troisième cas ci-dessus rembobine service_vm vers la VM
+                    # qu'on vient de quitter. Observé : intention 1 migre
+                    # edge1(pop1) → cloud1(pop2) ; le sync suivant lit encore
+                    # pop1, donc edge1, et l'écrit ; l'intention 2 part alors
+                    # de edge1 au lieu de cloud1 — et la migration supprime le
+                    # pod sur le mauvais cluster.
+                    #
+                    # La garde d'award ci-dessus ne couvre pas ce cas : elle
+                    # exige `not kubectl_says_active`, ce qui n'arrive qu'aux
+                    # promotions INTER-provider. Une migration LOCALE garde
+                    # kubectl_says_active à True et passait donc au travers.
+                    in_migration_grace = (
+                        state.last_migration_ts is not None
+                        and (time.monotonic() - state.last_migration_ts)
+                            < config.AWARD_GRACE_PERIOD_S
+                    )
+                    node_changed = (mon_node != node_hote)
+
+                    if (not was_active) or (node_hote is None) or (
+                        node_changed and not in_migration_grace
+                    ):
                         state.service_vm = active_vm
+                    elif node_changed:
+                        logger.info(
+                            f"🕒 Sync kubectl périmée ignorée (migration récente, "
+                            f"{config.AWARD_GRACE_PERIOD_S:.0f}s) — VM conservée : "
+                            f"{C.GREEN}{state.service_vm}{C.RESET} "
+                            f"(kubectl proposait {C.YELLOW}{active_vm}{C.RESET})"
+                        )
                     # sinon : conserver state.service_vm — kubectl ne sait pas
                     # distinguer edge2 de edge2b, notre suivi si.
 
@@ -490,6 +528,12 @@ class _FlowContext:
 async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str,
                       prof: Optional[StepProfiler] = None) -> None:
     """Calcule / met à jour les SLOs actifs (bootstrap ou metrics_manager)."""
+    # Version d'intention au DÉBUT du calcul. Sert de jeton de concurrence
+    # optimiste : si elle a changé quand metrics_manager répond, c'est qu'une
+    # intention est arrivée entre-temps et le résultat de ce cycle est périmé
+    # (voir la garde en fin de fonction).
+    _intent_version_at_start = state.intent_version
+
     def _t(name: str):
         return prof.step(name) if prof is not None else nullcontext()
     if state.cycle_count < state.BOOTSTRAP_MIN:
@@ -571,7 +615,25 @@ async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str,
         else:
             logger.warning("⚠️  MM response sans 'timings' — relancer le service metrics_manager")
         prof.merge(_mm_timings)   # absorbe mi_compute + mi_slos
-    if mm_res:
+    # ⚠️ COURSE INTENTION / CYCLE. `_step1_slos` a lu state.current_slos au
+    # début du cycle, puis attendu metrics_manager pendant ~500 ms. Une
+    # intention reçue DANS cet intervalle a déjà remplacé le contrat ; écrire
+    # ici le résultat calculé sur l'ANCIEN contrat l'écraserait.
+    #
+    # Observé en campagne (UC4) : cycle #175 démarre à 12:58:07.849 avec
+    # `latency < 50`, l'intention « maximum compute power » est livrée à
+    # 12:58:08.0 et pose `cpu_usage >= 3.5, ram_usage >= 8`, puis le cycle
+    # réécrit `latency + cpu_usage(MI)` à 12:58:08.382. Au cycle suivant, le
+    # filtre par original_intent_weights — désormais {cpu_usage, ram_usage} —
+    # ne retient que le SECONDAIRE `cpu_usage >= 1`, que metrics_manager
+    # promeut en primaire, et la latence revient en secondaire avec un seuil
+    # adaptatif. Le contrat client était perdu.
+    #
+    # Garde optimiste : si la version d'intention a changé pendant le calcul,
+    # le contrat fraîchement reçu gagne et le résultat du cycle est ignoré.
+    _intent_changed = (state.intent_version != _intent_version_at_start)
+
+    if mm_res and not _intent_changed:
         state.current_slos   = mm_res.get("slos", state.current_slos)
         ctx.active_metrics   = mm_res.get("active_metrics", list(config.METRICS_REGISTRY.keys()))
         state.last_mi_scores = mm_res.get("mi_scores", {})
@@ -582,6 +644,12 @@ async def _step1_slos(client: httpx.AsyncClient, ctx: _FlowContext, mode: str,
             f"📋 SLOs mis à jour — {C.CYAN}{len(state.current_slos)}{C.RESET} SLO(s) actif(s) "
             f"| primaires : {C.GREEN}{primaries}{C.RESET} "
             f"| secondaires : {C.YELLOW}{secondaries}{C.RESET}"
+        )
+    elif _intent_changed:
+        ctx.active_metrics = [s["metric"] for s in state.current_slos]
+        logger.info(
+            f"🔄 Intention reçue pendant le calcul des SLOs — résultat du cycle "
+            f"ignoré, contrat conservé : {C.CYAN}{ctx.active_metrics}{C.RESET}"
         )
     else:
         ctx.active_metrics = [s["metric"] for s in state.current_slos]
@@ -736,12 +804,19 @@ def _step5_check_violations(ctx: _FlowContext) -> bool:
 
 
 async def _step6_load_histories(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
-    """Charge les historiques de toutes les VMs en parallèle."""
+    """Charge les historiques de toutes les VMs en parallèle.
+
+    ⚠️ ML_HISTORY_WINDOW, et NON HISTORY_WINDOW : ces historiques alimentent
+    les prédictions (_step7_predict), qui exigent au moins le window_size du
+    modèle pour atteindre le Niveau 1 de predictor.py. HISTORY_WINDOW est
+    calibrée pour le MI, qui a le besoin inverse (fenêtre courte). Les deux ont
+    partagé la même valeur jusqu'au 24/08/2026 — voir shared/config.py.
+    """
     hist_responses = await asyncio.gather(*[
         _post(client, f"{_URLS['history_loader']}/load", {
             "vm_id":   vid,
             "metrics": list(config.METRICS_REGISTRY.keys()),
-            "size":    config.HISTORY_WINDOW,
+            "size":    config.ML_HISTORY_WINDOW,
         }) for vid in ctx.vm_ids
     ])
     ctx.vm_histories = {
@@ -750,7 +825,7 @@ async def _step6_load_histories(client: httpx.AsyncClient, ctx: _FlowContext) ->
     }
     logger.info(
         f"📚 Historiques chargés pour {C.CYAN}{len(ctx.vm_ids)}{C.RESET} VM(s) "
-        f"| fenêtre : {C.CYAN}{config.HISTORY_WINDOW}{C.RESET} points"
+        f"| fenêtre ML : {C.CYAN}{config.ML_HISTORY_WINDOW}{C.RESET} points"
     )
 
 
@@ -789,6 +864,75 @@ async def _step7_predict(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
 
     state.snapshot_collected   = list(state.last_collected)
     state.snapshot_predictions = dict(state.last_predictions)
+
+    _log_prediction_pairs(client, new_predictions)
+
+
+# Références fortes sur toutes les tâches détachées de ce module.
+# `asyncio.create_task` ne garde qu'une référence FAIBLE : sans ce set, le
+# ramasse-miettes peut détruire une tâche avant qu'elle ne s'achève, et son
+# effet — écrire une ligne, pousser un audit, exécuter un cycle — n'a jamais
+# lieu, sans la moindre erreur. Symptôme mesuré : 90 cycles manquants sur 303,
+# par salves — un motif régulier, jamais aléatoire.
+_detached_tasks: set = set()
+
+
+def _spawn(coro) -> "asyncio.Task":
+    """Lance une tâche détachée en la protégeant du ramasse-miettes."""
+    task = asyncio.create_task(coro)
+    _detached_tasks.add(task)
+    task.add_done_callback(_detached_tasks.discard)
+    return task
+
+
+def _log_prediction_pairs(
+    client:      httpx.AsyncClient,
+    predictions: Dict[str, Dict[str, Any]],
+) -> None:
+    """
+    Journalise, pour analyse HORS LIGNE, le couple (mesuré, prédit) de chaque
+    métrique de chaque VM à l'instant où la décision va les utiliser.
+
+    Pourquoi ici et pas dans la feuille Métriques : celle-ci est écrite à
+    l'étape de persistance, AVANT que les prédictions du cycle existent. Le
+    couple ne peut donc être constitué qu'après cette étape-ci.
+
+    ⚠️ Sans attente volontaire (`create_task`, hors de tout `prof.step`) :
+    cet appel ne doit ni allonger le cycle, ni polluer les mesures de temps
+    de ce même cycle. Un échec est sans conséquence — c'est de la trace, pas
+    un chemin de décision.
+    """
+    ts   = datetime.now(timezone.utc).isoformat()
+    rows: List[list] = []
+    for lc in state.last_collected:
+        vm_id = lc.get("vm_id")
+        preds = predictions.get(vm_id) or {}
+        for metric in config.METRICS_REGISTRY:
+            block     = preds.get(metric) or {}
+            series    = block.get("predictions") or []
+            predicted = series[0] if series else None
+            rows.append([
+                ts, state.flow_cycle, vm_id, metric,
+                lc.get(metric), predicted, block.get("model"),
+            ])
+
+    if not rows:
+        return
+
+    async def _send() -> None:
+        # Client DÉDIÉ, et non celui du cycle : l'appelant l'expose dans un
+        # `async with` qui se referme à la fin du cycle, alors que cette tâche
+        # détachée lui survit. Mesuré : avec le client du cycle, seuls 116
+        # cycles sur 411 étaient journalisés — les autres mouraient sur un
+        # client déjà fermé, silencieusement.
+        try:
+            async with httpx.AsyncClient() as c:
+                await _post(c, f"{_URLS['database']}/store/predictions",
+                            {"rows": rows})
+        except Exception as exc:
+            logger.debug(f"Journalisation mesuré/prédit ignorée : {exc}")
+
+    _spawn(_send())
 
 
 def _build_candidates(collected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -933,7 +1077,7 @@ async def _decide_mono_provider(
             } for lc in state.last_collected
         },
     }
-    asyncio.create_task(
+    _spawn(
         _post_audit(f"{_URLS['observability']}/audit", audit_payload)
     )
 
@@ -1109,7 +1253,7 @@ async def _finalize_multi_provider_decision(
         "provider_used": provider_used,
         "reasoning":     reasoning,
     }
-    asyncio.create_task(
+    _spawn(
         _post_audit(f"{_URLS['observability']}/audit", audit_payload)
     )
 
@@ -1572,7 +1716,7 @@ def _post_federated_audit(
         "provider_used": verdict.get("winner_provider") if verdict else None,
         "reasoning":     reasoning,
     }
-    asyncio.create_task(
+    _spawn(
         _post_audit(f"{_URLS['observability']}/audit", audit_payload)
     )
 
@@ -1656,7 +1800,7 @@ async def _decide_federated(
     async def _local_bid_branch():
         with prof.step("local_bid"):
             return await _build_local_bid(
-                client, state.current_slos, incumbent_vm, intent_id
+                client, state.current_slos, incumbent_vm, intent_id, prof
             )
 
     async def _broadcast_branch():
@@ -1927,6 +2071,14 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
                                 + (d.get("topsis_total")        or 0.0)), 3)
                    if _dc is not None else None)
 
+    # Coût de la fédération. bid_and_broadcast_parallel est la DURÉE RÉELLE du
+    # bloc concurrent (donc ≈ max(local_bid, broadcast), pas leur somme) ; on
+    # lui ajoute l'arbitrage, qui est séquentiel après lui. Vaut None sur un
+    # cycle non fédéré, ce qui distingue « pas de négociation » de « 0 ms ».
+    _fed_parts = [d.get("bid_and_broadcast_parallel"), d.get("arbitrate")]
+    fed_total = (round(sum(p for p in _fed_parts if p is not None), 3)
+                 if any(p is not None for p in _fed_parts) else None)
+
     # SOMME = somme des totaux par microservice
     _somme = round(
         hub_total
@@ -1941,6 +2093,11 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
 
     base: Dict[str, Any] = {
         "vm":                  vm,
+        # Hôte RÉEL du service dans la fédération, lu depuis l'infrastructure.
+        # `vm` est la vue locale de ce provider et reste figée tant qu'il est
+        # STANDBY ; sans cette colonne, deux intentions consécutives semblent
+        # partir de la même VM alors que le service a changé d'hôte.
+        "hosting_vm":          state.hosting_vm or vm,
         "decision":            decision,
         "to_vm":               state.last_decision.get("to_vm"),
         # Hub
@@ -1948,10 +2105,13 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
         "migration":           d.get("migration"),
         "hub_total":           hub_total,
         # Collector
-        "collect_edge1":       d.get("collect_edge1"),
-        "collect_edge2":       d.get("collect_edge2"),
-        "collect_cloud1":      d.get("collect_cloud1"),
-        "collect_cloud2":      d.get("collect_cloud2"),
+        # Les colonnes par VM sont dérivées du registre de CE processus
+        # (config.VM_REGISTRY), jamais écrites en dur : avec 3 edges + 1 cloud
+        # par provider, une liste figée edge1/edge2/cloud1/cloud2 laissait
+        # edge1b et edge1c sans aucune colonne, et remplissait de vides les
+        # deux colonnes appartenant à l'autre provider.
+        **{f"collect_{vm_id}": d.get(f"collect_{vm_id}")
+           for vm_id in config.VM_REGISTRY},
         "collect_max":         d.get("collect_max"),
         "collect":             d.get("collect"),
         "collect_overhead":    collect_overhead,
@@ -1980,6 +2140,14 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
         "topsis_dist":         d.get("topsis_dist"),
         "decide_call":         d.get("decide_call"),
         "di_overhead":         di_overhead,
+        # Fédération — mesurée par _decide_federated, jamais exportée jusqu'ici.
+        # Vide sur les chemins mono/multi, ce qui est l'information voulue :
+        # une colonne vide signifie « ce cycle n'a pas négocié ».
+        "local_bid":                 d.get("local_bid"),
+        "broadcast":                 d.get("broadcast"),
+        "bid_and_broadcast_parallel": d.get("bid_and_broadcast_parallel"),
+        "arbitrate":                 d.get("arbitrate"),
+        "federation_total":          fed_total,
         # Résumé
         "somme":               _somme,
     }
@@ -2000,7 +2168,7 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
                 "cycle_total":      cycle_total,
                 "intention_total":  round((reception_ms or 0.0) + (cycle_total or 0.0), 3),
             })
-            asyncio.create_task(timing_writer_enhanced.write(row))
+            _spawn(timing_writer_enhanced.write(row))
             logger.info(
                 f"📊 Mesures enregistrées (intention {C.CYAN}{pit.get('intent_id')}{C.RESET}) "
                 f"| réception → migration : {C.GREEN}{row['intention_total']} ms{C.RESET}"
@@ -2009,11 +2177,11 @@ def _persist_timing(prof: StepProfiler, mode: str, vm: Optional[str]) -> None:
     elif mode == "autonomous":
         row = dict(base)
         row.update({
-            "cycle":     state.cycle_count,
+            "cycle":     state.flow_cycle,
             "timestamp": ts,
             "total":     d.get("total"),
         })
-        asyncio.create_task(timing_writer_autonomous.write(row))
+        _spawn(timing_writer_autonomous.write(row))
         logger.info(
             f"📊 Mesures enregistrées (cycle {C.CYAN}{state.cycle_count}{C.RESET}) "
             f"| total : {C.GREEN}{d.get('total')} ms{C.RESET}"
@@ -2029,6 +2197,11 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
         return
 
     async with state._lock:
+        # Fige le numéro de CE cycle : tout ce qui est journalisé plus bas
+        # (temps, prédictions) doit porter la même étiquette, même si de
+        # nouveaux lots arrivent et incrémentent le compteur entre-temps.
+        state.flow_cycle = state.cycle_count
+
         logger.info(
             f"{'═'*60}\n"
             f"   🔄  Cycle #{C.BOLD}{state.cycle_count}{C.RESET}  |  "
@@ -2097,7 +2270,7 @@ async def _run_flow(measurements: List[RTTMeasurement], mode: str) -> None:
         # Seul le hub ACTIF pousse : le bridge PiCar reçoit ainsi une source
         # de vérité unique, sans avoir à départager deux réponses de polling.
         if state.is_active:
-            asyncio.create_task(_push_state_to_picar())
+            _spawn(_push_state_to_picar())
 
         logger.info(
             f"✅ Cycle #{C.BOLD}{state.cycle_count}{C.RESET} terminé\n"
@@ -2184,7 +2357,7 @@ app = FastAPI(title="QoS Orchestrator Core", version="2.1.0", lifespan=lifespan)
 @app.post("/rtt", status_code=status.HTTP_200_OK)
 async def receive_rtt(payload: LatencyPayload):
     state.cycle_count += 1
-    asyncio.create_task(_run_flow(payload.measurements, state._mode))
+    _spawn(_run_flow(payload.measurements, state._mode))
     return {"status": "accepted", "cycle": state.cycle_count}
 
 
@@ -2270,7 +2443,7 @@ async def receive_intent(payload: Dict[str, Any] = Body(...)):
                     )
             except Exception as exc:
                 logger.warning(f"⚠️  Intention non propagée aux pairs : {exc}")
-        asyncio.create_task(_propagate())
+        _spawn(_propagate())
 
     return {"status": "accepted", "mode": state._mode, "slos": len(state.current_slos)}
 
@@ -2461,6 +2634,7 @@ async def _build_local_bid(
     slos:         List[Dict[str, Any]],
     incumbent_vm: Optional[str],
     intent_id:    Optional[str] = None,
+    prof:         Optional[StepProfiler] = None,
 ) -> ProviderBid:
     """
     Construit le BID unifié (PlacementPlan + Gap Grade) de CE provider pour
@@ -2535,7 +2709,25 @@ async def _build_local_bid(
             "cycle":              state.cycle_count,
             "mi_scores":          state.last_mi_scores,
         }
-        di_res = await _post(client, f"{_URLS['decision_intelligence']}/decide", di_payload)
+        # `decide_call` = durée TOTALE de l'appel au service de décision. Les
+        # chemins mono/multi la mesurent chez eux ; sans ce wrapper, le chemin
+        # fédéré laissait « Total DI » vide — et « Overhead HTTP+logs », qui
+        # s'en déduit, vide aussi.
+        _di_ctx = prof.step("decide_call") if prof is not None else nullcontext()
+        with _di_ctx:
+            di_res = await _post(
+                client, f"{_URLS['decision_intelligence']}/decide", di_payload
+            )
+
+        # Fusionne les sous-mesures TOPSIS / détection renvoyées par
+        # decision_intelligence. Sans cette ligne, le CHEMIN FÉDÉRÉ perd
+        # silencieusement les 9 colonnes du bloc Decision Intelligence
+        # (détection, filtrage, les 4 phases TOPSIS, totaux) — elles sont
+        # calculées puis jetées, sans aucune erreur visible. Les chemins mono
+        # et multi font déjà ce merge chez eux ; ici `prof` est optionnel car
+        # l'endpoint /evaluate appelle cette fonction sans profileur.
+        if prof is not None and di_res:
+            prof.merge(di_res.get("timings"))
 
         if di_res and di_res.get("to_vm"):
             champion     = di_res["to_vm"]
@@ -2637,6 +2829,24 @@ async def evaluate(payload: Dict[str, Any] = Body(...)):
     # doit jamais se le faire écraser par le payload d'un pair.
     if config.PROVIDER_ID != "all" and not state.is_active:
         state.current_slos = slos
+        # ⚠️ Les poids d'origine DOIVENT suivre le contrat adopté. Sans cette
+        # ligne, ils restaient ceux de l'intention PRÉCÉDENTE, et le filtre de
+        # _step1_slos — qui ne garde du contrat que les métriques présentes
+        # dans original_intent_weights — renvoyait une liste VIDE dès que la
+        # nouvelle intention portait sur d'autres métriques.
+        # Privé de contrat LLM, le provider repartait alors en comportement
+        # autonome : seuil de latence adaptatif par percentile, et promotion
+        # d'un secondaire MI en primaire. Observé en campagne (UC4) : une
+        # intention « maximum compute power » adoptée par broadcast produisait
+        # `latency < 82` non primaire + `cpu_usage >= 1` primaire, c'est-à-dire
+        # ni les métriques demandées, ni les seuils du LLM.
+        # Les deux autres chemins d'adoption (/intent et /award) le faisaient
+        # déjà ; seul le broadcast était resté sans protection.
+        state.original_intent_weights = {
+            s["metric"]: s.get("weight", 1.0)
+            for s in slos
+            if s.get("is_primary", False)
+        }
         _prim = [s.get("metric") for s in slos if s.get("is_primary")]
         _sec  = [s.get("metric") for s in slos if not s.get("is_primary")]
         logger.info(

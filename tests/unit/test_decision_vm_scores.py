@@ -61,9 +61,17 @@ def test_decide_renvoie_vm_scores_sur_migrate():
 
 def test_decide_renvoie_vm_scores_sur_stay_hysteresis():
     """
-    edge1 (actif) et cloud1 sont toutes deux en violation, mais assez
-    proches pour que l'hystérésis (_MIGRATION_MARGIN) bloque la migration —
-    TOPSIS a bien tourné (vm_scores existe) mais la décision reste STAY.
+    edge1 (actif) et cloud1 sont assez proches pour que l'hystérésis
+    (_MIGRATION_MARGIN) bloque la migration — TOPSIS a bien tourné
+    (vm_scores existe) mais la décision reste STAY.
+
+    ⚠️ Cette branche exige DEUX conditions simultanées, d'où les prédictions
+    ci-dessous. Le détecteur déclare une violation dès qu'UN point de
+    l'horizon dépasse le seuil (130 > 100), tandis que le filtre de candidats
+    compare la MOYENNE PONDÉRÉE (96,7 < 100) et les garde donc conformes.
+    Depuis le retrait du repli « best_effort » (24/08/2026), un parc
+    entièrement non conforme ne produit plus aucun candidat : on part
+    directement sur un STAY « contrat infaisable », sans TOPSIS ni vm_scores.
     """
     handler = DecisionHandler()
     slos = [_slo(threshold=100.0)]
@@ -72,8 +80,9 @@ def test_decide_renvoie_vm_scores_sur_stay_hysteresis():
         {"vm_id": "cloud1", "total_cores": 4, "total_ram_gb": 8},
     ]
     predictions_map = {
-        "edge1":  {"latency": _preds(150.0, 150.0, 150.0)},
-        "cloud1": {"latency": _preds(149.0, 149.0, 149.0)},   # écart sous le seuil
+        # moyenne pondérée (poids 3,2,1) = 96,7 → conforme ; pic à 130 → violation
+        "edge1":  {"latency": _preds(90.0, 90.0, 130.0)},
+        "cloud1": {"latency": _preds(89.5, 89.5, 129.5)},     # écart sous le seuil
                                                                # de tie-break de TOPSIS
                                                                # (_TIE_THRESHOLD) → scores
                                                                # neutralisés, quasi identiques

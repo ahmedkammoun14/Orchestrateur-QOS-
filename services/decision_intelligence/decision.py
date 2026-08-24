@@ -175,6 +175,20 @@ class DecisionHandler:
             )
 
         if not best_candidate:
+            # Distinguer les deux causes : une liste de candidats VIDE vient
+            # de la politique "stay" (aucune VM conforme, infaisable), alors
+            # qu'une liste non vide sans gagnant est un échec de TOPSIS.
+            if not candidates:
+                logger.warning(
+                    f"🔒 Violation {breach_type} — aucune VM conforme, "
+                    f"contrat infaisable localement, le service reste sur "
+                    f"{service_vm}"
+                )
+                return _ret(self._build_stay(
+                    f"{breach_type} violation — no compliant target, "
+                    f"contract infeasible on this provider (policy=stay)",
+                    breach_type, None, ts, slos_detail,
+                ))
             logger.warning(
                 f"⚠️  TOPSIS n'a retourné aucun candidat "
                 f"— violation {breach_type} non résolue"
@@ -271,7 +285,26 @@ class DecisionHandler:
         preferred: List[Dict] = [
             c for c in all_candidates if _satisfies_all(c)
         ]
-        return preferred if preferred else all_candidates
+        if preferred:
+            return preferred
+
+        # Aucune VM conforme → AUCUN candidat. TOPSIS ne reçoit rien et
+        # l'appelant construit un STAY explicite.
+        #
+        # Ce chemin est SYMÉTRIQUE du chemin fédéré : là-bas, un provider sans
+        # VM conforme ne soumet AUCUNE offre (_build_local_bid, cas B) et
+        # l'arbitre renvoie STAY + alerte INFAISABLE plutôt que de retenir une
+        # offre non conforme.
+        #
+        # L'ancien repli « best_effort » — élire la moins mauvaise VM — a été
+        # retiré le 24/08/2026 : migrer vers une VM qui viole elle aussi le
+        # contrat déplace le service sans rétablir le SLO, au prix d'une
+        # migration réelle.
+        logger.info(
+            "🔒 Aucune VM conforme — aucun candidat proposé à TOPSIS, "
+            "le service ne bouge pas (contrat infaisable localement)"
+        )
+        return []
 
     @staticmethod
     def _slos_detail(slos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
