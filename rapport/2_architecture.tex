@@ -1,0 +1,281 @@
+\newpage
+\pagestyle{fancy}
+
+\lhead{\textsc{Chapitre 2. Architecture générale de la plateforme}}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\footrulewidth}{0.5pt}
+\chapter{Architecture générale de la plateforme}\setlength{\headheight}{27.06pt}
+\label{ch2}
+\minitoc
+
+
+\newpage
+\section{Inroduction}
+\label{sec:architecture}
+
+La plateforme développée durant ce stage maintient un service applicatif de streaming au service d'un véhicule autonome en mouvement, en le déplaçant au fil du temps vers la machine la mieux adaptée parmi celles qu'offrent deux fournisseurs distincts. Cette section décrit comment la plateforme est structurée pour y parvenir : d'abord l'environnement sur lequel elle agit, puis le style architectural retenu, le rôle du composant central et celui des services qui l'entourent, les composants qui la relient à l'infrastructure réelle, et enfin la façon dont l'ensemble est dupliqué pour couvrir les deux fournisseurs. Les mécanismes internes de chaque composant seront détaillés dans les chapitres suivants.
+
+\section{L'environnement d'exécution}
+\label{sec:environnement}
+
+La plateforme n'a de sens que rapportée à l'environnement dans lequel elle s'exécute. Cet environnement se compose d'un véhicule autonome qui circule sur une carte, d'un service applicatif qui le pilote, et d'un ensemble de machines virtuelles réparties sur cette même carte -- certaines en périphérie, au plus près du terrain, d'autres plus éloignées mais mieux dotées en ressources. Le service est hébergé sur l'une de ces machines à la fois, et rien n'impose qu'il y reste : à mesure que le véhicule se déplace et s'éloigne de son hôte actuel, une autre machine peut devenir un meilleur choix. Toute la question est de savoir quand basculer, et vers laquelle.
+
+\subsection{Le terminal mobile}
+\label{sec:picarx}
+
+Le client du service est un véhicule autonome PiCar-X, une plateforme robotique fondée sur un Raspberry Pi, équipée d'une caméra sur deux axes, d'un module à ultrasons et de capteurs de suivi de ligne~\cite{sunfounder_picarx}. Ce choix n'est pas anecdotique : il fournit un cas d'usage où la contrainte de latence est réelle et non posée par convention, puisqu'un véhicule qui décide de sa trajectoire ne peut pas attendre indéfiniment la réponse du service qui le pilote.
+
+Le véhicule circule en continu le long d'une trajectoire fermée tracée sur la carte, passant successivement à proximité de chacune des machines qui y sont positionnées. C'est ce déplacement qui rend le problème intéressant : la machine idéale à un instant donné cesse de l'être quelques secondes plus tard, sans qu'aucune ressource n'ait changé d'état -- seule la position du client a changé. Le placement du service doit donc être réévalué en permanence, et non fixé une fois pour toutes au déploiement.
+
+\paragraph{Du ping réseau à la carte simulée.} Dans une première version, la latence était mesurée par de simples pings ICMP vers chaque machine. Deux difficultés sont rapidement apparues : rien ne permettait de vérifier si les valeurs obtenues étaient cohérentes, et surtout il devenait impossible de les maîtriser lors d'une démonstration, le système subissant les aléas du réseau réel. Nous avons donc opté pour une carte simulée, sur laquelle chaque machine se voit attribuer une position fixe et le véhicule une position courante : la distance qui les sépare devient ainsi calculable à tout instant.
+
+\paragraph{Le mécanisme de mesure.} Le calcul du RTT (round-trip time) suit un échange simple entre le véhicule et la machine visée, illustré par le diagramme de séquence de la figure~\ref{fig:calcul-rtt}. À l'instant $t_0$, le véhicule envoie sa position $(x,y)$ à la machine par une requête POST. Celle-ci reçoit la position, calcule la distance qui l'en sépare, puis attend -- \texttt{sleep(f(distance))} -- une durée fonction de cette distance, avant de répondre. Le véhicule reçoit la réponse à l'instant $t_1$. Le RTT mesuré est alors $t_1 - t_0$ : un délai réellement subi par l'attente introduite côté serveur, et non une valeur affichée après coup. C'est cette attente contrôlée qui permet de simuler une latence réseau réaliste sans dépendre des aléas d'un réseau physique.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.85\textwidth]{images/calcul_rtt.png}
+    \caption{Diagramme de séquence du calcul du RTT entre le véhicule et une machine}
+    \label{fig:calcul-rtt}
+\end{figure}
+
+\paragraph{Le modèle de latence.} Au début du projet, la fonction régissant ce délai était calculée par une simple règle de trois -- par exemple, 10 m correspondant à 200 ms. Le problème est apparu rapidement : lorsque la distance devient nulle, c'est-à-dire lorsque le véhicule atteint physiquement la machine, le sleep calculé devient nul lui aussi, produisant un RTT quasiment nul. Cette valeur est absurde : aucune latence réseau, même locale, n'est jamais réellement nulle.
+
+Le modèle retenu résout ce problème en imposant deux bornes non nulles à chaque extrémité, comme le montre la figure~\ref{fig:calcul-sleep-formule} : une distance minimale $D_{min}$ associée à un délai minimal $T_{min}$, tous deux différents de zéro, et une distance maximale $D_{max}$ associée à un délai maximal $T_{max}$. Entre ces deux bornes, le délai est obtenu par interpolation linéaire :
+
+\begin{equation}
+t = \frac{x - D_{min}}{D_{max} - D_{min}} \times (T_{max} - T_{min}) + T_{min}
+\label{eq:sleep-formule}
+\end{equation}
+
+où $x$ est la distance mesurée. En dehors de l'intervalle $[D_{min}, D_{max}]$, la distance est d'abord ramenée à sa borne la plus proche, de sorte que le délai reste toujours compris entre $T_{min}$ et $T_{max}$, jamais nul et jamais illimité.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{images/calcul_sleep_formule.png}
+    \caption{Interpolation entre bornes non nulles pour le calcul du délai simulé}
+    \label{fig:calcul-sleep-formule}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    %\includegraphics[width=0.85\textwidth]{images/latence_regle_de_trois.png}
+    \caption{Modèle de latence retenu (edge et cloud) comparé à la règle de trois naïve}
+    \label{fig:latence-regle-trois}
+\end{figure}
+
+Les paramètres retenus figurent dans le tableau~\ref{tab:params-latence}.
+
+\begin{table}[H]
+    \centering
+    \caption{Paramètres du modèle de latence}
+    \label{tab:params-latence}
+    \begin{tabular}{llcc}
+        \toprule
+        \textbf{Paramètre} & \textbf{Symbole} & \textbf{Edge} & \textbf{Cloud} \\
+        \midrule
+        Distance minimale & $D_{min}$ & 3 cm & 3 cm \\
+        Distance maximale & $D_{max}$ & 80 cm & 80 cm \\
+        Latence minimale & $B$ & 5 ms & 50 ms \\
+        Latence maximale & $A$ & 150 ms & 230 ms \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Ce modèle est appliqué de façon identique aux huit machines, mais avec des bornes différentes selon leur niveau : une machine edge répond entre 5 et 150 ms, une machine cloud entre 50 et 230 ms, ce qui traduit une réalité physique -- une ressource cloud demeure structurellement plus éloignée, quelle que soit la position du véhicule. La conséquence est visible sur la figure~\ref{fig:latence-regle-trois} : les deux courbes ne se croisent jamais, et à distance égale, le cloud reste toujours plus latent que l'edge. Mais cela ne signifie pas que la machine la plus proche est toujours la meilleure candidate : un nœud edge proche peut malgré tout être surchargé, ce qui justifie l'évaluation multicritère présentée plus loin, où la latence n'est qu'un critère parmi d'autres.
+\subsection{L'infrastructure d'accueil}
+\label{sec:infra-accueil}
+
+Les machines virtuelles décrites plus haut ne tournent pas sur une infrastructure fictive : elles sont hébergées sur CROcc (Cloud Recherche Occitanie), la plateforme cloud du datacenter régional occitan (DROcc), opérée en partenariat entre Toulouse et Montpellier et rattachée à la fédération de clouds académiques France Grilles~\cite{crocc_website}. CROcc repose sur OpenStack et propose une offre de type IaaS -- ressources de calcul, stockage persistant, réseau privé et adresses IP publiques -- mise à disposition des laboratoires de recherche de la région, dont le LAAS-CNRS.
+
+Sur cette infrastructure, les machines virtuelles sont organisées en deux points de présence (PoP) distincts, chacun associé à un cluster Kubernetes propre : un PoP edge et un PoP cloud. Cette séparation en clusters distincts, plutôt qu'un cluster unique partagé, permet de sélectionner dans quel cluster kubectl doit intervenir selon la machine ciblée, et donc de traiter edge et cloud comme deux environnements d'exécution réellement séparés plutôt que comme une simple étiquette logique.
+
+Le déploiement d'un service sur une machine donnée se fait par kubectl, en ciblant le contexte du cluster correspondant à cette machine, avec un fichier de déploiement propre à chaque nœud physique -- une même machine virtuelle simulée peut ainsi partager le nœud physique d'une autre, ce que le système doit prendre en compte lorsqu'il interroge l'état réellement actif du service.
+
+\subsection{Les machines virtuelles}
+\label{sec:vms}
+
+Huit machines virtuelles composent l'infrastructure candidate, réparties entre deux fournisseurs indépendants. Chaque fournisseur possède trois machines edge et une machine cloud, si bien que l'appartenance à un fournisseur et le niveau -- edge ou cloud -- constituent deux dimensions indépendantes : un fournisseur n'est pas cantonné à un seul niveau, il opère transversalement sur les deux.
+
+Les machines edge et les machines cloud n'ont pas les mêmes capacités déclarées. Une machine edge dispose typiquement de deux cœurs et deux gigaoctets de mémoire, quand une machine cloud en dispose de huit -- une différence qui reflète le compromis habituel du continuum : la proximité au terrain contre la puissance de calcul disponible. Cette asymétrie n'est pas qu'une donnée de configuration : elle intervient directement dans l'évaluation multicritère du placement, où la disponibilité en ressources d'une machine cloud peut compenser sa latence plus élevée.
+
+Une contrainte matérielle mérite d'être signalée. Les trois machines edge d'un même fournisseur, bien que représentant des rôles logiques distincts dans le système, partagent en réalité un seul et même nœud physique sur le cluster Kubernetes -- une simplification imposée par les ressources disponibles sur l'infrastructure d'accueil. Cette mutualisation reste transparente pour le raisonnement de l'orchestrateur, qui continue de traiter ces trois machines comme des candidats distincts, mais elle doit être prise en compte lorsqu'il s'agit de vérifier, via kubectl, sur quel nœud un service est effectivement actif : l'outil ne renvoie que le nœud physique, jamais la machine logique précise parmi les trois qui le partagent.
+\subsection{Le service à maintenir}
+\label{sec:service}
+
+Le service que la plateforme maintient est un service de streaming, déployé sous Kubernetes dans un espace de nommage dédié et identifié par une étiquette qui permet de le retrouver quel que soit le nœud sur lequel il s'exécute. À tout instant, une seule instance de ce service est active, hébergée sur l'une des huit machines candidates ; c'est cette instance unique que le système déplace d'une machine à l'autre au fil du cycle de décision, jamais en la dupliquant. Migrer le service consiste très concrètement à le retirer de la machine qu'il occupait et à le redéployer sur la machine retenue, avec la configuration propre à cette dernière.
+\section{Vue d'ensemble : l'architecture hub-and-spoke}
+\label{sec:hub-and-spoke}
+
+Après avoir décrit l'environnement sur lequel la plateforme agit, il reste à préciser comment elle est elle-même structurée pour y répondre. Le style architectural retenu, les raisons qui l'ont motivé, et les quelques écarts assumés pour des raisons pratiques font l'objet de cette sous-section, avant que le rôle précis du composant central ne soit détaillé dans la suivante.
+
+\subsection{Le principe moyeu et rayons}
+Le projet repose sur une architecture \emph{hub-and-spoke}, littéralement « moyeu et rayons ». Un composant central, le Hub, concentre la logique de contrôle : c'est lui qui séquence le cycle de décision, décide quand agir et applique les migrations. Autour de lui gravitent des services indépendants, les \emph{spokes}, dont chacun assume une tâche précise -- interpréter une intention, collecter des métriques, produire une prédiction, classer des candidats. Ces services ne se parlent jamais directement entre eux : ils ne connaissent que le Hub, qui les sollicite tour à tour et rassemble leurs réponses, comme l'illustre la figure~\ref{fig:hub-and-spoke}.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.95\textwidth]{images/hub_and_spoke.png}
+    \caption{Architecture générale de la plateforme xQoS}
+    \label{fig:hub-and-spoke}
+\end{figure}
+
+\subsection{Justification du découpage en services}
+Ce choix répond à une contrainte propre au projet. Le cycle de décision enchaîne des traitements de natures très différentes -- un modèle de langage pour l'interprétation, un estimateur statistique pour la sélection des métriques, des modèles d'apprentissage pour la prédiction, une méthode multicritère pour le classement. Les regrouper dans un même processus aurait rendu le système difficile à faire évoluer et à diagnostiquer : une erreur dans la prédiction se serait confondue avec une erreur de décision. En les isolant en services autonomes, chacun exposant une interface HTTP, on peut remplacer un modèle, redémarrer un service ou tracer une anomalie sans toucher au reste.
+
+\subsection{Les deux exceptions assumées au modèle}
+La contrepartie de ce découpage est que le Hub devient un point de passage obligé pour toute information circulant dans le système. Deux exceptions à cette règle ont néanmoins été validées, pour des raisons de performance. D'une part, le service chargé de relever les métriques des machines (Collector) écrit directement le résultat en base de données, plutôt que de le faire transiter par le Hub, afin de ne pas le saturer lors des cycles à haute fréquence. D'autre part, le composant chargé d'exécuter concrètement une migration sur l'infrastructure est appelé directement par le Hub, sans service intermédiaire. Ces deux composants, ainsi que le rôle exact de chacun des services qui gravitent autour du Hub, sont détaillés dans la section~\ref{sec:spokes}.
+
+\section{Le Hub (orchestrateur central)}
+\label{sec:hub}
+
+Le style architectural venant d'être posé, il reste à détailler le composant qui en constitue le cœur. Cette sous-section précise ce que le Hub fait exactement, ce qui le pousse à agir, et comment il détermine, à chaque instant, quel objectif il doit chercher à satisfaire -- autrement dit, comment le déplacement du véhicule décrit plus haut se transforme, de proche en proche, en une décision de placement.
+
+\subsection{Rôle et responsabilités}
+Le Hub est le seul composant qui possède une vue d'ensemble du cycle de décision. Il ne réalise lui-même aucun calcul métier -- ni interprétation, ni prédiction, ni classement -- mais orchestre, dans l'ordre, les services qui en sont chargés : il fait traduire l'intention de l'utilisateur en SLOs, déclenche la collecte de l'état des huit machines candidates, transmet cet état à qui doit en prédire l'évolution, recueille les résultats, et décide, à partir de ceux-ci, s'il y a lieu de déplacer le service.
+
+Cette centralisation a un but précis : garantir qu'à tout instant, une seule décision est prise pour le service surveillé. Les spokes produisent chacun un résultat partiel -- une métrique relevée sur une machine, une prédiction, un classement de candidats -- mais aucun d'eux n'a l'autorité de déclencher une migration ; cette décision reste la responsabilité exclusive du Hub, qui l'applique ensuite lui-même sur l'infrastructure.
+
+\subsection{Les déclencheurs d'un cycle}
+Ce cycle de décision ne démarre pas de façon arbitraire : c'est le véhicule lui-même qui le rythme. À chaque fois qu'il transmet une nouvelle mesure de latence -- une pour chacune des machines qu'il vient d'interroger depuis sa position courante -- le Hub incrémente son compteur de cycle et relance l'ensemble du raisonnement : collecte des métriques système des machines, prédiction de leur évolution proche, évaluation des objectifs, puis décision. Le système se remet ensuite en attente de la mesure suivante. Le déplacement du véhicule sur la carte constitue donc, très concrètement, l'horloge du système.
+
+La réception d'une intention utilisateur suit un chemin distinct : elle ne déclenche pas elle-même un cycle complet, mais met à jour les objectifs que le Hub utilisera lors du cycle suivant, provoqué par la prochaine mesure de latence. Intention et mesure jouent ainsi des rôles complémentaires : l'une fixe ce qu'il faut atteindre, l'autre fait avancer le raisonnement qui permet de vérifier si c'est le cas.
+
+\subsection{Les deux modes : autonome et guidé par l'intention}
+Il reste à savoir d'où viennent ces objectifs que le Hub cherche à satisfaire. Deux réponses coexistent dans le système, correspondant à ses deux modes de fonctionnement -- une fois les objectifs fixés, le déroulement du cycle est en revanche rigoureusement identique dans les deux cas.
+
+Ces objectifs, appelés SLOs, ne sont pas tous de même rang. Un SLO primaire porte sur la contrainte que le service doit impérativement respecter et c'est le seul dont le non-respect peut justifier un déplacement du service. Les SLOs secondaires n'ont pas ce pouvoir : ils affinent le choix de la machine retenue sans jamais, à eux seuls, déclencher une migration. Cette hiérarchie sera reprise en détail dans les chapitres suivants.
+
+En mode autonome, actif par défaut dès le démarrage, le SLO primaire est fixé par la configuration du système (100 ms de latence) ; les SLOs secondaires sont découverts automatiquement, par analyse statistique de l'historique, parmi les métriques qui se révèlent effectivement liées aux dégradations observées (CPU et/ou RAM) -- sans aucune intervention humaine.
+
+En mode guidé par l'intention, c'est l'utilisateur qui exprime son besoin en langage naturel : ce besoin est alors traduit en SLOs mesurables par un LLM. Ces SLOs issus de l'interprétation deviennent les SLOs primaires du système -- et ils ne se réduisent pas nécessairement à la latence : selon l'intention exprimée, ils peuvent aussi porter sur le processeur ou la mémoire, plusieurs contraintes pouvant ainsi coexister au même rang. La découverte statistique reste néanmoins active en parallèle, mais uniquement sur les métriques que l'interprétation n'a pas déjà couvertes, qui viennent alors compléter le contrat en tant que SLOs secondaires. Le passage d'un mode à l'autre se fait simplement par la réception d'une intention ; le Hub bascule alors en mode guidé et le reste ainsi jusqu'à nouvel ordre.
+
+Ces mécanismes -- déclencheurs, objectifs et modes -- prennent tout leur sens une fois rapportés à l'environnement décrit précédemment. À chaque passage du véhicule à proximité des machines, une mesure de latence parvient au Hub et déclenche un cycle : celui-ci fait collecter l'état courant des huit machines candidates(CPU et RAM), en tire une prédiction de leur évolution proche, évalue si le SLO primaire risque d'être compromis, et détermine, le cas échéant, laquelle de ces machines doit désormais héberger le service de streaming -- les SLO secondaires intervenant alors pour départager les candidates. Traduction de l'intention, collecte, prédiction et décision ne sont donc pas des étapes indépendantes : ce sont les maillons d'un même cycle, rejoué à chaque déplacement du véhicule. La sous-section suivante détaille le rôle de chacun des services qui composent ce cycle.
+
+\section{Spécification des spokes}
+\label{sec:spokes}
+
+Chaque spoke assume une seule responsabilité dans le cycle décrit ci-dessus, et ne connaît que le Hub -- jamais les autres spokes directement. Ce cloisonnement n'est pas qu'un choix d'organisation : il garantit qu'une défaillance reste localisée, et permet de faire évoluer, remplacer ou temporairement arrêter un service sans remettre en cause le fonctionnement des autres. Les services sont présentés ci-dessous regroupés par fonction, dans l'ordre où ils interviennent au cours d'un cycle : ce que produit chacun devient la matière première du suivant.
+
+\subsection{Les services d'entrée}
+Un cycle ne peut commencer sans deux choses : savoir ce qu'il faut atteindre, et savoir où en est le système. Trois services fournissent ces informations, en constituant les points par lesquels le monde extérieur pénètre dans l'orchestrateur -- l'un pour ce que demande l'utilisateur, les deux autres pour ce que dit le terrain.
+
+L'\emph{Intent Manager} est la seule porte d'entrée par laquelle une demande humaine parvient à l'orchestrateur. Il reçoit l'intention en langage naturel, telle qu'elle a été formulée, et la convertit en SLOs exploitables par le reste du système -- des grandeurs mesurables, assorties de seuils et de priorités.
+
+Le \emph{Collector} se charge du premier flux venu du terrain : l'état des ressources. Il relève en continu les indicateurs système des huit machines candidates -- charge processeur et mémoire -- en les interrogeant directement, sans attendre que le Hub le sollicite. Ce fonctionnement en tâche de fond est délibéré : interroger huit machines à travers le réseau prend du temps, et le faire au cœur du cycle aurait allongé d'autant chaque décision. En collectant en permanence et en conservant le dernier état connu, le service permet au Hub de disposer instantanément d'une photographie à jour au moment précis où il en a besoin.
+
+Le \emph{Latency Manager} prend en charge le second flux : les mesures de latence transmises par le véhicule. Il les reçoit et s'assure qu'elles parviennent effectivement au Hub, en réémettant en cas d'échec. Ce rôle apparemment modeste est en réalité critique : puisque c'est l'arrivée d'une mesure qui déclenche un cycle, perdre une mesure revient à perdre un cycle entier, et donc à laisser le système aveugle pendant tout ce temps. Le service garantit qu'aucune mesure ne disparaisse silencieusement entre le véhicule et l'orchestrateur.
+
+\subsection{Les services de données}
+Les informations recueillies par les services d'entrée ne valent que si elles peuvent être conservées, puis retrouvées sous une forme utilisable. Deux services s'en chargent, l'un en écriture, l'autre en lecture.
+
+La \emph{Database} centralise l'état courant du système ainsi que l'historique des mesures, des SLOs successifs et des décisions prises. Elle s'appuie sur Redis, une base de données en mémoire dont les temps d'accès très courts conviennent au rythme soutenu du cycle : à chaque itération, plusieurs services viennent y lire ou y écrire.
+
+L'\emph{History Loader} effectue l'opération inverse. Une mesure isolée ne dit rien d'une tendance : pour anticiper une dégradation, il faut disposer d'une série de valeurs successives, pas d'un point unique. Ce service va chercher dans la base ce qui a été accumulé et le restitue sous forme de fenêtre récente, directement exploitable par les services d'analyse -- leur évitant d'avoir à savoir comment les données sont réellement stockées.
+
+\subsection{Les services d'analyse}
+Disposer d'un historique ne suffit pas encore à décider. Il faut d'abord déterminer quelles métriques méritent réellement attention, puis anticiper leur évolution plutôt que de se contenter de constater leur valeur actuelle. C'est le rôle des deux services suivants.
+
+Le \emph{Metrics Manager} répond à la première question. Parmi toutes les métriques disponibles, certaines n'ont aucun rapport avec les dégradations observées, tandis que d'autres les accompagnent systématiquement. Plutôt que de les traiter toutes à poids égal -- ce qui reviendrait à diluer l'information utile dans du bruit -- ce service identifie statistiquement celles qui comptent réellement, et enrichit le contrat de SLOs secondaires découverts plutôt que fixés à l'avance. Le système adapte ainsi son attention à ce qu'il observe, sans intervention humaine.
+
+Le \emph{ML Predictor} répond à la seconde. À partir de l'historique fourni, il projette l'évolution prochaine des métriques retenues, pour chacune des machines. C'est cette valeur prédite, et non la mesure brute, qui sera comparée aux SLOs à l'étape suivante : le système peut ainsi agir avant que la dégradation ne survienne, plutôt que de la corriger une fois le service déjà affecté. Son fonctionnement est détaillé au chapitre~3.
+
+\subsection{Les services de décision}
+Maintenant, c'est le temps de conclusion. Deux services y concourent, dans un ordre qui n'est pas anodin : l'un formule une proposition, l'autre rend le verdict.
+
+Le \emph{Decision Intelligence} vérifie d'abord, à partir des valeurs prédites, si un SLO primaire risque d'être compromis. Si ce n'est pas le cas, le service reste où il est et le cycle s'arrête là -- inutile d'engager une comparaison coûteuse quand rien ne justifie un déplacement. Dans le cas contraire, il compare les machines candidates dont il dispose localement et désigne la mieux adaptée à la situation. Ce qu'il produit n'est pas encore une décision : c'est une proposition argumentée, susceptible d'être confrontée à celle d'un autre fournisseur.
+
+Le \emph{Placement Arbiter} tranche. Il n'a de raison d'être que dans un contexte multi-fournisseur : il reçoit la proposition locale et celles venues du fournisseur pair, puis rend la décision finale que le Hub appliquera -- rester en place, migrer vers une autre machine du même fournisseur, ou céder la main au fournisseur concurrent. Cette séparation permet de garder distincts deux raisonnements différents : évaluer ses propres machines d'un côté, comparer des propositions concurrentes de l'autre.
+
+\subsection{Les services de coordination et de restitution}
+Deux services complètent enfin l'ensemble, en marge du raisonnement proprement dit : l'un ouvre le système vers l'extérieur, l'autre le rend lisible.
+
+Le \emph{Provider Relay} transporte les messages échangés avec les fournisseurs pairs -- le contrat de qualité de service à l'aller, leurs propositions au retour. Il ne les interprète jamais, ne les modifie jamais, ne décide de rien. Cette neutralité est délibérée : si ce service portait la moindre logique de décision, celle-ci se retrouverait dupliquée aux deux extrémités de l'échange, avec le risque qu'elle diverge d'un côté à l'autre. Le mécanisme de coordination qu'il rend possible est développé au chapitre~4.
+
+L'\emph{Observability} rend visible, en continu, ce que le cycle vient de produire à chaque étape : l'intention reçue, les mesures relevées, la prédiction obtenue, la décision prise et le motif qui l'a fondée. Ce service ne participe pas à la décision, mais il conditionne la confiance qu'on peut lui accorder -- un système qui décide seul, et par anticipation, doit pouvoir justifier ses choix. Il répond ainsi directement à l'exigence d'explicabilité posée dès la problématique de ce rapport.
+
+\subsection{Tableau récapitulatif}
+Le tableau~\ref{tab:spokes} résume, pour chaque service, ce qu'il reçoit, ce qu'il produit et le rôle qu'il joue dans le cycle.
+
+\begin{table}[H]
+    \centering
+    \caption{Rôle, entrée et sortie de chaque spoke}
+    \label{tab:spokes}
+    \footnotesize
+    \begin{tabular}{|p{2.6cm}|p{3.2cm}|p{3.2cm}|p{4.2cm}|}
+        \hline
+        \textbf{Service} & \textbf{Entrée} & \textbf{Sortie} & \textbf{Rôle} \\
+        \hline
+        Intent Manager & Intention en langage naturel & SLOs structurés & Traduire un besoin humain en contrat mesurable \\
+        \hline
+        Collector & État système des machines & Instantané des huit machines & Observer les ressources sans bloquer le cycle \\
+        \hline
+        Latency Manager & Mesures de latence du véhicule & Mesures relayées au Hub & Garantir qu'aucune mesure n'est perdue \\
+        \hline
+        Database & Métriques, SLOs, décisions & --- & Conserver l'état et l'historique \\
+        \hline
+        History Loader & Requête d'historique & Fenêtre de données récente & Rendre l'historique exploitable \\
+        \hline
+        Metrics Manager & Fenêtre de données, SLOs actifs & SLOs enrichis & Identifier les métriques réellement pertinentes \\
+        \hline
+        ML Predictor & Historique par machine & Valeurs prédites & Anticiper les dégradations \\
+        \hline
+        Decision Intelligence & Prédictions, SLOs actifs & Proposition de placement & Détecter une violation et classer les candidates \\
+        \hline
+        Placement Arbiter & Propositions locale et distantes & Décision finale & Trancher entre toutes les propositions \\
+        \hline
+        Provider Relay & Messages inter-fournisseurs & Messages acheminés & Transporter sans interpréter \\
+        \hline
+        Observability & Trace du cycle & Restitution en temps réel & Rendre les décisions explicables \\
+        \hline
+    \end{tabular}
+\end{table}
+
+\section{Les composants d'infrastructure}
+\label{sec:infra-composants}
+
+Les services décrits jusqu'ici raisonnent, mais n'observent ni n'agissent directement. Entre l'orchestrateur et l'infrastructure réelle s'intercale une seconde famille de composants, extérieurs au découpage hub-and-spoke mais indispensables à son fonctionnement.
+
+\subsection{Les agents déployés sur les VMs}
+Chaque machine héberge un agent léger qui expose deux informations : son état de charge -- processeur, mémoire, capacité déclarée -- et sa latence vis-à-vis du véhicule. C'est auprès de ces agents que le Collector vient relever ses mesures. Un même agent générique est déployé partout, sa configuration seule déterminant s'il se comporte en nœud edge ou en nœud cloud : ajouter une machine au banc d'essai ne demande donc aucune modification de code.
+
+\subsection{La passerelle du véhicule}
+La latence se mesure entre le véhicule et chaque machine, sans que l'orchestrateur y prenne part : c'est le véhicule qui envoie sa position et chronomètre le temps de réponse. Il ne dialogue toutefois pas directement avec l'orchestrateur. Une passerelle intermédiaire déclenche ces mesures à chaque nouvelle position, en interrogeant les machines en parallèle, puis transmet les résultats obtenus au Latency Manager de chaque fournisseur. C'est par ce canal que la latence réellement perçue sur le terrain parvient au système, qui peut alors la comparer à ses objectifs.
+
+\subsection{L'interface de simulation}
+Une interface graphique restitue en temps réel le déplacement du véhicule sur sa trajectoire, la machine qui héberge effectivement le service, et celle qui serait optimale à cet instant. Elle rend immédiatement visible l'écart entre la décision prise et la décision idéale, et sert autant de support de démonstration que d'outil de vérification.
+
+\subsection{Le client OpenStack et l'exécution des migrations}
+Lorsqu'une migration est décidée, un dernier composant la traduit en actions concrètes sur les clusters : retirer le service de la machine qu'il occupait, puis le redéployer sur celle qui a été retenue. C'est le seul composant qui agit réellement sur l'infrastructure -- tous les autres se contentent d'observer ou de raisonner.
+
+L'ensemble forme une boucle fermée : les agents mesurent, la passerelle achemine, l'orchestrateur décide, le client applique -- et la mesure suivante reflète déjà l'effet de la décision précédente.
+
+\section{Déploiement multi-provider}
+\label{sec:multi-provider}
+
+Tout ce qui précède décrit le fonctionnement d'un seul fournisseur. Reste à voir comment cet ensemble se dédouble pour en couvrir deux, et ce que cela change dans son organisation.
+
+\subsection{Deux piles complètes et indépendantes}
+Chaque fournisseur exécute sa propre pile complète : son Hub, et tous les services qui l'entourent. Rien n'est mis en commun. On aurait pu imaginer une solution plus économe, où certains services auraient été partagés entre les deux -- une seule base de données, un seul module de prédiction. Ce choix a été écarté, car il aurait rendu chaque fournisseur dépendant du bon fonctionnement de l'autre : la panne de l'un aurait bloqué l'autre, et l'indépendance revendiquée dans la problématique n'aurait été qu'un affichage.
+
+En pratique, les deux piles se distinguent par deux choses seulement. D'abord un décalage de ports : chaque service du second fournisseur écoute sur un port décalé par rapport à son équivalent du premier, ce qui leur permet de tourner côte à côte sur la même machine. Ensuite une base de données séparée, de sorte que chacun conserve son propre historique, ses propres SLOs et ses propres décisions. Aucun des deux ne peut lire ni modifier ce que l'autre a enregistré ; leurs seuls échanges passent par des messages, via le relais présenté plus haut.
+
+Cette séparation stricte a un avantage supplémentaire, moins évident : passer de deux fournisseurs à un nombre quelconque ne demande pas de repenser l'architecture. Il suffit de lancer une pile de plus et de la déclarer dans la table d'adresses ; le reste du système fonctionne à l'identique.
+
+\subsection{Les composants partagés}
+Deux composants font exception à cette règle et restent uniques pour l'ensemble du système.
+
+Le premier est le client d'infrastructure, celui qui exécute concrètement les migrations. Il agit sur un même parc de machines : le dupliquer reviendrait à autoriser deux processus à modifier simultanément le même déploiement, avec le risque qu'ils se contredisent -- l'un retirant le service au moment où l'autre le redéploie. Un seul point d'action garantit qu'une migration se déroule d'un bout à l'autre sans interférence.
+
+Le second est la vue de fédération, une interface qui affiche l'état global des deux fournisseurs : où se trouve le service, quelles décisions ont été prises de part et d'autre, et sur quelle base. La dupliquer n'aurait aucun sens, puisque chaque copie ne verrait qu'une moitié du système. Ce composant se contente d'observer et de restituer ; il ne prend aucune décision et n'influence en rien le comportement des fournisseurs.
+
+\subsection{Rôles ACTIVE et STANDBY : l'absence de maître}
+Il reste une question à trancher : lequel des deux fournisseurs conduit le cycle de décision ? La réponse tient en un principe simple -- celui qui héberge le service.
+
+Le fournisseur sur lequel le service s'exécute est dit ACTIVE. C'est lui qui reçoit les mesures de latence, qui déclenche les cycles, qui évalue ses machines et qui, le cas échéant, lance une mise en concurrence. L'autre est STANDBY : il continue de fonctionner, mais reste en retrait, se contentant de répondre lorsqu'on lui demande ce qu'il peut offrir.
+
+Ces rôles ne sont attribués à personne une fois pour toutes. Ils suivent le service : dès qu'une migration le confie au fournisseur qui était en attente, celui-ci devient ACTIVE et l'autre passe en STANDBY. Aucun des deux n'occupe donc une position privilégiée de façon permanente.
+
+C'est cette symétrie qui distingue l'architecture d'une relation client-serveur classique, où le rôle de chacun serait fixé à la conception. Ici, aucun coordinateur n'est désigné à l'avance : selon les circonstances, n'importe lequel des deux fournisseurs peut initier une mise en concurrence ou simplement y répondre. Le mécanisme précis de cette coordination -- comment la mise en concurrence est lancée, comment les propositions sont comparées, comment le service change de main -- fait l'objet du chapitre~4.
+\section{Conclusion}
+Cette section a décrit l'architecture de la plateforme en partant du terrain pour remonter jusqu'à la décision : un véhicule qui se déplace et dont la latence perçue change en permanence, huit machines réparties entre deux fournisseurs et deux niveaux, un service unique qui se déplace de l'une à l'autre. Pour piloter cet ensemble, le choix s'est porté sur une organisation hub-and-spoke, où un composant central décide seul mais ne calcule rien lui-même, s'appuyant sur des services spécialisés qui traduisent l'intention, observent, anticipent et proposent. Cette pile complète est enfin dupliquée à l'identique pour chaque fournisseur, sans maître ni coordinateur désigné.
+
+Ce qui a été présenté ici reste volontairement descriptif : la place de chaque composant, ce qu'il reçoit et ce qu'il produit. Les mécanismes qui les font fonctionner -- comment une phrase devient un contrat mesurable, comment une dégradation est anticipée, comment deux fournisseurs indépendants s'accordent sur une même décision -- font l'objet des chapitres suivants.

@@ -51,74 +51,6 @@ _CAPACITY_METRICS: Dict[str, str] = {
 }
 
 
-def _parse_horizon_weights(spec: str) -> Optional[List[float]]:
-    """
-    Lit le profil de pondération de l'horizon depuis la configuration.
-    Retourne None si non configuré ou illisible — l'appelant retombe alors
-    sur le profil décroissant d'origine. Une valeur invalide ne doit jamais
-    empêcher une décision : on préfère le comportement d'origine à une panne.
-    """
-    if not spec:
-        return None
-    try:
-        vals = [float(x) for x in spec.split(",") if x.strip() != ""]
-    except ValueError:
-        logger.warning(
-            f"⚠️  TOPSIS_HORIZON_WEIGHTS illisible ({spec!r}) "
-            "— profil décroissant d'origine conservé"
-        )
-        return None
-    if not vals or any(v < 0 for v in vals) or sum(vals) <= 0:
-        logger.warning(
-            f"⚠️  TOPSIS_HORIZON_WEIGHTS invalide ({spec!r}) "
-            "— profil décroissant d'origine conservé"
-        )
-        return None
-    return vals
-
-
-_CONFIGURED_WEIGHTS: Optional[List[float]] = _parse_horizon_weights(
-    getattr(config, "TOPSIS_HORIZON_WEIGHTS", "")
-)
-
-# Journalisé au PREMIER APPEL, pas à l'import : app.py importe ce module
-# (via DecisionHandler) avant d'avoir configuré ses handlers de log, donc un
-# message émis à l'import est perdu. Or il faut pouvoir vérifier dans les
-# journaux d'une exécution quel profil tournait réellement.
-_WEIGHTS_LOGGED: bool = False
-
-
-def _horizon_weights(n: int) -> List[float]:
-    """
-    Poids appliqués aux n pas prédits, du plus proche au plus lointain.
-
-    Sans configuration : [n, n-1, …, 1] — le pas le plus proche domine.
-    Avec configuration : le profil déclaré, ajusté à n (tronqué s'il est plus
-    long, complété par son dernier poids s'il est plus court) pour rester
-    défini quel que soit l'horizon effectivement renvoyé par le prédicteur.
-    """
-    global _WEIGHTS_LOGGED
-    if not _WEIGHTS_LOGGED:
-        _WEIGHTS_LOGGED = True
-        if _CONFIGURED_WEIGHTS:
-            logger.info(
-                f"⚖️  Pondération de l'horizon TOPSIS : {_CONFIGURED_WEIGHTS} "
-                "(profil configuré, du pas le plus proche au plus lointain)"
-            )
-        else:
-            logger.info(
-                "⚖️  Pondération de l'horizon TOPSIS : profil décroissant "
-                "d'origine [n, n-1, …, 1]"
-            )
-
-    if not _CONFIGURED_WEIGHTS:
-        return [float(w) for w in range(n, 0, -1)]
-    w = _CONFIGURED_WEIGHTS
-    if len(w) >= n:
-        return w[:n]
-    return w + [w[-1]] * (n - len(w))
-
-
 def vm_satisfies_slo(mean: float, slo: Dict[str, Any]) -> bool:
     """Return True if *mean* meets the SLO threshold given its operator."""
     op = slo["operator"]
@@ -319,11 +251,9 @@ class TopsisSelector:
     def calculate_weighted_mean(self, preds: List[float]) -> float:
         if not preds:
             return 0.0
-        n:       int         = len(preds)
-        weights: List[float] = _horizon_weights(n)
-        total:   float       = sum(weights)
-        if total <= 0:
-            return sum(preds) / n
+        n:       int       = len(preds)
+        weights: List[int] = list(range(n, 0, -1))
+        total:   int       = sum(weights)
         return sum(w * p for w, p in zip(weights, preds)) / total
 
     def _budget_score(

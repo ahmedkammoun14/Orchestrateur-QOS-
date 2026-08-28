@@ -1,0 +1,761 @@
+\newpage
+\pagestyle{fancy}
+
+\lhead{\textsc{Chapitre 4. Réalisation}}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\footrulewidth}{0.5pt}
+\chapter{Réalisation}\setlength{\headheight}{27.06pt}
+\label{ch4}
+\minitoc
+
+\newpage
+\section{Introduction}
+Le chapitre précédent a expliqué pourquoi chaque brique du système a été pensée de cette façon : pourquoi une cascade de modèles plutôt qu'un seul, pourquoi une négociation entre pairs plutôt qu'un arbitre central, pourquoi chaque décision doit toujours pouvoir se justifier. Ce chapitre montre comment ces choix ont été concrètement traduits en code.
+
+Il suit le même ordre que le chapitre précédent : l'environnement et les outils utilisés (section~\ref{sec:realisation-environnement}), puis la réalisation de la traduction d'intention, de la décision locale proactive, de la coordination inter-fournisseurs et du tableau de bord, chacune reprenant la brique conçue dans la section correspondante du chapitre 3. Rien n'y est rejustifié : il s'agit ici du service concerné, de la façon dont il a été implémenté, et des choix techniques qui en découlent.
+\section{Environnement et outils}
+\label{sec:realisation-environnement}
+
+Avant de détailler comment chaque brique a été implémentée, il faut préciser avec quoi elle l'a été. Cette section présente les langages et bibliothèques retenus, les modèles de langage utilisés, l'infrastructure d'exécution et le banc d'essai physique sur lequel l'ensemble a été validé.
+
+\subsection{Langages, frameworks et bibliothèques}
+
+Le système ne mobilise pas les mêmes technologies partout : ce qui sert à afficher une décision n'a rien à voir avec ce qui sert à la calculer. Cette sous-section détaille les choix retenus domaine par domaine -- interface, services, données, intelligence, infrastructure --, chaque technologie étant présentée individuellement.
+
+\subsubsection{Interface}
+
+Le tableau de bord ne repose sur aucun framework front-end séparé : il s'appuie directement sur HTML, CSS et JavaScript, sans bibliothèque de mise en forme ni framework comme React ou Vue. Ce choix reste volontaire plutôt que par défaut : le tableau de bord n'a besoin ni d'état complexe ni de composants réutilisables, ce qu'un framework plus lourd n'aurait fait qu'ajouter en complexité sans réel bénéfice. La page est construite et servie directement par le service FastAPI concerné, sous forme de HTML embarqué dans le code Python, et le peu de dynamisme nécessaire -- rafraîchir les badges de décision, mettre à jour les compteurs -- s'appuie sur de simples requêtes JavaScript périodiques.
+
+Ce choix simplifie aussi le déploiement, qui se limite à celui du service Python lui-même, sans chaîne de compilation ni build séparé -- cohérent avec le rôle du tableau de bord, qui reste un outil de supervision interne plutôt qu'une application à part entière.
+
+\subsubsection{Services}
+
+Le Hub et l'ensemble des spokes sont écrits en Python~3.
+
+\paragraph{FastAPI}
+
+
+Chaque service est un serveur \emph{FastAPI}~\cite{fastapi}, qui expose sa propre API REST sur un port dédié. Ce choix découle directement d'une exigence posée au chapitre 3 : plusieurs services doivent pouvoir s'interroger sans se bloquer mutuellement, ce que permet la nature asynchrone de FastAPI, en particulier pour les appels au modèle de langage ou aux fournisseurs pairs, qui peuvent prendre plusieurs secondes.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/fastapi.png}
+    \caption{Logo FastAPI}
+    \label{fig:logo-fastapi}
+\end{figure}
+
+Autour de FastAPI, trois briques complètent l'ensemble sans intervenir dans les choix de conception : \emph{uvicorn} exécute chaque application, \emph{httpx} assure les échanges asynchrones entre services, et chaque contrat SLO transmis est validé par un modèle \emph{pydantic} avant d'être accepté.
+
+\subsubsection{Données}
+La base de données où on stocke les données est Redis
+\paragraph{Redis}
+
+Redis est utilisé comme mémoire partagée à faible latence pour les métriques collectées à chaque cycle, avec une base distincte par fournisseur. C'est le seul choix de cette couche qui a une réelle incidence sur la conception : les autres bibliothèques (pandas, numpy pour les séries historiques, openpyxl pour l'export, matplotlib pour les figures) sont des outils d'usage courant, sans effet sur les choix décrits au chapitre précédent.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/redis.png}
+    \caption{Logo Redis}
+    \label{fig:logo-redis}
+\end{figure}
+
+\subsubsection{Intelligence}
+
+Ce domaine regroupe deux familles de technologies bien distinctes, l'une pour l'interprétation, l'autre pour la décision.
+
+\paragraph{vLLM}
+
+Sert le modèle de langage utilisé pour l'interprétation des intentions, hébergé sur l'infrastructure de calcul du LAAS~\cite{kwon2023vllm}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/vllm.png}
+    \caption{Logo vLLM}
+    \label{fig:logo-vllm}
+\end{figure}
+
+\paragraph{Ollama}
+
+Exécute localement le modèle de repli, sans dépendance réseau, lorsque le modèle principal n'est pas disponible~\cite{ollama}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/ollama.png}
+    \caption{Logo Ollama}
+    \label{fig:logo-ollama}
+\end{figure}
+
+\paragraph{TensorFlow et Keras}
+
+Construisent les réseaux de neurones récurrents utilisés pour la prédiction~\cite{tensorflow2015}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.3\textwidth]{images/tensorflowkeras.jpg}
+    \caption{Logos TensorFlow et Keras}
+    \label{fig:logo-tensorflow-keras}
+\end{figure}
+
+\paragraph{Optuna}
+
+Détermine automatiquement l'architecture et les hyperparamètres de ces réseaux, plutôt que de les fixer à la main~\cite{akiba2019optuna}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/optuna.jpg}
+    \caption{Logo Optuna}
+    \label{fig:logo-optuna}
+\end{figure}
+
+\paragraph{scikit-learn}
+
+Fournit le calcul de l'information mutuelle, qui sert à retenir les SLOs secondaires~\cite{scikit-learn}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/sikit.png}
+    \caption{Logo scikit-learn}
+    \label{fig:logo-scikit-learn}
+\end{figure}
+
+TOPSIS et la scalarisation de Tchebycheff, en revanche, ont été implémentés directement en Python : ce sont des opérations matricielles simples qui ne justifiaient pas l'ajout d'une dépendance supplémentaire.
+
+\subsubsection{Infrastructure}
+Dans l'infrastructure, nous avons recours à Kubernetes et OpenStack 
+\paragraph{Kubernetes}
+
+C'est géré par invocation directe de \emph{kubectl}, il pilote deux clusters distincts, l'un pour les machines edge, l'autre pour les machines cloud.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/k8s.png}
+    \caption{Logo Kubernetes}
+    \label{fig:logo-kubernetes}
+\end{figure}
+
+\paragraph{OpenStack}
+
+\c{C}a fournit les machines virtuelles sur lesquelles tournent ces clusters, hébergées par CROcc~\cite{crocc_website}, l'infrastructure cloud régionale mise à disposition par l'université.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.2\textwidth]{images/openstack.png}
+    \caption{Logo OpenStack}
+    \label{fig:logo-openstack}
+\end{figure}
+
+L'ensemble du code -- des spokes jusqu'aux fonctions de décision -- est par ailleurs couvert par des suites de tests \emph{pytest}, unitaires et d'intégration, exécutées avant tout déploiement.
+
+\subsection{Modèles de langage utilisés}
+
+Le chapitre précédent a expliqué pourquoi l'interprétation des intentions repose sur une cascade de modèles plutôt que sur un seul. Cette sous-section précise lesquels ont été retenus, et comment leur usage a été concrètement paramétré.
+
+Le premier niveau s'appuie sur \emph{Qwen3.6-27B}, exécuté en pleine précision (FP16) et servi par vLLM sur l'infrastructure de calcul du LAAS. C'est un modèle de grande taille, choisi pour sa capacité à suivre une consigne structurée en plusieurs étapes -- identifier le type de service que l'intention implique, en déduire ses besoins, puis produire un contrat JSON conforme -- sans disposer de puissance de calcul locale dédiée, puisqu'il tourne à distance. Le second niveau s'appuie sur \emph{qwen2.5}, un modèle nettement plus petit, exécuté localement via Ollama. Il sacrifie une partie de la finesse de raisonnement du premier au profit d'une exécution possible sans dépendance réseau ni infrastructure de calcul distante -- cohérent avec son rôle de repli, qui doit rester disponible précisément quand le premier ne l'est plus.
+
+Chaque appel est borné à soixante secondes. Passé ce délai, ou en cas de réponse HTTP en erreur, ou encore si la réponse ne contient aucun JSON exploitable, l'appel est considéré comme un échec et le niveau suivant de la cascade prend le relais -- c'est cette même condition d'échec, quelle que soit sa cause, qui déclenche le repli décrit en conception.
+
+\subsection{Infrastructure d'exécution}
+
+Les choix de conception du chapitre 3 (fournisseurs autonomes, aucune vue globale partagée) devaient encore être posés sur une infrastructure réelle. Le système est déployé sur l'infrastructure cloud régionale CROcc~\cite{crocc_website}, sur des machines virtuelles OpenStack réparties en deux clusters Kubernetes -- un cluster \emph{edge} et un cluster \emph{cloud} --, chacun identifié par son propre contexte \texttt{kubectl}. Le pilotage de ces clusters se fait par simple invocation en sous-processus de la commande \texttt{kubectl}, sans passer par le SDK OpenStack : c'est kubectl, avec l'option \texttt{--context}, qui détermine sur quel cluster une commande s'applique.
+
+Le parc compte huit machines virtuelles, réparties selon un découpage transversal : chaque fournisseur possède trois machines edge et une machine cloud, plutôt que chaque fournisseur possédant un cluster entier. Cette répartition est ce qui rend la coordination inter-fournisseurs décrite au chapitre 3 observable en pratique -- sans elle, edge et cloud seraient chacun la propriété d'un seul fournisseur, et aucune négociation n'aurait jamais lieu à niveau égal.
+
+Faire tourner deux fournisseurs sur la même infrastructure impose une précaution supplémentaire : les deux piles logicielles ne doivent ni se marcher dessus, ni se voir. Chaque service expose son port habituel décalé d'un montant fixe, \texttt{PORT\_OFFSET}, propre à chaque fournisseur -- de sorte que les deux stacks tournent sur le même réseau sans collision de ports. De la même façon, chaque fournisseur écrit dans sa propre base Redis, distinguée par un numéro de base dédié, pour que l'historique de l'un ne se mélange jamais à celui de l'autre.
+
+Un déploiement se fait par fichier YAML déclaratif, appliqué au cluster concerné via \texttt{kubectl apply}. Ce fichier est défini par fournisseur, et non par machine individuelle : toutes les machines d'un même fournisseur, edge comme cloud, partagent le même manifeste de déploiement, cohérent avec le fait qu'elles appartiennent à un seul et même espace administratif. 
+\subsection{Banc d'essai physique}
+
+Les choix décrits plus haut ont été validés sur un banc d'essai concret, construit autour d'un robot \emph{PiCar-X}~\cite{sunfounder_picarx}, dont le déplacement sert de terminal mobile pour l'ensemble des mesures.
+
+Le déplacement du robot est piloté par un simulateur exécuté dans un navigateur : une trajectoire fixe est parcourue à vitesse réglable, et la position courante $(x, y)$ est envoyée périodiquement à un pont logiciel (\emph{bridge}) qui fait le lien entre le simulateur et l'infrastructure réelle. Ce pont interroge en parallèle chacune des machines virtuelles sur un point d'accès dédié : chaque machine reçoit la position du terminal, calcule sa propre distance, applique le modèle de latence décrit au chapitre 2, puis répond après le délai correspondant -- de sorte que le temps de réponse mesuré par le pont reflète directement la latence simulée. Les mesures obtenues sont à la fois transmises à l'orchestrateur et journalisées dans un fichier local, pour permettre une analyse hors ligne indépendante de ce que le système a effectivement décidé.
+
+Cette transmission est volontairement cadencée : plutôt que d'envoyer une mesure à chaque position reçue, le pont ne transmet à l'orchestrateur qu'au rythme d'un cycle de décision, soit environ toutes les cinq secondes. Envoyer plus souvent n'aurait aucun effet, puisqu'un cycle ne peut de toute façon pas en chevaucher un autre : les mesures supplémentaires seraient ignorées.
+
+\section{Réalisation de la traduction d'intention}
+\label{sec:realisation-traduction}
+
+Le chapitre précédent a posé le principe : une intention exprimée librement doit devenir un contrat SLO vérifiable, sans jamais rester sans réponse. Cette section montre comment ce principe a été implémenté.
+
+\subsection{Service Intent Manager}
+
+La traduction d'intention est assurée par un spoke dédié, l'\emph{Intent Manager}, qui expose un point d'entrée unique recevant l'intention en langage naturel. Ce service ne conserve aucune décision : il traduit, puis transmet le contrat obtenu au Hub, qui reste seul responsable de son application.
+
+Le traitement d'une intention suit trois étapes. Le service commence par récupérer auprès du Hub l'état courant du système -- SLOs actuellement actifs, machine hébergeant le service, numéro de cycle -- afin d'enrichir la requête envoyée au modèle de langage. Sans ce contexte, une intention formulée en termes relatifs (\og encore plus rapide \fg) serait ininterprétable, faute de savoir par rapport à quoi. Le modèle est ensuite interrogé, puis le contrat produit est fusionné avec les SLOs déjà en place avant d'être transmis au Hub.
+
+Deux précautions accompagnent ce traitement. D'abord, la durée de chaque étape est mesurée et transmise au Hub avec le contrat, ce qui permet de distinguer le temps passé dans le modèle de langage du temps de traitement propre au service. Ensuite, l'historique des intentions déjà traitées est conservé dans la base de données plutôt qu'en mémoire : redémarrer le service ne fait donc pas perdre la trace des intentions passées.
+
+\subsection{Intégration de la cascade LLM et repli par mots-clés}
+
+La cascade décrite au chapitre 3 se traduit simplement : le service interroge d'abord le modèle distant servi par vLLM. Si l'appel échoue -- trop long, en erreur, ou sans réponse exploitable --, il repose exactement la même question au modèle local exécuté par Ollama.
+
+Ce basculement n'a pourtant pas été la partie difficile. Le vrai travail a porté sur la consigne donnée au modèle. Une intention réelle ne mentionne presque jamais de métrique. \og Préviens-moi tout de suite si le site tombe \fg ne parle ni de latence ni de processeur, et pourtant elle veut dire deux choses claires : il faut réagir vite, et il n'y a pas besoin de beaucoup de calcul. Demander au modèle d'extraire directement des chiffres reviendrait à lui demander de deviner, puisqu'il n'y en a aucun dans la phrase.
+
+La consigne demande donc au modèle de raisonner en trois étapes : deviner d'abord quel service répondrait à l'intention, en déduire ensuite ses besoins en calcul et en mémoire, puis traduire la réactivité attendue en contrainte de latence. C'est ce détour qui permet d'obtenir un contrat cohérent à partir d'une phrase qui ne contient aucun chiffre.
+
+La consigne fixe aussi des limites strictes : seules trois métriques sont autorisées, avec un nom et une unité imposés, pour que le modèle ne propose jamais une métrique que le système ne sait pas mesurer. Un petit catalogue de profils -- service léger, sonde de surveillance, traitement web, transcodage vidéo, inférence -- donne des ordres de grandeur quand l'intention ne précise rien.
+
+
+Reste le cas où les deux modèles échouent. La conception prévoyait un repli par mots-clés pour produire quand même des SLOs, mais ce choix n'a pas été gardé à l'usage : un contrat construit à partir de simples mots-clés donne des seuils qui n'ont aucun rapport avec la demande réelle, ce qui est pire qu'un refus. Quand les deux modèles échouent, l'intention est donc simplement rejetée, avec une trace qui explique pourquoi.
+
+Avant d'être accepté, le contrat produit par le modèle passe enfin par un nettoyage : les noms de métriques sont uniformisés (\og cpu \fg devient \texttt{cpu\_usage}), les unités sont converties si besoin, et les seuils sont ramenés à des valeurs plausibles. Un SLO qui ne passe pas ce contrôle est simplement écarté, avec une trace, plutôt qu'accepté tel quel.
+
+\subsection{Implémentation de la fusion des SLOs}
+
+Trois façons de fusionner une nouvelle intention avec les objectifs déjà actifs ont été prévues au chapitre 3 : remplacer entièrement les anciens objectifs, les compléter en ajoutant les nouveaux, ou ajuster un seuil existant sans le remplacer. Cette sous-section explique comment ce choix se fait en pratique, et comment chacune des trois méthodes est codée.
+
+Deux cas se présentent. En temps normal, c'est le modèle de langage qui décide : en même temps qu'il fournit les nouveaux objectifs, il indique lui-même laquelle des trois méthodes appliquer. C'est le chemin principal, celui qui s'exécute la plupart du temps.
+
+Un chemin de secours existe pour le cas où le modèle omettrait cette précision. Le code se rabat alors sur des mots-clés repérés dans le texte : des expressions comme \og plus strict \fg ou \og moins de \fg orientent vers un ajustement, \og aussi \fg ou \og en plus \fg vers un complément, et l'absence de tout indice fait basculer vers un remplacement par défaut.
+
+Ce chemin de secours reste toutefois peu fiable, ce qui explique pourquoi il n'intervient qu'en dernier recours. Deux phrases suffisent à le montrer : \og je veux moins de latence, et aussi moins de CPU \fg fixe deux objectifs complets qui doivent remplacer les anciens, tandis que \og garde ce qui est en place, mais surveille aussi le CPU \fg doit simplement compléter les objectifs existants -- et pourtant le mot \og aussi \fg figure dans les deux. Aucun mot-clé ne peut départager ces deux cas ; seul un modèle capable de comprendre le sens de la phrase le peut, ce qui justifie de lui confier la décision en priorité.
+
+Cela a une conséquence directe sur la méthode d'ajustement : elle n'est presque jamais sollicitée lorsque le modèle répond, puisqu'il connaît déjà les anciens objectifs et calcule lui-même la nouvelle valeur. Elle demeure implémentée, mais ne s'active en pratique que par le chemin de secours.
+
+La fusion se conclut par une vérification. En effet, notre service détecte les contradictions entre objectifs -- deux règles opposées sur une même métrique, par exemple --, sans bloquer le traitement mais en le signalant par un avertissement. 
+\subsection{Service Metrics Manager}
+
+Après le Collector, qui fournit les mesures brutes, vient le service qui décide de ce qu'il faut en faire. Le \emph{Metrics Manager} détermine quelles métriques méritent d'être surveillées, en mettant en œuvre la découverte des SLOs secondaires conçue au chapitre 3.
+
+\begin{table}[H]
+    \centering
+    \caption{Rôle du service Metrics Manager}
+    \label{tab:metrics-manager-role}
+    \begin{tabular}{|p{2.8cm}|p{10.5cm}|}
+        \hline
+        \textbf{Entrée} & Historique des métriques et du signal de violation, SLOs actuellement actifs \\
+        \hline
+        \textbf{Sortie} & Liste des SLOs (primaires et secondaires) avec poids normalisés \\
+        \hline
+        \textbf{Côté métier} & Décide statistiquement quelles métriques comptent réellement, sans intervention humaine \\
+        \hline
+    \end{tabular}
+\end{table}
+
+En mode autonome, le système démarre avec un seul objectif, fixé d'avance dans le registre de configuration : la latence, avec un poids de 1. Ce seuil n'est jamais recalculé statistiquement -- c'est l'objectif métier non négociable. Pendant les cinq premiers cycles, le système reste en phase d'amorçage, le temps d'accumuler assez d'historique pour que les estimations soient fiables. Passé cette phase, le service teste à chaque cycle si la charge processeur ou la mémoire est statistiquement liée aux violations de latence passées.
+
+\subsubsection{Ce que l'on cherche à mesurer}
+
+Avant d'entrer dans le calcul, il faut préciser ce qui est comparé à quoi. Deux séries sont mises en regard à chaque cycle.
+
+La première, notée $X$, est la métrique continue testée : la suite des valeurs de CPU ou de RAM relevées à chaque cycle de l'historique. La seconde, notée $Y$, est le signal de violation : une suite de 0 et de 1, valant 1 lorsque le cycle a connu une violation de l'objectif de latence, 0 sinon.
+
+La question posée est alors la suivante : connaître $X$ aide-t-il à savoir si $Y$ vaut 0 ou 1 ? Autrement dit, la charge processeur d'une machine renseigne-t-elle sur le fait qu'elle viole ou non son objectif ? Si oui, cette métrique mérite d'être surveillée ; si non, elle n'apporte rien et doit être écartée.
+
+Le tableau~\ref{tab:mi-termes} rassemble ces deux grandeurs et tous les symboles employés par la suite.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{|p{2cm}|p{11.3cm}|}
+        \hline
+        \textbf{Terme} & \textbf{Signification} \\
+        \hline
+        $X$ & La métrique continue testée (CPU ou RAM) : la série des valeurs mesurées à chaque cycle de l'historique. \\
+        \hline
+        $Y$ & Le signal binaire de violation : 0 si le cycle était normal, 1 si une violation a eu lieu ce cycle-là. C'est ce que l'on cherche à prédire. \\
+        \hline
+        $n$ & Nombre total de points (cycles) dans l'échantillon d'historique. \\
+        \hline
+        $k$ & Nombre de voisins considérés dans l'estimateur, calculé automatiquement selon $n$. \\
+        \hline
+        $r_k$ & Distance entre un point et son $k$-ième plus proche voisin (mesure de densité locale). \\
+        \hline
+        $c$ & Une classe de $Y$ (soit 0, soit 1). \\
+        \hline
+        $n_c$ & Nombre de points appartenant à la classe $c$. \\
+        \hline
+        $H(X)$ & Entropie de $X$ : incertitude globale sur la métrique, sans tenir compte de la violation. \\
+        \hline
+        $H(X \mid Y{=}c)$ & Entropie de $X$ calculée uniquement sur les points d'une classe (normal ou violation). \\
+        \hline
+        $H(X \mid Y)$ & Moyenne pondérée des deux entropies conditionnelles. \\
+        \hline
+        $I(X;Y)$ & Information mutuelle : réduction d'incertitude sur $X$ apportée par la connaissance de $Y$. \\
+        \hline
+        $H(Y)$ & Entropie du signal de violation lui-même, qui sert à normaliser le score entre 0 et 1. Elle obéit à une formule propre -- l'entropie de Shannon discrète $H(Y) = -\sum_c p_c \ln p_c$ -- et non à l'estimateur par plus proches voisins, puisque $Y$ ne prend que deux valeurs. \\
+        \hline
+        $\psi$ & Fonction digamma, utilisée dans la formule d'entropie de l'estimateur k-NN. \\
+        \hline
+        score & $I(X;Y)/H(Y)$ : plus il est proche de 1, plus $X$ est un bon prédicteur de la violation. \\
+        \hline
+    \end{tabular}
+    \caption{Termes employés dans le calcul de l'information mutuelle}
+    \label{tab:mi-termes}
+
+
+\end{table}
+
+\subsubsection{Fonctionnement détaillé — information mutuelle par k plus proches voisins}
+
+La mesure retenue pour répondre à cette question est l'information mutuelle, estimée par la méthode différentielle de Kozachenko-Leonenko. Celle-ci travaille sur les distances entre points voisins plutôt que sur un découpage des valeurs en intervalles, ce qui évite d'avoir à choisir une largeur d'intervalle arbitraire qui influencerait le résultat. Le nombre de voisins s'adapte à la taille de l'échantillon selon $k = \max(3, \min(5, \lfloor n/10 \rfloor))$.
+
+Le calcul se déroule en cinq étapes :
+
+\begin{enumerate}
+    \item $H(X) = \psi(n) - \psi(k) + \ln 2 + \mathrm{moy}(\ln r_k)$ -- entropie globale
+    \item $H(X \mid Y = c)$ -- même formule, calculée séparément par classe (violation / normal)
+    \item $H(X \mid Y) = \sum_c (n_c/n) \cdot H(X \mid Y = c)$ -- entropie conditionnelle pondérée
+    \item $I(X;Y) = H(X) - H(X \mid Y)$ -- information mutuelle (en nats)
+    \item $\mathrm{score} = I(X;Y) / H(Y)$, borné à $[0,1]$ -- $H(Y)$ étant l'entropie du signal de violation
+\end{enumerate}
+
+L'idée sous-jacente est simple : si la métrique se comporte de la même façon en régime normal et en régime de violation, connaître $Y$ ne réduit en rien l'incertitude sur $X$, et l'information mutuelle est nulle. Si au contraire les valeurs se répartissent en deux groupes bien distincts selon la classe, l'incertitude chute fortement dès qu'on connaît la classe, et le score augmente.
+
+Une précaution complète ce calcul : si une classe compte trop peu de points pour que l'estimateur soit défini ($n_c \leq k+1$), son entropie conditionnelle est remplacée par $H(X)$, ce qui annule sa contribution plutôt que de produire une valeur arbitraire.
+
+\subsubsection{Détail des fonctions mathématiques utilisées}
+
+Chacune de ces étapes fait appel à quelques fonctions qu'il est utile de préciser, avec les valeurs qu'elles prennent sur l'exemple traité plus loin.
+
+\begin{table}[H]
+    \centering
+    \small
+    \label{tab:mi-fonctions}
+    \begin{tabular}{|p{2.2cm}|p{6.3cm}|p{5cm}|}
+        \hline
+        \textbf{Fonction} & \textbf{Définition} & \textbf{Exemple chiffré} \\
+        \hline
+               $\psi(n)$ \newline digamma &
+        $\psi(n) = -\gamma + \sum_{i=1}^{n-1} 1/i$, avec $\gamma \approx 0{,}5772$ (constante d'Euler-Mascheroni). Correction statistique qui remplace un simple $\ln(n)$ afin de corriger le biais de l'estimateur d'entropie sur un échantillon fini. &
+        $\psi(8) = -0{,}5772 + (1 + 0{,}5 + 0{,}333 + 0{,}25 + 0{,}2 + 0{,}167 + 0{,}143) = 2{,}016$ \newline $\psi(5) = -0{,}5772 + 2{,}083 = 1{,}506$ \newline $\psi(3) = -0{,}5772 + 1{,}5 = 0{,}923$ \\
+        \hline
+        $\mathrm{moy}(\cdot)$ \newline moyenne &
+        Moyenne arithmétique simple, appliquée ici aux logarithmes des distances $r_k$ de chaque point de l'échantillon. &
+        sur $r_3 = (8,6,5,8,7,4,5,7)$ : \newline $(2{,}079 + 1{,}792 + 1{,}609 + 2{,}079 + 1{,}946 + 1{,}386 + 1{,}609 + 1{,}946)/8 = 1{,}806$ \\
+        \hline
+        $\ln(\cdot)$ \newline logarithme népérien &
+        Logarithme en base $e$, et non en base 2. L'estimateur k-NN continu est nativement défini avec le logarithme népérien : les résultats s'expriment donc en nats. &
+        $\ln(8) = 2{,}079$, $\ln(2) = 0{,}693$ \newline (1 nat $\approx$ 1,443 bit) \\
+        \hline
+        $\sum_c$ \newline somme indexée &
+        Somme d'une série de termes, un par valeur de l'indice -- ici un terme par classe $c$ ($0$ = normal, $1$ = violation). &
+        $H(X \mid Y) = (5/8) \times 3{,}401 + (3/8) \times 3{,}592 = 3{,}473$ \\
+        \hline
+    \end{tabular}
+    \caption{Fonctions mathématiques de l'estimateur k-NN}
+
+\end{table}
+
+Pourquoi une correction digamma plutôt qu'un simple logarithme ? Sur un petit échantillon -- quelques cycles seulement --, l'entropie estimée naïvement serait biaisée. Le terme $\psi(n) - \psi(k)$ corrige précisément ce biais, ce qui rend l'estimateur asymptotiquement non biaisé même à faible $n$. C'est aussi ce qui explique que le score puisse malgré tout rester instable lorsque $n$ est très petit.
+
+\subsubsection{Exemple chiffré détaillé — calcul complet de $r_k$ et des entropies}
+
+Le déroulement complet du calcul se comprend mieux sur un cas concret. On considère huit cycles observés. Le nombre de voisins découle directement de la taille de l'échantillon : $k = \max(3, \min(5, \lfloor 8/10 \rfloor)) = 3$.
+
+\begin{table}[H]
+    \centering
+    \label{tab:mi-donnees}
+    \begin{tabular}{|l|c|c|c|c|c|c|c|c|}
+        \hline
+        \textbf{Cycle} & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 \\
+        \hline
+        \textbf{CPU \%} & 40 & 85 & 42 & 88 & 45 & 90 & 48 & 92 \\
+        \hline
+        \textbf{Violation} & non & oui & non & oui & non & oui & oui & oui \\
+        \hline
+    \end{tabular}
+    \caption{Jeu de données de l'exemple}
+
+\end{table}
+
+\paragraph{Calcul de $r_k$ pour $H(X)$}
+
+Les 8 points sont d'abord pris ensemble ($n = 8$, $k = 3$) : pour chaque point, on trie ses distances aux 7 autres et on retient la troisième plus petite.
+
+\begin{table}[H]
+    \centering
+    \label{tab:mi-rk-global}
+    \begin{tabular}{|c|l|c|c|}
+        \hline
+        \textbf{Point} & \textbf{Distances triées (extrait)} & $r_3$ & $\ln r_3$ \\
+        \hline
+        40 & 2, 5, 8\ldots & 8 & 2,079 \\
+        \hline
+        42 & 2, 3, 6\ldots & 6 & 1,792 \\
+        \hline
+        45 & 3, 3, 5\ldots & 5 & 1,609 \\
+        \hline
+        48 & 3, 6, 8\ldots & 8 & 2,079 \\
+        \hline
+        85 & 3, 5, 7\ldots & 7 & 1,946 \\
+        \hline
+        88 & 2, 3, 4\ldots & 4 & 1,386 \\
+        \hline
+        90 & 2, 2, 5\ldots & 5 & 1,609 \\
+        \hline
+        92 & 2, 4, 7\ldots & 7 & 1,946 \\
+        \hline
+        \multicolumn{3}{|r|}{\textbf{moyenne des $\ln r_3$}} & \textbf{1,806} \\
+        \hline
+    \end{tabular}
+    \caption{Distances aux plus proches voisins sur l'échantillon complet}
+
+\end{table}
+
+D'où l'entropie globale :
+\[
+H(X) = \psi(8) - \psi(3) + \ln 2 + 1{,}806 = 2{,}016 - 0{,}923 + 0{,}693 + 1{,}806 \approx 3{,}592 \text{ nats}
+\]
+
+\paragraph{Cas de la classe \og non \fg}
+
+La classe \og non \fg{} ne regroupe que trois valeurs, $\{40, 42, 45\}$. Or l'estimateur exige au moins $k+2$ points pour être défini, soit cinq ici.Cette classe ne contient que trois points, $\{40, 42, 45\}$. Chaque point n'a donc que deux autres points autour de lui : il n'existe aucun troisième plus proche voisin à mesurer, et la colonne $r_3$ serait vide. La précaution décrite plus haut s'applique donc : plutôt que de produire une valeur arbitraire sur un échantillon trop petit, le service remplace l'entropie de cette classe par l'entropie globale, soit $H(X \mid Y{=}0) = 3{,}592$ nats. Cette substitution annule la contribution de la classe au calcul, ce qui rend le score volontairement prudent.
+
+\paragraph{Calcul de $r_k$ pour $H(X \mid Y{=}1)$}
+
+La classe \og oui \fg{} regroupe en revanche cinq valeurs, $\{48, 85, 88, 90, 92\}$, ce qui suffit à l'estimateur. Le point 48 y est nettement isolé des quatre autres.
+
+\begin{table}[H]
+    \centering
+    \label{tab:mi-rk-classe1}
+    \begin{tabular}{|c|c|c|l|}
+        \hline
+        \textbf{Point} & $r_3$ & $\ln r_3$ & \textbf{Remarque} \\
+        \hline
+        48 & 42 & 3,738 & valeur isolée, loin du reste \\
+        \hline
+        85 & 7 & 1,946 & \\
+        \hline
+        88 & 4 & 1,386 & \\
+        \hline
+        90 & 5 & 1,609 & \\
+        \hline
+        92 & 7 & 1,946 & \\
+        \hline
+        \multicolumn{2}{|r|}{\textbf{moyenne}} & \textbf{2,125} & \\
+        \hline
+    \end{tabular}
+    \caption{Distances au sein de la classe \og oui \fg}
+
+\end{table}
+
+\[
+H(X \mid Y{=}1) = \psi(5) - \psi(3) + \ln 2 + 2{,}125 = 1{,}506 - 0{,}923 + 0{,}693 + 2{,}125 \approx 3{,}401 \text{ nats}
+\]
+
+\paragraph{Assemblage final}
+
+Il reste à combiner ces entropies pour obtenir le score.
+
+\begin{table}[H]
+    \centering
+    \label{tab:mi-assemblage}
+    \begin{tabular}{|l|l|r|}
+        \hline
+        \textbf{Étape} & \textbf{Calcul} & \textbf{Résultat} \\
+        \hline
+        $H(X \mid Y)$ & $(5/8) \times 3{,}401 + (3/8) \times 3{,}592$ & 3,473 nats \\
+        \hline
+        $I(X;Y)$ & $3{,}592 - 3{,}473$ & 0,119 nat \\
+        \hline
+        $H(Y)$ & $-(0{,}625 \ln 0{,}625 + 0{,}375 \ln 0{,}375)$ & 0,662 nat \\
+        \hline
+        \textbf{score} & $0{,}119 / 0{,}662$ & \textbf{0,18} \\
+        \hline
+    \end{tabular}
+    \caption{Assemblage du score d'information mutuelle}
+
+\end{table}
+
+\paragraph{Calcul de $H(Y)$}
+
+Contrairement à $H(X)$, l'entropie du signal de violation est une entropie de Shannon discrète classique : $Y$ ne prenant que deux valeurs, l'estimateur k-NN n'est pas nécessaire. On applique directement $H(Y) = -\sum_c p_c \ln p_c$.
+
+\begin{table}[H]
+    \centering
+    
+    \label{tab:mi-hy}
+    \begin{tabular}{|l|l|r|}
+        \hline
+        \textbf{Étape} & \textbf{Calcul} & \textbf{Résultat} \\
+        \hline
+        Proportions & 5 violations sur 8, 3 normaux sur 8 & $p_1 = 0{,}625$ ; $p_0 = 0{,}375$ \\
+        \hline
+        Logarithmes & $\ln(0{,}625)$ et $\ln(0{,}375)$ & $-0{,}470$ ; $-0{,}981$ \\
+        \hline
+        Produits $p_c \ln p_c$ & $0{,}625 \times (-0{,}470)$, $0{,}375 \times (-0{,}981)$ & $-0{,}294$ ; $-0{,}368$ \\
+        \hline
+        $H(Y)$ & $-(-0{,}294 - 0{,}368)$ & 0,662 nat \\
+        \hline
+    \end{tabular}
+    \caption{Détail du calcul de $H(Y)$}
+\end{table}
+
+$H(Y)$ représente le plafond théorique que $I(X;Y)$ ne peut jamais dépasser : tout savoir sur $X$ ne peut pas apporter plus d'information sur $Y$ que $Y$ n'en contient lui-même. Diviser par $H(Y)$ ramène donc le score dans l'intervalle $[0,1]$, où 0 signifie aucune information et 1 que $X$ prédit parfaitement la violation.
+
+Le score obtenu, 0,18, dépasse le seuil de 0,15(c'est pris dans la configuration de notre système) : le CPU est donc retenu comme SLO secondaire. La marge reste toutefois étroite, et l'exemple illustre bien la limite discutée plus loin -- sur huit points seulement, dont une classe trop petite pour être estimée, le score est nécessairement prudent et peu stable. Sur un historique plus long, où les deux classes seraient correctement estimées, la séparation nette entre le régime normal (valeurs basses et groupées) et le régime de violation (valeurs hautes et dispersées) produirait un score sensiblement plus élevé.
+
+Deux précisions sur les formules employées. Le terme $+\ln 2$ vient de ce qu'en dimension un, une boule de rayon $r$ couvre un segment de longueur $2r$. Et les nats sont utilisés plutôt que les bits parce que l'estimateur k-NN continu est naturellement défini avec le logarithme népérien -- 1 nat vaut environ 1,443 bit.
+\subsubsection{Seuil adaptatif des SLOs secondaires}
+
+Retenir une métrique ne suffit pas : encore faut-il lui fixer un seuil. Contrairement au SLO primaire, dont le seuil est fixé d'avance, celui d'un SLO secondaire est calculé à partir de l'historique récent, sous forme de percentile.
+
+Un percentile désigne la valeur en dessous de laquelle se situe une proportion donnée des mesures : P75 est la valeur que la métrique n'a pas dépassée dans 75~\% des cycles observés. Son calcul est direct : les valeurs de l'historique sont triées par ordre croissant, puis la valeur située à la position correspondant au pourcentage voulu est retenue. Pour 20 relevés et un percentile de 75, la position vaut $20 \times 0{,}75 = 15$ : le seuil est donc la seizième valeur de la liste triée. Cette méthode sans interpolation garantit que le seuil est toujours une valeur réellement mesurée sur la machine, et non une valeur calculée qui n'aurait jamais été observée.
+
+Le seuil n'est donc pas choisi arbitrairement, mais tiré du comportement réel de la machine : le fixer à P75 revient à considérer comme anormal ce qui dépasse ce qu'elle fait habituellement dans trois cas sur quatre.
+
+Reste à déterminer quel percentile retenir. Ce choix dépend de la régularité du signal, mesurée par son coefficient de variation $CV = \sigma/\mu$, où $\mu$ est la moyenne des valeurs observées et $\sigma$ leur écart-type. Ce rapport exprime la dispersion relative du signal, ce qui permet de comparer des métriques d'échelles différentes : un écart-type de 5 autour d'une moyenne de 10 traduit un signal très instable, alors que le même écart-type autour d'une moyenne de 200 correspond à un signal très régulier.
+
+\begin{table}[H]
+    \centering
+    \label{tab:percentile-adaptatif}
+    \begin{tabular}{|l|l|l|}
+        \hline
+        \textbf{Coefficient de variation} & \textbf{Régime} & \textbf{Percentile retenu} \\
+        \hline
+        $CV < 0{,}15$ & stable & P70 \\
+        \hline
+        $0{,}15 \leq CV < 0{,}30$ & normal & P75 \\
+        \hline
+        $CV \geq 0{,}30$ & volatile & P85 \\
+        \hline
+    \end{tabular}
+    \caption{Choix du percentile selon la volatilité du signal}
+
+\end{table}
+\subsection{Service Decision Intelligence}
+
+Le Metrics Manager a déterminé quoi surveiller, le ML Predictor a annoncé ce qui va se passer. Reste à trancher. Le \emph{Decision Intelligence} est le point de décision final du système : il transforme les données collectées en un verdict opérationnel -- rester en place, ou déplacer le service vers une machine précise.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|p{2.8cm}|p{10.5cm}|}
+        \hline
+        \textbf{Entrée} & Métriques actuelles, prédictions du ML Predictor et SLOs actifs, pour l'ensemble des machines candidates \\
+        \hline
+        \textbf{Sortie} & Décision de maintien ou de migration, avec la machine cible et son score, transmise au Hub \\
+        \hline
+        \textbf{Côté métier} & Point de décision final : privilégie la stabilité du service à une optimisation théorique permanente \\
+        \hline
+    \end{tabular}
+    \caption{Rôle du service Decision Intelligence}
+    \label{tab:decision-role}
+\end{table}
+
+\subsubsection{Ce que l'on cherche à décider}
+
+Deux questions distinctes se posent à chaque cycle, et l'ordre dans lequel elles sont traitées est important.
+
+La première est : \emph{faut-il agir ?} Elle se tranche en comparant les valeurs prédites aux seuils des SLOs actifs. Tant qu'aucun objectif primaire n'est menacé, la réponse est non, et le cycle s'arrête là.
+
+La seconde, qui n'est posée que si la première a reçu une réponse positive, est : \emph{où aller ?} Elle suppose de comparer plusieurs machines entre elles sur plusieurs critères simultanément -- une machine peut offrir une bonne latence mais peu de ressources, une autre l'inverse.
+
+Le tableau~\ref{tab:topsis-termes} rassemble les symboles employés dans ce qui suit.
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{|p{2.2cm}|p{11.1cm}|}
+        \hline
+        \textbf{Terme} & \textbf{Signification} \\
+        \hline
+        critère & Une dimension de comparaison entre machines : latence, CPU disponible ou RAM disponible. \\
+        \hline
+        coût & Critère qu'il faut minimiser -- ici la latence : plus elle est basse, mieux c'est. \\
+        \hline
+        bénéfice & Critère qu'il faut maximiser -- ici le CPU et la RAM disponibles. \\
+        \hline
+        $w_j$ & Poids du critère $j$, hérité du SLO correspondant. La somme des poids vaut 1. \\
+        \hline
+        $A^{+}$ & Solution idéale : machine fictive réunissant la meilleure valeur de chaque critère. \\
+        \hline
+        $A^{-}$ & Solution anti-idéale : machine fictive réunissant la pire valeur de chaque critère. \\
+        \hline
+        $d_i^{+}$ & Distance euclidienne entre la machine $i$ et la solution idéale. \\
+        \hline
+        $d_i^{-}$ & Distance euclidienne entre la machine $i$ et la solution anti-idéale. \\
+        \hline
+        score & $d_i^{-}/(d_i^{+} + d_i^{-})$ : compris entre 0 et 1, il vaut 1 pour une machine idéale et 0 pour la pire. \\
+        \hline
+        hystérésis & Marge minimale qu'une machine candidate doit dépasser pour justifier une migration. \\
+        \hline
+    \end{tabular}
+    \caption{Termes employés dans le classement multicritère}
+    \label{tab:topsis-termes}
+\end{table}
+
+\subsubsection{Fonctionnement détaillé — les huit étapes de la décision}
+
+Le traitement d'un cycle suit toujours le même enchaînement :
+
+\begin{enumerate}
+    \item \textbf{Détection de violation} -- compare la valeur courante et les prédictions de chaque SLO actif à son seuil ; qualifie la violation de proactive (seulement prédite) ou réactive (déjà mesurée, utilisée en secours si la prédiction est indisponible).
+    \item \textbf{Porte de garde} -- vérifie si la violation concerne le SLO primaire. Sinon, décision de maintien immédiate, sans lancer le classement.
+    \item \textbf{Matrice de décision} -- pour chaque machine candidate, machine active incluse, une valeur par critère : latence (coût), CPU et RAM disponibles (bénéfices).
+    \item \textbf{Normalisation min-max} -- ramène chaque colonne dans l'intervalle $[0,1]$.
+    \item \textbf{Pondération} -- multiplie chaque valeur normalisée par le poids du SLO correspondant.
+    \item \textbf{Solutions idéales et distances} -- construit $A^{+}$ et $A^{-}$, puis calcule $d_i^{+}$ et $d_i^{-}$ pour chaque machine.
+    \item \textbf{Score} -- $\mathrm{score}_i = d_i^{-}/(d_i^{+} + d_i^{-})$ ; le score le plus élevé désigne la meilleure candidate.
+    \item \textbf{Hystérésis} -- la migration n'est déclenchée que si ce score dépasse celui de la machine active d'au moins 5~\%.
+\end{enumerate}
+
+L'idée sous-jacente est la suivante : puisque les critères n'ont ni la même unité ni la même échelle, on ne peut pas les additionner directement. On les ramène donc à une échelle commune, puis on mesure à quelle distance chaque machine se trouve de deux repères -- le meilleur cas imaginable et le pire. Une bonne machine est celle qui est à la fois proche du premier et loin du second.
+
+Deux points de conversion méritent d'être signalés. À l'étape 3, le CPU et la RAM ne sont pas exprimés en pourcentage d'utilisation mais en quantité absolue disponible, soit capacité totale $\times\,(1 - \mathrm{utilisation})$ : une machine chargée à 20~\% sur huit c\oe{}urs n'offre pas la même ressource qu'une machine chargée à 20~\% sur quatre. À l'étape 4, la latence est inversée par rapport aux deux autres critères, puisqu'une valeur basse y est bonne alors qu'une valeur haute l'est pour les ressources.
+
+Enfin, une contrainte de périmètre s'applique à tout ce traitement : le classement ne porte jamais que sur les machines d'un seul fournisseur à la fois, pour la raison de comparabilité exposée au chapitre~3.
+
+\subsubsection{Détail des formules utilisées}
+
+\begin{table}[H]
+    \centering
+    \small
+    \begin{tabular}{|p{2.4cm}|p{6.1cm}|p{5cm}|}
+        \hline
+        \textbf{Formule} & \textbf{Définition} & \textbf{Exemple chiffré} \\
+        \hline
+        normalisation min-max &
+        $v' = \dfrac{v - v_{\min}}{v_{\max} - v_{\min}}$ : ramène chaque colonne dans $[0,1]$, la plus petite valeur devenant 0 et la plus grande 1. &
+        latences $(120, 250, 150, 140)$ : \newline $120 \rightarrow 0{,}000$ \newline $250 \rightarrow 1{,}000$ \newline $150 \rightarrow 0{,}231$ \\
+        \hline
+        pondération &
+        Chaque valeur normalisée est multipliée par le poids du critère, de sorte qu'un critère important pèse davantage dans la distance finale. &
+        $0{,}231 \times 0{,}5 = 0{,}115$ \newline (latence, poids 0,5) \\
+        \hline
+        distance euclidienne &
+        $d_i = \sqrt{\sum_j (v_{ij} - a_j)^2}$ : distance entre la machine $i$ et un point de référence $a$, tous critères confondus. &
+        $d^{+} = \sqrt{(0{,}115-0)^2 + (0{,}250-0{,}250)^2 + (0{,}250-0{,}250)^2} = 0{,}115$ \\
+        \hline
+        score &
+        $\mathrm{score}_i = \dfrac{d_i^{-}}{d_i^{+} + d_i^{-}}$ : proximité relative à l'idéal, toujours comprise entre 0 et 1. &
+        $0{,}522 / (0{,}115 + 0{,}522) = 0{,}819$ \\
+        \hline
+    \end{tabular}
+    \caption{Formules employées par le classement TOPSIS}
+    \label{tab:topsis-formules}
+\end{table}
+
+Pourquoi deux points de référence plutôt qu'un seul ? Mesurer uniquement la distance à l'idéal ne suffirait pas : deux machines peuvent en être également éloignées tout en étant très différentes, l'une médiocre partout, l'autre excellente sur un critère et mauvaise sur un autre. Rapporter la distance à l'idéal à celle qui sépare du pire cas départage ces situations.
+
+\subsubsection{Exemple chiffré détaillé — un cycle complet}
+
+Le SLO primaire actif est \texttt{latency < 200~ms} avec un poids de 0,5, complété de deux SLOs secondaires, \texttt{cpu\_usage} et \texttt{ram\_usage}, de poids 0,25 chacun. La machine active \texttt{edge2} atteint 250~ms : la violation primaire est détectée, la porte de garde s'ouvre, le classement est lancé sur les quatre machines.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|l|c|c|c|c|c|}
+        \hline
+        \textbf{VM} & \textbf{Latence} & \textbf{CPU util.} & \textbf{C\oe{}urs} & \textbf{RAM util.} & \textbf{RAM tot.} \\
+        \hline
+        edge1 & 120 ms & 50~\% & 4 & 60~\% & 4 Go \\
+        \hline
+        edge2 (active) & 250 ms & 40~\% & 4 & 50~\% & 4 Go \\
+        \hline
+        cloud1 & 150 ms & 20~\% & 8 & 30~\% & 8 Go \\
+        \hline
+        cloud2 & 140 ms & 25~\% & 8 & 35~\% & 8 Go \\
+        \hline
+    \end{tabular}
+    \caption{Étape 1 -- données mesurées}
+    \label{tab:topsis-etape1}
+\end{table}
+
+\paragraph{Construction de la matrice de décision}
+
+Les utilisations sont converties en quantités absolues disponibles. Pour \texttt{edge1} : $4 \times (1 - 0{,}50) = 2{,}0$ c\oe{}urs et $4 \times (1 - 0{,}60) = 1{,}6$ Go.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|l|c|c|c|}
+        \hline
+        \textbf{VM} & \textbf{Latence (coût)} & \textbf{CPU dispo. (bénéfice)} & \textbf{RAM dispo. (bénéfice)} \\
+        \hline
+        edge1 & 120 & 2,0 c\oe{}urs & 1,6 Go \\
+        \hline
+        edge2 (active) & 250 & 2,4 c\oe{}urs & 2,0 Go \\
+        \hline
+        cloud1 & 150 & 6,4 c\oe{}urs & 5,6 Go \\
+        \hline
+        cloud2 & 140 & 6,0 c\oe{}urs & 5,2 Go \\
+        \hline
+    \end{tabular}
+    \caption{Étape 3 -- matrice de décision}
+    \label{tab:topsis-etape3}
+\end{table}
+
+\paragraph{Normalisation et pondération}
+
+Chaque colonne est ramenée dans $[0,1]$, puis multipliée par le poids de son critère.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|l|c|c|c|c|c|c|}
+        \hline
+        & \multicolumn{3}{c|}{\textbf{Normalisée}} & \multicolumn{3}{c|}{\textbf{Pondérée}} \\
+        \hline
+        \textbf{VM} & Latence & CPU & RAM & Latence & CPU & RAM \\
+        \hline
+        edge1 & 0,000 & 0,000 & 0,000 & 0,000 & 0,000 & 0,000 \\
+        \hline
+        edge2 & 1,000 & 0,091 & 0,100 & 0,500 & 0,023 & 0,025 \\
+        \hline
+        cloud1 & 0,231 & 1,000 & 1,000 & 0,115 & 0,250 & 0,250 \\
+        \hline
+        cloud2 & 0,154 & 0,909 & 0,900 & 0,077 & 0,227 & 0,225 \\
+        \hline
+    \end{tabular}
+    \caption{Étapes 4 et 5 -- normalisation min-max puis pondération}
+    \label{tab:topsis-etape45}
+\end{table}
+
+\paragraph{Solutions de référence et scores}
+
+La solution idéale réunit la latence pondérée la plus basse et les ressources pondérées les plus élevées, soit $A^{+} = [0{,}000\ ;\ 0{,}250\ ;\ 0{,}250]$. La solution anti-idéale est son opposée, $A^{-} = [0{,}500\ ;\ 0{,}000\ ;\ 0{,}000]$.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|l|c|c|c|}
+        \hline
+        \textbf{VM} & $d^{+}$ & $d^{-}$ & \textbf{Score} \\
+        \hline
+        edge1 & 0,354 & 0,500 & 0,586 \\
+        \hline
+        edge2 (active) & 0,594 & 0,034 & 0,054 \\
+        \hline
+        cloud1 & 0,115 & 0,522 & 0,819 \\
+        \hline
+        cloud2 & 0,084 & 0,531 & \textbf{0,863} \\
+        \hline
+    \end{tabular}
+    \caption{Étapes 6 et 7 -- distances et scores}
+    \label{tab:topsis-etape67}
+\end{table}
+
+Le score de \texttt{cloud2}, 0,863, dépasse celui de la machine active, 0,054, bien au-delà de la marge d'hystérésis de 5~\% (valeur définie dans la configuration du système). La décision est donc de migrer de \texttt{edge2} vers \texttt{cloud2}.
+
+On notera que \texttt{cloud1} était un candidat presque équivalent, avec 0,819. Les deux machines cloud offrent des ressources comparables, et c'est finalement la latence qui les départage -- 140~ms contre 150~ms. C'est là un effet direct de la pondération : la latence pesant deux fois plus que chaque ressource, un écart même faible sur ce critère suffit à trancher entre deux candidates par ailleurs semblables.
+
+\subsubsection{Le rôle de la porte de garde}
+
+Un second cas, observé lors d'un test réel, illustre l'importance de la deuxième étape. Avec un contrat relâché à 200~ms, l'état du parc était le suivant.
+
+\begin{table}[H]
+    \centering
+    \begin{tabular}{|l|c|c|c|c|}
+        \hline
+        \textbf{VM} & \textbf{Latence} & \textbf{CPU disponible} & \textbf{RAM disponible} & \textbf{État} \\
+        \hline
+        edge2 & 144,8 ms & 1,82 c\oe{}urs & 2,48 Go & actif \\
+        \hline
+        edge1 & 10,9 ms & 2,14 c\oe{}urs & 2,43 Go & inactif \\
+        \hline
+        cloud1 & 103,8 ms & 6,18 c\oe{}urs & 6,00 Go & inactif \\
+        \hline
+        cloud2 & 101,3 ms & 6,67 c\oe{}urs & 5,66 Go & inactif \\
+        \hline
+    \end{tabular}
+    \caption{État observé lors d'un cycle sans migration}
+    \label{tab:topsis-nonmigration}
+\end{table}
+
+\texttt{edge1} offrait une latence plus de dix fois inférieure à celle de la machine active -- 10,9~ms contre 144,8~ms -- et davantage de ressources sur les deux autres critères. Le service n'a pourtant pas été déplacé.
+
+L'explication tient entièrement à la porte de garde : 144,8~ms respecte le contrat de 200~ms, aucune violation n'est donc détectée, et le classement n'est même pas exécuté. Ce comportement découle directement du principe posé au chapitre~3 : le système ne cherche pas le meilleur placement possible à tout instant, mais un placement qui tient l'engagement pris. Chercher l'optimum en permanence multiplierait les migrations, chacune ayant un coût réel en interruption de service, pour un gain contractuel nul.
+
+\subsubsection{Le rôle de l'hystérésis}
+
+La huitième étape répond à un problème voisin mais distinct. Une fois la violation constatée, rien ne garantit que la meilleure candidate soit franchement meilleure que la machine en place : elle peut ne la dépasser que de quelques millièmes de point.
+
+Migrer dans ce cas serait doublement contre-productif. Le gain obtenu serait inférieur au coût de l'interruption, et surtout la situation pourrait s'inverser au cycle suivant, provoquant un retour en arrière -- puis un nouvel aller, indéfiniment. Ce phénomène d'oscillation est connu sous le nom d'effet ping-pong.
+
+La marge de 5~\% l'empêche : elle crée une zone d'indifférence dans laquelle la machine en place conserve le service par défaut. Une migration n'est déclenchée que lorsque l'écart est suffisamment net pour qu'un retour en arrière au cycle suivant soit improbable.

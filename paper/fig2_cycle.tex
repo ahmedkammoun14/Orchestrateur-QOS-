@@ -1,0 +1,60 @@
+% Figure 2 --- the orchestration cycle: one parallel block, then a strictly
+% sequential chain imposed by data dependencies, then a two-way routing.
+% Included from paper.tex. Requires the same TikZ libraries as Fig. 1.
+
+\begin{tikzpicture}[
+    font=\scriptsize,
+    st/.style  = {draw=black!70, rounded corners=1pt, minimum width=3.0cm,
+                  minimum height=6.2mm, align=center, fill=white},
+    stn/.style = {st, minimum width=2.15cm},
+    trg/.style = {st, fill=black!7, minimum width=3.6cm},
+    par/.style = {draw=black!55, dashed, rounded corners=2.5pt, inner sep=2.6mm},
+    ar/.style  = {-{Latex[length=1.5mm]}, draw=black!70},
+    ann/.style = {font=\scriptsize\itshape, text=black!60, align=left},
+]
+
+%--- trigger
+\node[trg] (trig) at (0,0) {measurement batch arrives};
+
+%--- parallel block: two independent branches
+\node[st] (a1) at (-2.05,-1.30) {build SLO contract};
+\node[st] (a2) at (-2.05,-2.20) {persist contract};
+\node[st] (b1) at ( 2.05,-1.30) {collect metrics};
+\node[st] (b2) at ( 2.05,-2.20) {persist metrics};
+
+\node[par, fit=(a1)(a2)(b1)(b2)] (pbox) {};
+\node[ann, anchor=north west] at ([xshift=1mm,yshift=-0.5mm]pbox.north west)
+      {parallel branches};
+
+%--- sequential chain
+\node[st] (h) at (0,-3.55) {load metric histories};
+\node[st] (p) at (0,-4.50) {predict next state};
+\node[st] (v) at (0,-5.45) {detect violations};
+\node[st] (d) at (0,-6.40) {decide};
+
+%--- two decision paths
+\node[stn] (m1) at (-1.55,-7.65) {single\\provider};
+\node[stn] (m3) at ( 1.55,-7.65) {federated\\(Contract Net)};
+
+\node[st] (act) at (0,-9.05) {migrate and audit};
+
+%--- edges
+\draw[ar] (trig.south) -- (pbox.north);
+\draw[ar] (a1) -- (a2);
+\draw[ar] (b1) -- (b2);
+\draw[ar] (pbox.south) -- (h.north);
+\draw[ar] (h) -- (p);
+\draw[ar] (p) -- (v);
+\draw[ar] (v) -- (d);
+
+\draw[ar] (d.south) -- ++(0,-0.30) -| (m1.north);
+\draw[ar] (d.south) -- ++(0,-0.30) -| (m3.north);
+
+\draw[ar] (m1.south) |- ([yshift=-0.42cm]m1.south) -| (act.north);
+\draw[ar] (m3.south) |- ([yshift=-0.42cm]m1.south) -| (act.north);
+
+%--- annotations: the two kinds of parallelism
+\node[ann, anchor=west] at ([xshift=3mm]h.east) {$\times N$ machines\\(max, not sum)};
+\node[ann, anchor=west] at ([xshift=3mm]p.east) {$\times N$ machines\\(max, not sum)};
+
+\end{tikzpicture}

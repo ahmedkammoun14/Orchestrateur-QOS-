@@ -420,6 +420,44 @@ PROVIDER_RELAY_URLS: Dict[str, str] = {
 # production tant que la fonctionnalité n'est pas explicitement activée.
 MULTI_PROVIDER_ENABLED: bool = os.getenv("MULTI_PROVIDER_ENABLED", "false").lower() == "true"
 
+# Profil de pondération de l'horizon dans calculate_weighted_mean (TOPSIS).
+# Vide (défaut) = poids décroissants [n, n-1, …, 1], comportement d'origine :
+# la valeur agrégée est dominée par le pas le plus proche.
+#
+# Format : entiers séparés par des virgules, du pas le PLUS PROCHE au plus
+# LOINTAIN. Ex. "1,2,3,4,5,6,7" inverse le profil et porte l'horizon pondéré
+# de 18 s à 30 s.
+#
+# Mesuré le 27/08/2026 par rejeu hors ligne de l'extrapolation linéaire sur
+# les 112 débuts de violation de la campagne LAAS (UC1, FED1-3, 2 providers),
+# retard de fraîcheur de 13 s inclus dans le calcul de l'avance :
+#   [7,6,5,4,3,2,1] (actuel)  → 75,9 % détectés à l'avance, avance méd. 11,0 s
+#   [1,2,3,4,5,6,7] (inversé) → 96,4 % détectés à l'avance, avance méd. 22,7 s
+# Fausses alarmes nulles dans les deux cas.
+#
+# ⚠️ Ce gain suppose un prédicteur capable de voir venir un franchissement.
+# Le GRU seul ne le fait PAS (rappel 0 % à tous les horizons) : changer ces
+# poids sans l'extrapolation linéaire ne donne rien — c'est précisément ce
+# qu'a montré RUN9, qui n'avait modifié que la pondération.
+TOPSIS_HORIZON_WEIGHTS: str = os.getenv("TOPSIS_HORIZON_WEIGHTS", "").strip()
+
+# Extrapolation linéaire proposée EN PLUS du GRU dans ml_predictor : à chaque
+# appel les deux prédisent, on garde celui dont l'erreur récente à t+1 est la
+# plus faible. Le GRU reste calculé et mesuré dans les deux cas.
+#
+# Défaut FALSE : les exécutions de réplication doivent tourner sur le MÊME
+# prédicteur que la campagne de référence (UC1, FED1-3, UC2, ABL1-3). Laisser
+# cette option active par défaut rendrait toute nouvelle exécution
+# incomparable aux précédentes — sans aucun signe visible.
+#
+# Mesuré le 27/08/2026 sur les 112 débuts de violation de la campagne LAAS :
+# le GRU ne détecte JAMAIS un franchissement à venir (rappel 0 % de t+1 à
+# t+7) ; l'extrapolation linéaire sur les 3 derniers points le détecte à
+# 100 % jusqu'à t+6 (94,7 % à t+7), avec 0,0–0,2 % de fausses alarmes.
+ML_LINEAR_EXTRAPOLATION: bool = os.getenv(
+    "ML_LINEAR_EXTRAPOLATION", "false"
+).strip().lower() == "true"
+
 # Capacité physique (total_cores, total_ram_gb) : plus fixée ici. Chaque VM
 # la déclare elle-même via son propre /metrics (logique fédération/service
 # mesh — chaque provider annonce sa capacité). Le collector la propage et

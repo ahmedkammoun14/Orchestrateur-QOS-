@@ -13,11 +13,23 @@ Pour aussi sauver les logs dans un fichier :
     python launch_provider.py --provider provider1 *> logs\p1.log   (PowerShell)
 """
 import argparse
+import io
 import os
 import subprocess
 import sys
 import threading
 import time
+
+# Reconfigure stdout/stderr en UTF-8 : sans ca, rediriger la sortie de ce
+# lanceur vers un fichier (> log.txt) fait heriter l'encodage de la console
+# Windows (cp1252), qui plante sur le moindre accent ou emoji renvoye par un
+# service (ex: "Decision", box-drawing). Le crash tue le thread _stream sans
+# tuer le processus enfant : son pipe stdout n'est plus draine, se remplit,
+# et le service se bloque en silence des son prochain print() -- observe en
+# pratique : le hub gele, zero nouveau cycle, aucune erreur visible.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Ordre de demarrage (le hub EN DERNIER : il verifie la sante des spokes).
 SERVICES = [

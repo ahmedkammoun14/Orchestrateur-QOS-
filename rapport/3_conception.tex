@@ -1,0 +1,163 @@
+\newpage
+\pagestyle{fancy}
+
+\lhead{\textsc{Chapitre 3. Conception détaillée}}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\footrulewidth}{0.5pt}
+\chapter{Conception détaillée}\setlength{\headheight}{27.06pt}
+\label{ch3}
+\minitoc
+
+\newpage
+\section{Introduction}
+
+Le chapitre précédent a décrit le squelette du système : une architecture hub-and-spoke, un hub sans logique métier propre, des spokes spécialisés reliés à une base commune. Il expliquait quoi existe, pas pourquoi chaque brique a été conçue ainsi. C'est cette question que reprend ce chapitre, brique par brique, en repartant des trois difficultés posées par la problématique : comprendre une intention, décider seul du bon moment pour agir, puis décider à plusieurs lorsqu'un seul fournisseur ne suffit plus.
+
+\section{Démarche de conception}
+\label{sec:demarche-conception}
+
+Avant de détailler chaque partie du système, ce chapitre explique comment elle a été pensée.
+
+Le système doit prendre trois types de décisions : comprendre ce que l'utilisateur demande, savoir quand agir, et choisir avec quel fournisseur travailler. Pour ces trois décisions, aucune règle fixe n'a été écrite à l'avance. Chaque décision se base sur ce qui est mesuré au moment où elle est prise, pas sur un seuil décidé une fois pour toutes.
+
+Chaque partie a aussi été conçue pour fonctionner seule, sans dépendre des deux autres. On peut la modifier sans toucher au reste. C'est ce qui permet, par exemple, d'ajouter un nouveau fournisseur sans redéfinir tout le système.
+
+Enfin, aucune partie ne voit tout le système. Chacune ne connaît que ce qu'elle observe elle-même. C'est cohérent avec un constat déjà posé en problématique : aucun fournisseur ne commande les autres, donc aucune partie du système ne peut avoir une vue complète sur tout.
+
+Ce sont ces mêmes principes qui structurent la conception de la traduction d'intention (section~\ref{sec:conception-traduction}), de la décision locale (section~\ref{sec:conception-decision-locale}) puis de la coordination inter-fournisseurs (section~\ref{sec:conception-coordination}).
+\section{Conception de la traduction d'intention}
+\label{sec:conception-traduction}
+
+La première décision que le système doit prendre, c'est comprendre ce que l'utilisateur veut. Cette section explique comment cette étape a été pensée, avant d'aborder la décision locale (section~\ref{sec:conception-decision-locale}) puis la coordination entre fournisseurs (section~\ref{sec:conception-coordination}).
+
+\subsection{Entrées et sorties attendues}
+
+Le système reçoit une intention exprimée en langage naturel, comme une phrase que dirait un utilisateur normal, sans format imposé. Une même idée peut être formulée de dizaines de façons différentes, et la même phrase peut aussi être comprise de plusieurs manières. Le système ne peut donc pas se contenter de repérer des mots-clés : il doit interpréter le sens.
+
+Ce qu'il doit produire, en revanche, ne laisse aucune place à l'ambiguïté : un contrat SLO structuré, c'est-à-dire une liste d'objectifs mesurables, chacun associé à une métrique précise et à un seuil chiffré. Le système doit aussi indiquer quels objectifs sont ceux que l'utilisateur a explicitement demandés, et lesquels restent à surveiller sans avoir été mentionnés. Toute la conception de cette étape tourne autour de ce passage : d'une phrase floue et libre à des objectifs précis et vérifiables, sans perte ni déformation du sens exprimé.
+
+\subsection{Choix du modèle de langage et stratégie de repli}
+
+Une méthode plus simple, comme repérer des mots-clés dans la phrase, a été écartée d'entrée : elle suppose que l'utilisateur formule sa demande d'une façon précise, ce qui contredit l'idée même de langage naturel. Un modèle de langage a donc été choisi, car c'est le seul moyen de comprendre une phrase formulée librement.
+
+Mais s'appuyer uniquement sur ce modèle pose un autre problème : il peut être indisponible, trop lent à répondre, ou mal interpréter une demande ambiguë. Si toute la traduction dépendait de lui seul, une seule panne suffirait à bloquer tout le système, ce qui va à l'encontre du principe posé plus haut : le système doit toujours pouvoir prendre une décision. La conception prévoit donc plusieurs niveaux de repli : si le modèle principal échoue, une méthode alternative prend le relais, puis une méthode encore plus simple en dernier recours. Chaque niveau est moins précis que le précédent, mais garantit qu'une intention aboutit toujours à un contrat, plutôt que de rester sans réponse.
+
+\subsection{Fusion avec les SLOs existants}
+
+Une intention n'arrive pas toujours seule : le système a souvent déjà des objectifs actifs au moment où une nouvelle intention arrive. Il faut alors décider ce qu'on fait des anciens objectifs, et une règle unique ne peut pas convenir à tous les cas. Si la nouvelle intention porte sur autre chose que l'ancienne, les deux doivent coexister. Si elle porte sur exactement le même point, l'ancienne doit être remplacée pour éviter deux objectifs contradictoires. Si elle vient préciser l'ancienne sans la contredire, elle doit l'ajuster plutôt que l'effacer.
+
+Décider laquelle de ces situations s'applique ne peut pas non plus être fixé à l'avance : cela dépend du contenu de chaque nouvelle intention par rapport à celles déjà actives. C'est cette décision de fusion qui garantit que le système ne perd pas d'objectifs valables sans raison, et qu'il n'en garde pas non plus qui deviennent contradictoires entre eux.
+
+\subsection{Propagation du contrat vers les fournisseurs pairs}
+
+Une fois l'intention traduite, le contrat obtenu doit être compris de la même façon par tous les fournisseurs concernés. Si chacun traduisait l'intention de son côté, deux fournisseurs pourraient se retrouver à négocier sur des bases différentes sans même le savoir, ce qui rendrait toute comparaison entre eux faussée dès le départ.
+
+Le choix de conception est donc de traduire l'intention une seule fois, puis de transmettre ce même contrat, identique, à tous les fournisseurs concernés. Cela déplace le problème : ce n'est plus à chaque fournisseur de comprendre l'intention, mais au système de s'assurer que le contrat qu'il diffuse est complet et sans ambiguïté, puisqu'aucun fournisseur ne pourra le réinterpréter ensuite.
+\section{Conception de la décision locale proactive}
+\label{sec:conception-decision-locale}
+
+Comprendre l'intention ne suffit pas : encore faut-il savoir quand agir. Cette section explique comment le système a été pensé pour détecter un problème avant qu'il ne se produise, plutôt que d'y réagir une fois qu'il est là.
+
+\subsection{Collecte et découverte des SLOs secondaires}
+
+Anticiper suppose d'abord d'observer. Le système relève donc périodiquement l'état de chaque machine disponible : sa latence vis-à-vis du terminal, sa charge processeur, sa mémoire occupée. Deux choix de conception encadrent cette collecte. D'abord, elle est régulière et systématique : toutes les machines sont interrogées à chaque cycle, y compris celles qui n'hébergent pas le service, faute de quoi le système ne saurait rien de leurs capacités au moment où il devrait choisir où déplacer ce service. Ensuite, les valeurs relevées sont conservées dans le temps plutôt que consommées puis oubliées : sans historique, ni la découverte d'objectifs secondaires ni la prédiction décrite plus loin ne seraient possibles, l'une comme l'autre ayant besoin de plusieurs valeurs successives pour fonctionner.
+
+Cette collecte fournit donc plus d'informations que ce que l'objectif principal demande à lui seul, et c'est précisément ce qui permet d'aller plus loin. Le système ne se limite pas à surveiller l'objectif explicitement demandé : à côté de cet objectif principal, il examine les autres métriques relevées et retient celles qui sont réellement liées à lui, plutôt que de toutes les traiter sur un pied d'égalité.
+
+Encore faut-il pouvoir décider lesquelles sont \og liées \fg. Un simple coefficient de corrélation ne convient pas ici : il ne détecte que les relations linéaires, alors que le lien entre la charge d'une machine et sa latence ne l'est pas nécessairement. Le critère retenu est l'\emph{information mutuelle}, une mesure issue de la théorie de l'information introduite par Shannon~\cite{shannon1948}, qui quantifie la quantité d'information qu'une variable apporte sur une autre. Sa valeur est nulle si les deux variables sont indépendantes, et d'autant plus grande que l'une renseigne sur l'autre, quelle que soit la forme de leur relation.
+
+L'idée est donc d'élargir la surveillance sans la disperser : une métrique n'est retenue comme objectif secondaire que lorsqu'elle apporte une information mesurable sur l'objectif principal.
+
+\subsection{Anticipation par prédiction}
+
+Réagir seulement lorsque la violation est déjà constatée revient trop tard : le temps de déplacer un service, le mal est fait. Le système doit donc anticiper, en estimant l'évolution proche de chaque métrique surveillée plutôt que de se contenter de sa valeur courante.
+
+Prédire l'évolution d'une métrique revient à traiter une série temporelle, c'est-à-dire une suite de valeurs ordonnées dans le temps dont chaque point dépend des précédents. Les réseaux de neurones récurrents sont conçus pour ce type de données : contrairement à un réseau classique, ils conservent une mémoire des valeurs déjà vues et s'en servent pour estimer la suivante. Trois variantes ont été envisagées.
+
+Le réseau LSTM (\emph{Long Short-Term Memory}), proposé par Hochreiter et Schmidhuber~\cite{hochreiter1997lstm}, ajoute à chaque neurone un mécanisme de portes qui décide de ce qu'il faut retenir, oublier ou transmettre. Il a été conçu précisément pour corriger le défaut des premiers réseaux récurrents, incapables de mémoriser une information sur une longue durée. Le réseau GRU (\emph{Gated Recurrent Unit}), introduit par Cho et al.~\cite{cho2014gru}, repose sur le même principe avec une structure simplifiée : moins de portes, donc moins de paramètres à entraîner, pour des performances souvent comparables et un entraînement plus rapide. Le réseau ESN (\emph{Echo State Network}), proposé par Jaeger~\cite{jaeger2001esn}, adopte une approche différente : la partie récurrente du réseau est laissée fixe, générée aléatoirement, et seule la couche de sortie est entraînée. L'entraînement en devient beaucoup plus rapide, au prix d'un contrôle moindre sur ce que le réseau apprend.
+
+Aucun de ces trois modèles n'a été imposé a priori. Le comportement d'une métrique n'est pas le même selon qu'il s'agit de la latence, du processeur ou de la mémoire, et rien ne garantit qu'une architecture unique convienne à toutes. La conception laisse donc une procédure de recherche automatique déterminer, pour chaque métrique, le modèle et les hyperparamètres les plus adaptés aux données observées.
+
+Ce choix automatique impose toutefois une contrainte : la reproductibilité. Si l'entraînement comportait une part d'aléa non maîtrisée, deux exécutions successives produiraient deux modèles différents, et le comportement du système changerait d'une session à l'autre sans qu'aucune ligne de code n'ait été modifiée. Toute mesure ultérieure deviendrait alors ininterprétable, puisqu'une variation observée pourrait provenir du modèle autant que du système lui-même. La conception impose donc qu'à conditions identiques, un même entraînement produise toujours le même modèle.
+
+S'y ajoute l'exigence de repli déjà posée en section~\ref{sec:demarche-conception} : la prédiction est organisée en plusieurs niveaux, du plus élaboré au plus simple, afin qu'une estimation reste toujours disponible même lorsque le niveau le plus sophistiqué échoue.
+
+\subsection{Déclenchement de la décision}
+
+Disposer d'une prédiction ne dit pas encore quand s'en servir. Le système ne réévalue pas son placement à chaque cycle : ce serait déplacer un service à la moindre fluctuation, pour un gain nul et un coût réel.
+
+Une décision n'est donc déclenchée que lorsque la prédiction annonce la violation de l'objectif principal. Les objectifs secondaires, eux, sont surveillés et journalisés mais ne déclenchent aucune action à eux seuls. Ce choix évite qu'une variation mineure sur une métrique accessoire ne provoque un déplacement disproportionné du service, tout en conservant l'information pour l'analyse.
+
+\subsection{Classement des options par TOPSIS}
+
+Une fois la décision déclenchée, il reste à choisir la meilleure option parmi les ressources disponibles. Ce choix ne porte jamais sur un seul critère : une machine peut offrir une bonne latence mais une charge processeur élevée, une autre l'inverse. Il s'agit donc d'un problème de décision multicritère, pour lequel additionner simplement les critères ne convient pas -- ils n'ont ni la même unité, ni la même échelle, ni la même importance.
+
+La méthode retenue est TOPSIS (\emph{Technique for Order of Preference by Similarity to Ideal Solution}), proposée par Hwang et Yoon~\cite{hwang1981topsis}. Son principe est le suivant : les critères sont d'abord ramenés à une échelle commune et pondérés selon leur importance, puis deux points de référence sont construits -- la solution idéale, qui réunirait la meilleure valeur sur chaque critère, et la solution anti-idéale, qui réunirait les pires. Chaque option est ensuite notée selon sa proximité avec la première et son éloignement de la seconde.
+
+Cette méthode a été choisie parce qu'elle répond exactement à la situation : elle compare des options sur plusieurs critères hétérogènes sans en privilégier un arbitrairement, produit un classement complet plutôt qu'un simple verdict, et reste explicable -- on peut toujours dire pourquoi une option a été préférée à une autre, ce qui rejoint l'exigence de traçabilité traitée en section~\ref{sec:conception-dashboard}.
+
+\section{Conception de la coordination inter-fournisseurs}
+\label{sec:conception-coordination}
+
+Tout ce qui précède décrit un fournisseur qui décide seul, chez lui, avec ce qu'il observe. Cela suffit tant qu'il dispose d'au moins une machine capable de tenir l'objectif. Mais rien ne garantit que ce soit toujours le cas : ses machines peuvent toutes être saturées, ou toutes trop éloignées du terminal. Le service doit alors partir ailleurs, chez un fournisseur voisin. C'est là que la difficulté centrale de ce travail apparaît réellement, car ce voisin n'obéit à personne. Cette section explique comment cette coopération a été conçue.
+
+\subsection{Rôles ACTIVE / STANDBY et diffusion du contrat}
+
+Avant de coopérer, encore faut-il savoir qui fait quoi. À un instant donné, un seul fournisseur héberge effectivement le service : il est dit \emph{actif}. L'autre, qui n'héberge rien mais reste disponible, est dit \emph{en attente}. Ces rôles ne sont pas attribués une fois pour toutes à la configuration : ils suivent le service. Le fournisseur qui reçoit le service devient actif, celui qui le cède repasse en attente. Ce choix évite de désigner à l'avance un fournisseur privilégié, ce qui reviendrait à réintroduire par la petite porte la hiérarchie que la problématique cherche justement à éviter.
+
+Ces deux rôles ne suffisent cependant pas à faire coopérer les fournisseurs : encore faut-il qu'ils travaillent sur le même objectif. C'est le rôle de la diffusion du contrat, déjà évoquée en section~\ref{sec:conception-traduction} : le contrat SLO est transmis tel quel à tous les fournisseurs, de sorte qu'ils évaluent tous la même exigence. Sans cette précaution, un fournisseur pourrait se déclarer conforme à un objectif que l'autre juge violé, et la comparaison entre eux n'aurait plus aucun sens.
+
+\subsection{Évaluation locale et remontée d'offres}
+
+Une fois le contrat partagé, il faut organiser la manière dont les fournisseurs se répondent. Une solution centralisée aurait consisté à faire remonter l'état de toutes les machines vers un point unique qui aurait tranché. Elle a été écartée pour deux raisons : elle suppose qu'un fournisseur accepte de dévoiler l'état détaillé de son infrastructure à un tiers, et elle recrée le décideur unique que l'étude de l'existant (section~\ref{sec:etat-art}) identifiait comme la limite commune des solutions étudiées.
+
+Le mécanisme retenu est le \emph{Contract Net Protocol}, proposé par Smith~\cite{smith1980contractnet} puis normalisé par la FIPA~\cite{fipa2002cnp}. Son principe est emprunté à la passation de marchés : un participant qui ne peut plus assurer une tâche lance un appel d'offres auprès des autres ; chacun évalue de son côté s'il peut la prendre en charge et, si oui, répond par une offre ; l'initiateur compare les offres reçues et attribue la tâche à la meilleure.
+
+Ce protocole convient précisément à la situation. Chaque fournisseur évalue lui-même ses propres machines, avec ses propres mesures, et ne transmet que le résultat de cette évaluation -- une offre -- sans révéler l'état interne de son infrastructure. Personne ne commande à personne : un fournisseur peut parfaitement ne faire aucune offre s'il n'a rien à proposer. Et la décision reste fondée sur des informations que chacun a acceptées de déclarer, jamais sur une vue globale que personne ne possède.
+
+\subsection{Arbitrage et comparaison inter-fournisseurs}
+
+Recevoir plusieurs offres ne dit pas encore comment les départager, et c'est ici que se pose la difficulté la plus subtile de cette section. La méthode de classement retenue en section~\ref{sec:conception-decision-locale} ne peut pas servir à cet usage. TOPSIS produit en effet un score \emph{relatif} : il note chaque option par rapport aux autres options du même ensemble. Deux fournisseurs qui classent chacun leurs propres machines produisent donc deux scores qui n'ont pas la même signification -- le meilleur score chez un fournisseur peut correspondre à une machine objectivement moins bonne que la moins bonne de l'autre. Les comparer directement serait donc mathématiquement infondé.
+
+La comparaison entre fournisseurs exige au contraire une mesure \emph{absolue}, c'est-à-dire indépendante de l'ensemble dans lequel elle est calculée : une note qui dise à quel point une machine s'écarte du contrat, et rien d'autre. La conception retient pour cela une scalarisation de Tchebycheff augmentée, telle que formulée par Steuer et Choo~\cite{steuer1983tchebycheff}. Son principe est de mesurer, pour chaque objectif du contrat, l'écart entre ce que l'offre propose et ce que le contrat exige, puis de retenir principalement le \emph{plus grand} de ces écarts. Une offre n'est ainsi jugée bonne que si elle l'est sur tous les objectifs à la fois : elle ne peut pas compenser un mauvais résultat sur l'un par un excellent résultat sur un autre, ce qu'une simple moyenne aurait permis. Comme cet écart se mesure toujours par rapport au contrat, et jamais par rapport aux autres offres, deux fournisseurs peuvent enfin être comparés sur une base commune.
+
+Un dernier point restait à trancher : que faire lorsque deux offres sont presque équivalentes ? Déplacer un service a un coût, et le faire pour un gain négligeable serait absurde, voire nuisible si les deux fournisseurs alternent ensuite indéfiniment. La conception introduit donc une \emph{bande morte} : le fournisseur en place conserve le service tant que l'offre concurrente ne le dépasse pas d'une marge minimale. Autrement dit, changer de fournisseur doit apporter un gain réel, pas un gain statistique.
+
+\subsection{Passage de relais et garde anti-boucle}
+
+Une fois l'offre gagnante désignée, le service doit effectivement changer de fournisseur. Ce passage de relais est conçu pour rester une opération explicite : le fournisseur sortant transmet le service, le fournisseur entrant devient actif, et l'ancien repasse en attente. Le contrat, lui, ne change pas -- c'est le même objectif qui continue d'être poursuivi, simplement ailleurs.
+
+Reste le risque déjà identifié en problématique : une intention que personne ne peut satisfaire risque de circuler indéfiniment d'un fournisseur à l'autre. Chacun, constatant qu'il ne peut pas l'honorer, la transmettrait à son voisin, qui ferait de même en retour. La conception prévoit donc de garder trace des fournisseurs déjà sollicités pour une même demande : un fournisseur qui a déjà été interrogé ne peut pas l'être une seconde fois dans le cadre de la même négociation. Lorsque tous ont été sollicités sans succès, le système ne renvoie pas la demande une fois de plus : il conclut qu'aucun placement satisfaisant n'existe à cet instant, conserve le service là où il est, et le signale. Mieux vaut un échec constaté et visible qu'une recherche sans fin.
+
+\section{Conception du tableau de bord explicable}
+\label{sec:conception-dashboard}
+
+Les sections précédentes ont doté le système d'une certaine autonomie : il interprète une demande, décide seul quand agir, et négocie avec un pair sans qu'on le lui demande. Cette autonomie a une contrepartie. Plus un système décide de lui-même, moins ce qu'il fait est évident pour celui qui l'utilise : un service change de machine, puis de fournisseur, sans que personne n'ait rien demandé. Sans moyen de comprendre ces décisions, l'utilisateur n'a le choix qu'entre faire aveuglément confiance au système ou s'en méfier tout autant -- et l'étude de l'existant (section~\ref{sec:etat-art}) a précisément relevé ce manque chez les solutions étudiées. Le tableau de bord n'est donc pas conçu ici comme un simple affichage, mais comme le moyen de rendre compte de ce que le système fait en son nom.
+
+\subsection{Informations à restituer}
+
+Reste à déterminer ce qu'il faut effectivement montrer. Tout afficher ne servirait à rien : noyé sous les mesures brutes de toutes les machines à chaque cycle, l'utilisateur ne verrait pas davantage ce qui se passe. La conception part donc des questions auxquelles il doit pouvoir répondre.
+
+La première est \emph{sur quoi le système s'est engagé} : quel contrat est actuellement poursuivi, quels objectifs y figurent, lesquels ont été explicitement demandés et lesquels ont été ajoutés par le système lui-même. Sans cela, l'utilisateur ne peut même pas vérifier que sa demande a été correctement comprise.
+
+La deuxième est \emph{où en est le système} : quelle machine héberge le service, chez quel fournisseur, et si le contrat est actuellement tenu ou non. C'est l'état instantané, celui qu'on regarde en premier.
+
+La troisième, moins évidente mais essentielle, est \emph{ce qui a changé et pourquoi}. Un système qui n'afficherait que son état présent laisserait invisible tout ce qui fait sa spécificité : les déplacements de service, les négociations, les fournisseurs sollicités. La conception prévoit donc de restituer aussi l'historique des décisions, chacune accompagnée de sa nature -- déplacement au sein d'un même fournisseur, passage à un autre fournisseur, négociation, ou constat d'échec.
+
+\subsection{Traçabilité de la chaîne de décision}
+
+Signaler qu'une décision a eu lieu ne la rend pas pour autant compréhensible. Apprendre que le service a changé de fournisseur laisse entière la seule question qui intéresse vraiment l'utilisateur : sur quelle base ce choix a-t-il été fait ? C'est cette question qui sépare un système que l'on peut observer d'un système que l'on peut comprendre.
+
+La règle de conception est donc la suivante : une décision n'est jamais présentée seule, mais toujours avec ce qui l'a provoquée et ce qui l'a orientée -- l'objectif dont la violation avait été anticipée, l'option finalement retenue, celles qui ont été écartées, et la note qui les a départagées. Chaque décision doit pouvoir être remontée jusqu'à sa cause sans qu'il soit nécessaire d'ouvrir les journaux techniques du système.
+
+Cette règle n'est tenable que grâce aux méthodes retenues plus haut. Le classement multicritère de la section~\ref{sec:conception-decision-locale} attribue une note à chaque option : on peut donc montrer non seulement quelle option a gagné, mais avec quelle avance. La comparaison entre fournisseurs de la section~\ref{sec:conception-coordination} exprime un écart au contrat, une grandeur qui se lit directement. L'explicabilité n'a donc pas été ajoutée après coup : elle vient du fait d'avoir préféré, à chaque étape, des méthodes qui produisent des valeurs interprétables plutôt qu'un simple verdict.
+
+Restait un cas facile à oublier : celui où le système ne fait rien. C'est pourtant le moment où l'utilisateur s'interroge le plus -- le contrat n'est pas tenu, et rien ne bouge. La conception prévoit donc d'expliquer aussi l'immobilité : le service reste en place parce qu'aucune autre option ne ferait mieux, ou parce qu'aucun fournisseur n'a été en mesure de répondre. Ne rien faire est une décision comme une autre, et elle se justifie de la même façon.
+
+\section{Conclusion}
+
+Ce chapitre a détaillé la façon dont chaque brique du système a été pensée, en suivant le trajet d'une intention : comment elle est comprise et transformée en contrat vérifiable, comment un fournisseur décide seul du moment d'agir à partir de ce qu'il observe et anticipe, comment il négocie avec un pair lorsqu'il ne peut plus tenir cet engagement, et comment tout cela est restitué à l'utilisateur.
+
+Un même souci revient d'une section à l'autre. Chaque choix -- interpréter une demande, retenir une métrique, déclencher une décision, préférer un fournisseur -- repose sur une mesure prise au moment où la décision se pose, jamais sur une règle écrite à l'avance. Et chaque mécanisme prévoit ce qui se passe lorsqu'il échoue : un modèle indisponible, une prédiction impossible, un fournisseur qui ne répond pas. Le système est conçu pour continuer à décider, quitte à décider moins bien, plutôt que pour s'arrêter.
+
+Ces choix restent toutefois des principes. Le chapitre suivant montre comment ils ont été traduits en un système qui fonctionne : les services développés, les outils retenus et l'infrastructure sur laquelle l'ensemble a été déployé.

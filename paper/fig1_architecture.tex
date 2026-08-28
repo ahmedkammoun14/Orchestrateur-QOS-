@@ -1,0 +1,108 @@
+% Figure 1 --- xQoS architecture: two symmetric providers over a
+% transversally partitioned infrastructure.
+% Included from paper.tex. Requires: tikz + positioning, shapes.geometric,
+% fit, arrows.meta, calc, backgrounds.
+
+\begin{tikzpicture}[
+    font=\small,
+    blk/.style   = {draw=black!70, rounded corners=1pt, minimum width=3.5cm,
+                    minimum height=6.2mm, align=center, fill=white},
+    prov/.style  = {draw=black!70, rounded corners=4pt, thick, inner sep=3mm},
+    node distance = 1.6mm,
+    vm/.style    = {draw=black!70, minimum width=1.15cm, minimum height=6mm,
+                    rounded corners=1pt, align=center, font=\scriptsize},
+    p1/.style    = {vm, fill=blue!16},
+    p2/.style    = {vm, fill=orange!30},
+    lnk/.style   = {-{Latex[length=1.6mm]}, draw=black!60},
+    dlnk/.style  = {-{Latex[length=1.6mm]}, dashed, draw=black!55},
+    own/.style   = {draw=black!35, dotted, thick},
+]
+
+%============================ PROVIDER 1 ============================
+\node[blk] (a1) {Ingestion};
+\node[blk, below=of a1] (a2) {Intent translation};
+\node[blk, below=of a2, minimum height=9mm] (a3) {};
+\node[anchor=west] at ([xshift=1.5mm]a3.west) {Observation};
+\node[draw=black!70, fill=black!6, rounded corners=1pt, font=\scriptsize,
+      inner sep=1.2mm, anchor=east] (mi1) at ([xshift=-1.5mm]a3.east) {MI};
+\node[blk, below=of a3] (a4) {Prediction};
+\node[blk, below=of a4, minimum height=9mm] (a5) {};
+\node[anchor=west] at ([xshift=1.5mm]a5.west) {Decision};
+\node[draw=black!70, fill=black!6, rounded corners=1pt, font=\scriptsize,
+      inner sep=1.2mm, anchor=east] (t1) at ([xshift=-1.5mm]a5.east) {TOPSIS};
+\node[blk, below=of a5, fill=black!4] (r1) {Relay};
+
+\node[prov, fit=(a1)(r1), label={[font=\small\bfseries]above:Provider 1}]
+      (P1) {};
+
+%============================ PROVIDER 2 ============================
+\node[blk, right=4.2cm of a1] (b1) {Ingestion};
+\node[blk, below=of b1] (b2) {Intent translation};
+\node[blk, below=of b2, minimum height=9mm] (b3) {};
+\node[anchor=west] at ([xshift=1.5mm]b3.west) {Observation};
+\node[draw=black!70, fill=black!6, rounded corners=1pt, font=\scriptsize,
+      inner sep=1.2mm, anchor=east] (mi2) at ([xshift=-1.5mm]b3.east) {MI};
+\node[blk, below=of b3] (b4) {Prediction};
+\node[blk, below=of b4, minimum height=9mm] (b5) {};
+\node[anchor=west] at ([xshift=1.5mm]b5.west) {Decision};
+\node[draw=black!70, fill=black!6, rounded corners=1pt, font=\scriptsize,
+      inner sep=1.2mm, anchor=east] (t2) at ([xshift=-1.5mm]b5.east) {TOPSIS};
+\node[blk, below=of b5, fill=black!4] (r2) {Relay};
+
+\node[prov, fit=(b1)(r2), label={[font=\small\bfseries]above:Provider 2}]
+      (P2) {};
+
+%============================ ARBITER ===============================
+\coordinate (mid) at ($(r1.east)!0.5!(r2.west)$);
+\node[draw=black!70, diamond, aspect=2.1, inner sep=0.9mm, fill=white,
+      font=\scriptsize] (arb) at (mid) {Arbiter};
+\draw[{Latex[length=1.6mm]}-{Latex[length=1.6mm]}, draw=black!70]
+      (r1.east) -- (arb.west);
+\draw[{Latex[length=1.6mm]}-{Latex[length=1.6mm]}, draw=black!70]
+      (arb.east) -- (r2.west);
+\node[font=\scriptsize, above=0.4mm of arb, text=black!60]
+      {Gap Grade};
+
+%============================ VEHICLE ===============================
+\node[draw=black!70, rounded corners=1pt, minimum width=1.5cm,
+      minimum height=8mm, align=center, font=\scriptsize,
+      left=1.0cm of P1.west] (car) {Mobile\\consumer};
+\draw[dlnk] (car.east) -- ++(0.45,0) |- (P1.west);
+\draw[dlnk] (car.north) |- ([yshift=6mm]$(P1.north)!0.5!(P2.north)$) -| (P2.north);
+
+%======================= INFRASTRUCTURE LAYER =======================
+\coordinate (base) at ([yshift=-1.5cm]$(P1.south)!0.5!(P2.south)$);
+
+% --- edge row: 3 VMs per provider
+\node[p1] (e1)  at ([xshift=-4.55cm]base) {edge$_1$};
+\node[p1, right=2.2mm of e1]  (e1b) {edge$_{1b}$};
+\node[p1, right=2.2mm of e1b] (e1c) {edge$_{1c}$};
+\node[p2, right=8mm of e1c]   (e2)  {edge$_2$};
+\node[p2, right=2.2mm of e2]  (e2b) {edge$_{2b}$};
+\node[p2, right=2.2mm of e2b] (e2c) {edge$_{2c}$};
+
+% --- cloud row: 1 VM per provider, aligned under its own group
+\node[p1, below=5mm of e1b] (c1) {cloud$_1$};
+\node[p2, below=5mm of e2b] (c2) {cloud$_2$};
+
+\node[font=\scriptsize, left=3mm of e1, text=black!70] (lblE) {\textsc{edge}};
+\node[font=\scriptsize] at (lblE |- c1) {\textsc{cloud}};
+
+% --- ownership envelopes (this is what makes the partition readable)
+\node[own, fit=(e1)(e1c)(c1), inner sep=1.6mm] (own1) {};
+\node[own, fit=(e2)(e2c)(c2), inner sep=1.6mm] (own2) {};
+
+\draw[own] (P1.south) -- (own1.north);
+\draw[own] (P2.south) -- (own2.north);
+
+%============================ LEGEND ================================
+\node[p1, minimum width=4mm, minimum height=3.2mm, anchor=west]
+      (lg1) at ([yshift=-9mm]own1.south west) {};
+\node[font=\scriptsize, anchor=west] (lg1t)
+      at ([xshift=1.8mm]lg1.east) {owned by Provider 1};
+\node[p2, minimum width=4mm, minimum height=3.2mm, anchor=west]
+      (lg2) at ([xshift=9mm]lg1t.east) {};
+\node[font=\scriptsize, anchor=west]
+      at ([xshift=1.8mm]lg2.east) {owned by Provider 2};
+
+\end{tikzpicture}

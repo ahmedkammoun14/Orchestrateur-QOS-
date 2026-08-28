@@ -1,0 +1,326 @@
+\newpage
+\pagestyle{fancy}
+
+\lhead{\textsc{Chapitre 1. Contexte général}}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\footrulewidth}{0.5pt}
+\chapter{Contexte général}\setlength{\headheight}{27.06pt}
+\label{ch1}
+\minitoc
+
+
+\newpage
+\section{Présentation de l'organisme d'accueil}
+\label{sec:organisme}
+
+Cette section est consacrée au LAAS-CNRS, laboratoire au sein duquel s'est déroulé notre projet de fin d'études pendant six mois.
+
+\subsection{Présentation générale}
+
+Le Laboratoire d'Analyse et d'Architecture des Systèmes (LAAS-CNRS)~\cite{laas_website}, comme illustré dans la figure~\ref{fig:logo-laas}, est un pôle d'excellence en automatique, informatique, robotique et micro/nanosciences.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.35\textwidth]{images/LAAS.jpg}
+    \caption{Logo du LAAS-CNRS}
+    \label{fig:logo-laas}
+\end{figure}
+
+Sous la tutelle du Centre National de la Recherche Scientifique (CNRS), le LAAS-CNRS est associé à six membres fondateurs de l'Université de Toulouse (UT3 Paul Sabatier, INSA Toulouse, INP Toulouse, UT2J Jean Jaurès, UT1 Capitole) et opère sur un site unique, au 7 avenue du Colonel Roche à Toulouse. Comptant plusieurs centaines de chercheurs, enseignants-chercheurs, ingénieurs, techniciens et doctorants, dirigés par Mohamed Kaaniche, directeur de recherche CNRS, le LAAS-CNRS constitue l'un des plus importants laboratoires du CNRS en sciences de l'ingénieur.
+
+Notre stage s'est déroulé au sein de l'équipe SARA (Services et Architectures pour Réseaux Avancés)~\cite{laas_sara}. Dirigée par Khalil Drira, cette équipe travaille sur les réseaux et systèmes de communication de nouvelle génération ; on y a travaillé sur leur plateforme, dotée du matériel nécessaire.
+
+
+
+\subsection{Activités du LAAS-CNRS}
+
+Structuré en six départements de recherche et vingt-quatre équipes, comme illustré à la figure~\ref{fig:departements-laas}, le LAAS-CNRS tire sa force de la diversité et de la complémentarité de ses expertises : Décision et Optimisation, Gestion de l'énergie, Systèmes hyperfréquences et photoniques, Micro Nano Bio Technologies, Réseaux/Informatique/Systèmes de confiance (dont dépend l'équipe SARA) et Robotique. Ses activités couvrent à la fois des recherches théoriques et des applications concrètes, trouvant des échos dans des domaines tels que l'aéronautique, l'espace, l'énergie, les transports, la santé et la défense, maintenant ainsi un lien étroit avec le tissu socio-économique.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{images/Department.png}
+    \caption{Départements de recherche au sein du LAAS-CNRS}
+    \label{fig:departements-laas}
+\end{figure}
+
+
+L'encadrement de ce stage a été assuré par une équipe franco-tunisienne. Côté LAAS-CNRS, Christophe Chassot, Samir Medjiah et Sami Yangui ont suivi le projet ; M.Sami Yangui, maître de conférences à l'INSA Toulouse et membre du LAAS-CNRS, travaille sur les systèmes distribués, l'informatique orientée services et l'IoT, avec une spécialisation en cloud/edge computing et virtualisation des fonctions réseau. Côté ENIS Sfax, Mme Imene Lahyani, maîtresse de conférences et membre du laboratoire ReDCAD (Research laboratory on Development and Control of Distributed Applications), apporte son expertise en ingénierie logicielle des systèmes distribués et systèmes auto-adaptatifs ; les deux encadrantes ont d'ailleurs déjà co-publié sur le placement de services en edge computing, dans \emph{IEEE Transactions on Network and Service Management} (2024).
+
+\section{Concepts de base}
+Avant d'aborder la problématique spécifique de ce travail, il est nécessaire de poser précisément trois notions qui reviennent tout au long de ce rapport : le continuum cloud--edge--fog sur lequel repose l'architecture de notre projet, la qualité de service et les contrats qui la formalisent (QoS, SLO, SLA), et le paradigme d'orchestration piloté par l'intention qui guide la conception du système. Définir clairement ici ces notions évite toute confusion dans la suite du rapport.
+
+\subsection{Le continuum cloud--edge--fog}
+\label{sec:continuum}
+L'architecture sur laquelle repose notre système s'appuie sur trois strates de calcul complémentaires : le cloud, le fog et l'edge, entre lesquelles une application peut aujourd'hui répartir ses traitements.
+
+Le cloud computing centralise le calcul et le stockage dans de grands centres de données, accessibles à la demande selon un modèle de facturation à l'usage. Cette centralisation permet une mutualisation massive des ressources et une élasticité que peu d'infrastructures privées peuvent égaler, mais elle a un coût : les données doivent parcourir le réseau jusqu'au data center, souvent situé à des centaines de kilomètres, ce qui introduit une latence incompatible avec des applications comme la conduite autonome ou le contrôle industriel temps réel.
+
+L'edge computing est né pour répondre à cette limite. Shi \emph{et al.}~\cite{shi2016edge} le définissent comme le fait d'exécuter les traitements à la périphérie du réseau, au plus près de la source des données, plutôt que de tout renvoyer vers un data center distant ; l'edge désigne alors toute ressource de calcul et de réseau située sur le chemin entre la source de données et le cloud, qu'il s'agisse d'un smartphone, d'une passerelle domestique ou d'un micro-data-center. Les objets connectés ne sont plus seulement consommateurs de contenu mais aussi producteurs de données, et l'edge doit traiter ces deux flux localement : l'enjeu est de réduire la latence, d'économiser la bande passante et de mieux protéger les données sensibles en évitant qu'elles ne transitent jusqu'au cloud.
+
+Le fog computing poursuit la même logique, mais côté infrastructure plutôt que terminaux. Bonomi \emph{et al.}~\cite{bonomi2012fog}, qui ont introduit le terme, le définissent comme une plateforme virtualisée fournissant du calcul, du stockage et du réseau entre les terminaux et les data centers du cloud, typiquement en périphérie du réseau. Sa large répartition géographique, son grand nombre de nœuds hétérogènes, son support natif de la mobilité et son orientation temps réel le distinguent d'une simple extension du cloud. Le fog ne remplace donc pas ce dernier, il le prolonge vers la périphérie ; les deux paradigmes sont d'ailleurs souvent considérés comme interchangeables, l'edge étant davantage centré sur les objets et terminaux, le fog sur l'infrastructure intermédiaire qui les relie au cloud.
+
+Ensemble, ces trois strates forment un continuum : un ensemble hiérarchisé et non figé de ressources allant des terminaux et nœuds edge jusqu'aux data centers cloud, en passant par des nœuds fog intermédiaires. Une application n'est plus assignée à un seul niveau ; elle peut répartir dynamiquement ses traitements selon ses contraintes de latence, de bande passante, de coût ou de disponibilité.
+
+\subsection{QoS, SLO et SLA}
+\label{sec:qos-slo-sla}
+Les termes QoS, SLI, SLO et SLA reviennent constamment dans ce rapport, et sont souvent employés de façon interchangeable alors qu'ils recouvrent des réalités distinctes. Il convient donc de les définir précisément avant d'aller plus loin. On verra qu'ils forment une progression, de l'attente exprimée par l'utilisateur jusqu'à l'engagement contractuel du fournisseur.
+
+\subsubsection{QoS (Quality of Service).} La qualité de service désigne l'ensemble des performances d'un service qui déterminent la satisfaction de son utilisateur. Dans le continuum, elle se traduit par ce qu'une application attend concrètement de son infrastructure : une latence faible, un débit suffisant, une disponibilité continue. C'est une notion large, qui exprime une attente plutôt qu'une valeur précise. Pour qu'un système puisse la garantir, il faut la rendre mesurable.
+
+\subsubsection{SLI (Service Level Indicator).} Le SLI est la métrique que l'on mesure réellement sur le service. Il peut s'agir de la latence d'une requête, du taux d'erreur, du débit ou de la disponibilité. C'est lui qui rend la qualité observable, en la ramenant à des chiffres relevés en continu. Sans SLI, aucun objectif de qualité ne peut être vérifié.
+
+\subsubsection{SLO (Service Level Objective).} Le SLO est la cible fixée sur un SLI. Il prend toujours la même forme : une métrique, un opérateur de comparaison et un seuil, comme \og~latence $\leq$ 100~ms~\fg{}. Cette structure simple suffit à transformer une attente qualitative en condition vérifiable automatiquement. À tout instant, le système peut donc dire si le SLO est respecté ou violé.
+
+\subsubsection{SLA (Service Level Agreement).} La SLA est le contrat qui engage le fournisseur sur ses SLO. Ce qui la distingue d'un simple objectif interne, c'est la conséquence prévue en cas de non-respect : une pénalité financière, un remboursement, un dédommagement. Sans sanction, on parle de SLO ; avec sanction, de SLA. Cette distinction devient délicate lorsque plusieurs fournisseurs se partagent l'exécution d'une même application, car il devient difficile de désigner lequel est responsable d'une violation.
+
+C'est cette chaîne -- la QoS comme attente, le SLI comme mesure, le SLO comme cible et la SLA comme garantie -- que xQoS doit reconstruire chez chaque fournisseur pour honorer l'intention exprimée par l'utilisateur.
+
+\subsection{Orchestration pilotée par l'intention (intent-driven)}
+\label{sec:intent-driven}
+
+Une fois qu'on sait comment mesurer et garantir la qualité de service (QoS, SLO, SLA), il reste un problème : comment l'utilisateur communique-t-il ce qu'il veut au système ? C'est là qu'intervient la notion d'intention.
+
+Une intention, c'est une expression de haut niveau du résultat voulu, sans dire comment l'atteindre. Plutôt que de préciser sur quel serveur déployer une application, avec combien de CPU, ou selon quelle règle migrer les traitements, l'utilisateur dit simplement ce qu'il attend : par exemple, \og~je veux un temps de réponse inférieur à 50~ms pour cette application~\fg{}. Toute la complexité technique -- le choix du nœud, du fournisseur, de la configuration -- reste cachée derrière cette phrase simple.
+
+L'orchestration pilotée par l'intention, c'est le mécanisme qui prend cette intention et la transforme en actions concrètes. Ce mécanisme fait trois choses en continu : il traduit l'intention en objectifs mesurables (les SLO qu'on a définis avant), il choisit où et comment déployer pour satisfaire ces objectifs, et il surveille en permanence si l'intention reste respectée. Si ce n'est plus le cas -- un fournisseur devient trop lent, une ressource se sature -- il corrige automatiquement, en migrant ou en redéployant, sans que l'utilisateur ait à intervenir.
+
+
+
+\section{Contexte et problématique}
+\label{sec:problematique}
+
+\subsection{Portée du projet}
+
+Le travail présenté dans ce rapport s'inscrit dans la continuité des travaux de recherche menés par l'équipe SARA du LAAS-CNRS sur la gestion de la qualité de service dans le continuum cloud.
+
+\subsection{Contexte}
+
+L'Industrie 4.0 a transformé la production industrielle en s'appuyant sur les systèmes cyber-physiques, le cloud et l'intelligence artificielle pour créer des usines plus intelligentes, plus interconnectées et plus automatisées. L'Industrie 5.0 va plus loin en remettant l'humain au centre de cette boucle, avec une attention accrue portée à la collaboration homme-machine et à la résilience des systèmes de production. Ces évolutions, comme d'autres domaines critiques tels que les véhicules autonomes, la santé connectée ou la supervision industrielle en temps réel, reposent sur un même besoin : traiter les données au plus près de leur source. Le cloud seul, centralisé et souvent distant de plusieurs centaines de kilomètres, ne peut répondre à leurs exigences de latence, de bande passante ou de continuité de service~\cite{sfaxi2026policies}. Le continuum cloud-edge-fog répond à cette limite en répartissant les traitements sur plusieurs strates, chacune plus proche ou mieux adaptée à un besoin donné.
+
+Cette répartition reste toutefois un potentiel, pas une garantie. Une application n'en tire réellement parti que si ses traitements sont placés au bon endroit, déplacés au bon moment et redimensionnés à mesure que les conditions évoluent. C'est le rôle de l'orchestration. Dans les systèmes actuels, elle repose sur des règles techniques fixées à l'avance -- un seuil d'utilisation CPU qui déclenche une réplication, un nombre de réplicas à maintenir, une contrainte de placement à respecter. Ces règles disent comment agir, jamais pourquoi : elles traduisent une décision prise en amont par un administrateur, et non le besoin réel de l'application. Dès que ce besoin change, il faut les redéfinir manuellement.
+
+À cette difficulté s'ajoute une particularité du continuum, souvent passée sous silence : il n'appartient à aucun opérateur unique. Fournisseurs cloud, fournisseurs edge et fog, infrastructures industrielles privées y coexistent, chacun restant maître de ses propres ressources et de ses propres règles. Or la plupart des orchestrateurs actuels supposent l'inverse -- un domaine unique, dont ils contrôlent l'ensemble des ressources et connaissent l'état à tout instant. C'est de ce double constat que part notre projet : orchestrer les services à partir de l'intention exprimée par l'utilisateur plutôt que de règles figées, et le faire dans un environnement réparti entre plusieurs fournisseurs indépendants.
+
+\subsection{Problématique}
+\label{sec:problematique-sub}
+
+Ces deux ambitions, prises ensemble, font apparaître une difficulté que ni l'une ni l'autre ne pose isolément. Une intention n'est pas une action ponctuelle à exécuter : c'est un objectif à tenir dans la durée. Or le fournisseur qui héberge une application aujourd'hui peut, demain, ne plus être en mesure de respecter cet objectif -- parce que ses ressources sont saturées, parce que sa charge a augmenté, ou parce que les conditions réseau se sont dégradées. L'intention doit alors être reprise ailleurs, chez un fournisseur capable de l'honorer, sans que l'utilisateur ait à la reformuler ni même à s'en apercevoir.
+
+La difficulté tient à ce qu'aucun fournisseur ne commande aux autres. Chacun ne connaît que son propre domaine : il sait ce que ses machines peuvent offrir à un instant donné, mais ignore tout de l'état de ses pairs. Il n'existe donc ni vue d'ensemble sur laquelle s'appuyer pour choisir, ni autorité capable d'imposer un placement à l'ensemble des acteurs. La coordination ne peut pas être décidée d'en haut : elle doit émerger des fournisseurs eux-mêmes, à partir de ce que chacun accepte de déclarer sur ses propres capacités.
+
+Deux risques apparaissent alors. D'abord, si chaque fournisseur reçoit l'intention sous une forme différente, ils s'engagent sans le savoir sur des objectifs qui ne sont pas les mêmes. Ensuite, si le passage d'un fournisseur à l'autre n'est pas encadré, une intention que personne ne peut satisfaire risque de circuler sans fin entre eux, sans jamais aboutir ni être déclarée impossible.
+
+La question qui structure ce travail est donc la suivante : comment faire coopérer des fournisseurs indépendants autour d'une même intention -- la leur transmettre sans ambiguïté, comparer ce que chacun peut offrir, désigner le mieux placé, puis passer le relais quand les conditions changent -- alors qu'aucun d'eux ne commande aux autres ?
+
+%% ===================================================================
+%% 1.4 Étude des solutions existantes
+%% ===================================================================
+\section{Étude de l'existant}
+\label{sec:etat-art}
+
+De nombreuses plateformes traitent déjà l'orchestration de services dans le continuum cloud-edge. Elles automatisent le déploiement, le placement et la supervision des applications distribuées, et adaptent dynamiquement les ressources allouées à l'évolution des conditions d'exécution. Nous en présentons ci-dessous trois, retenues parce qu'elles représentent chacune une réponse différente au problème d'orchestration, et parce qu'elles permettent de situer précisément la limite identifiée dans notre problématique (sous-section~\ref{sec:problematique-sub}).
+
+\subsection{Kubernetes et KubeEdge}
+\label{sec:etat-art-k8s}
+
+Kubernetes~\cite{website:kubernetes} est aujourd'hui l'orchestrateur de conteneurs de référence dans l'industrie. Il repose sur un modèle déclaratif : l'utilisateur décrit l'état souhaité de son application, et le système converge automatiquement vers cet état en déployant, redémarrant ou répliquant les conteneurs. Son extension KubeEdge~\cite{website:kubeedge} prolonge ce fonctionnement jusqu'aux nœuds edge, permettant de gérer depuis un plan de contrôle central des ressources situées en périphérie du réseau, comme l'illustre la figure~\ref{fig:kubernetes}.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{images/kubernetes.png}
+    \caption{Architecture de Kubernetes étendue à l'edge par KubeEdge}
+    \label{fig:kubernetes}
+\end{figure}
+
+Ce modèle apporte une réponse robuste à l'hétérogénéité technique du continuum : Kubernetes sait placer une charge sur des nœuds aux capacités variables et réagir à leur défaillance. En revanche, ce que l'utilisateur déclare demeure de nature technique -- un nombre de réplicas, une quantité de CPU, une contrainte de placement -- et non une intention exprimée en termes de qualité de service. Surtout, Kubernetes repose sur un plan de contrôle central qui possède la vue complète des ressources et décide seul de leur affectation. C'est précisément l'hypothèse que notre contexte invalide : dans un continuum réparti entre plusieurs fournisseurs indépendants, aucun acteur ne dispose de cette vue globale ni du pouvoir d'imposer un placement aux autres.
+
+\subsection{ONAP (Open Network Automation Platform)}
+\label{sec:etat-art-onap}
+
+ONAP~\cite{website:onap} est une plateforme industrielle d'orchestration de services réseau, portée par la Linux Foundation et adoptée par plusieurs grands opérateurs télécoms. Elle couvre l'ensemble du cycle de vie des services, intègre une gestion des politiques et des SLA, et propose une approche \emph{intent-based} à travers un module dédié à la gestion des intentions, comme le montre la figure~\ref{fig:onap}.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{images/onap.png}
+    \caption{Architecture fonctionnelle de la plateforme ONAP}
+    \label{fig:onap}
+\end{figure}
+
+ONAP se rapproche donc de notre problématique sur un point : elle reconnaît explicitement la notion d'intention et traite les engagements de qualité de service comme des objets de premier plan. Deux limites subsistent néanmoins. L'intention y est traduite vers un ensemble de politiques prédéfinies, selon des règles de correspondance configurées à l'avance, plutôt qu'évaluée au regard des capacités réellement disponibles au moment de la décision. Par ailleurs, la plateforme est conçue pour l'environnement d'un opérateur unique, qui orchestre ses propres ressources : la coopération entre fournisseurs autonomes, chacun décidant seul de ce qu'il accepte de prendre en charge, n'entre pas dans son périmètre.
+
+\subsection{IntentContinuum}
+\label{sec:etat-art-intentcontinuum}
+
+IntentContinuum~\cite{akbari2025intentcontinuum} est un prototype de recherche récent, qui propose d'utiliser un grand modèle de langage pour interpréter les intentions exprimées par l'utilisateur et adapter en conséquence le placement des services dans le continuum. Le système surveille en continu le respect de l'intention et, en cas de violation, sollicite le modèle de langage pour analyser la cause du problème et sélectionner une action corrective.
+
+C'est la solution la plus proche conceptuellement de notre approche, puisqu'elle place l'intention au cœur de l'orchestration et met en œuvre une boucle de rétroaction continue. Elle reste toutefois construite autour d'un décideur unique, qui connaît l'ensemble des ressources et choisit à lui seul où placer les services : la question du passage de relais entre fournisseurs indépendants, lorsque celui qui héberge l'application ne peut plus tenir ses engagements, ne s'y pose jamais. Le modèle de langage y assure en outre à la fois l'interprétation et la décision de placement, ce qui rend le raisonnement difficile à auditer et l'explicabilité limitée à des justifications textuelles non structurées.
+
+\subsection{Synthèse comparative}
+\label{sec:etat-art-synthese}
+
+Le tableau~\ref{tab:comparatif-existant} compare ces trois solutions selon les critères qui structurent notre travail.
+
+\begin{table}[H]
+    \centering
+    \caption{Comparatif synthétique des solutions d'orchestration étudiées}
+    \label{tab:comparatif-existant}
+    \begin{tabular}{p{5.5cm}ccc}
+        \toprule
+        \textbf{Critère} & \textbf{Kubernetes} & \textbf{ONAP} & \textbf{IntentContinuum} \\
+        \midrule
+        Orchestration du continuum edge-cloud & \cmark & \cmark & \cmark \\
+        Pilotage par l'intention utilisateur & \xmark & \pmark & \cmark \\
+        Coordination entre fournisseurs autonomes & \xmark & \pmark & \xmark \\
+        Décision sans autorité centrale & \xmark & \xmark & \xmark \\
+        Passage de relais entre fournisseurs & \xmark & \xmark & \xmark \\
+        Décision proactive fondée sur la prédiction & \xmark & \xmark & \pmark \\
+        Explicabilité des décisions & \xmark & \xmark & \pmark \\
+        \bottomrule
+    \end{tabular}
+    \\[0.3cm]
+    {\footnotesize \cmark~: pris en charge \quad \pmark~: partiellement pris en charge \quad \xmark~: non pris en charge}
+\end{table}
+
+Cette comparaison confirme le constat posé en problématique : aucune des solutions étudiées ne traite la coordination entre fournisseurs autonomes. Toutes reposent, sous des formes différentes, sur un décideur unique disposant d'une vue complète des ressources et du pouvoir de les affecter -- un plan de contrôle central chez Kubernetes, l'orchestrateur d'un opérateur chez ONAP, le système lui-même chez IntentContinuum. Aucune ne prévoit qu'un fournisseur puisse refuser une intention, proposer sa propre offre, ou transmettre à un pair une charge qu'il n'est plus en mesure d'honorer. C'est au regard de cette limite commune que nous avons conçu la solution présentée dans la section~\ref{sec:solution}
+\section{Solution proposée}
+\label{sec:solution}
+Pour répondre à cette problématique, nous avons développé xQoS, un prototype d'orchestrateur réparti entre plusieurs fournisseurs, où chacun conserve la maîtrise de ses propres ressources.
+
+Le point de départ est l'intention de l'utilisateur, exprimée en langage naturel — par exemple une contrainte de latence pour une application donnée. Le fournisseur qui la reçoit la traduit en objectifs chiffrés et vérifiables, puis diffuse ces objectifs à l'ensemble des autres fournisseurs. La traduction n'est donc faite qu'une seule fois : tous travaillent ensuite sur le même contrat, ce qui écarte le risque que chacun s'engage sur une interprétation différente de la même demande.
+
+Vient ensuite le choix du fournisseur. Plutôt qu'une autorité centrale qui imposerait un placement, xQoS interroge tous les fournisseurs en parallèle et laisse chacun répondre par une offre, établie à partir des seules ressources qu'il connaît : les siennes. Ces offres sont comparées selon plusieurs critères simultanément, et le fournisseur le mieux placé se voit confier l'application. La décision émerge ainsi des propositions des fournisseurs eux-mêmes, sans qu'aucun ne décide pour les autres.
+
+Une fois l'application déployée, xQoS ne se contente pas d'attendre qu'un problème survienne. Il surveille en continu les indicateurs pertinents et anticipe les dégradations, de manière à réagir avant que l'objectif ne soit violé. Si le fournisseur en place n'est plus en mesure de tenir ses engagements, l'intention est transmise à un autre, qui reprend la main. Ce passage de relais est encadré : un fournisseur déjà sollicité pour une intention donnée ne peut être resollicité, ce qui évite qu'une intention impossible à satisfaire ne circule indéfiniment entre les fournisseurs.
+
+Enfin, chaque étape reste consultable : la façon dont l'intention a été comprise, les offres reçues, la raison pour laquelle tel fournisseur a été retenu, et ce qui a motivé chaque passage de relais. L'utilisateur, comme l'opérateur, dispose ainsi des éléments nécessaires pour vérifier que la demande initiale a bien été honorée.
+
+Les exigences que ces choix imposent au système sont précisées dans la section suivante, avant la présentation de l'architecture en section~\ref{sec:architecture}.
+\section{Méthodologie de travail}
+\label{sec:methodologie}
+
+Le choix d'une méthodologie de développement adaptée conditionne la qualité du travail réalisé et le respect des délais. Pour ce projet, nous avons retenu la méthodologie agile Scrum~\cite{schwaber2020scrumguide}, qui privilégie des livraisons fréquentes et incrémentales plutôt qu'une spécification figée en amont -- un choix particulièrement adapté à un projet de recherche, où les besoins se précisent à mesure que le prototype se construit.
+
+\subsection{Principes de Scrum}
+
+Scrum organise le développement en itérations courtes appelées \emph{sprints}, chacune aboutissant à un incrément fonctionnel du produit. Le travail à réaliser est consigné dans un \emph{product backlog}, dont une partie est sélectionnée à chaque début de sprint pour constituer le \emph{sprint backlog}. Le déroulement du sprint est ponctué de réunions courtes et régulières : une réunion de planification à l'ouverture, des points quotidiens de synchronisation, puis une revue et une rétrospective à la clôture~\cite{schwaber2001agile}, comme l'illustre la figure~\ref{fig:scrum}.
+
+\begin{figure}[H]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{images/methode-scrum.jpg}
+    \caption{Processus de la méthodologie Scrum}
+    \label{fig:scrum}
+\end{figure}
+
+\subsection{Rôles et responsabilités}
+
+La répartition des rôles au sein du projet est présentée dans le tableau~\ref{tab:roles}.
+
+\begin{table}[H]
+    \centering
+    \caption{Rôles et responsabilités dans la mise en œuvre du projet}
+    \label{tab:roles}
+    \begin{tabular}{p{6cm}p{7cm}}
+        \toprule
+        \textbf{Rôle / Responsabilité} & \textbf{Personne responsable} \\
+        \midrule
+        Orientation scientifique et validation & M. Sami YANGUI \\
+        Encadrement technique & M. Samir MEDJIAH \\
+        Encadrement académique & Mme Imene LAHYANI \\
+        Conception et développement & Mustapha Amine KECHAOU \\
+        Conception et développement & Ahmed KAMMOUN \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Suivi et réunions}
+
+Le projet a été suivi par des réunions régulières associant les encadrants et les deux développeurs. Le tableau~\ref{tab:reunions} récapitule la nature de ces réunions et leurs participants.
+
+\begin{table}[H]
+    \centering
+    \caption{Réunions de suivi et participants}
+    \label{tab:reunions}
+    \begin{tabular}{p{4cm}p{3cm}p{6.5cm}}
+        \toprule
+        \textbf{Type de réunion} & \textbf{Fréquence} & \textbf{Participants} \\
+        \midrule
+        Point de synchronisation & Quotidienne & Mustapha Amine KECHAOU, Ahmed KAMMOUN \\
+        Revue technique & Hebdomadaire & Binôme, M. Samir MEDJIAH \\
+        Revue de sprint & Fin de sprint & Binôme, M. Sami YANGUI, M. Samir MEDJIAH,Mme.Imene LAHYANI \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsection{Planification des sprints}
+
+Le développement a été organisé en sprints successifs, chacun ciblant un ensemble cohérent de fonctionnalités. Le tableau~\ref{tab:sprints} récapitule ce découpage.
+
+\begin{table}[H]
+    \centering
+    \caption{Planification des sprints}
+    \label{tab:sprints}
+    \begin{tabular}{p{2cm}p{8.5cm}p{3.5cm}}
+        \toprule
+        \textbf{Sprint} & \textbf{Activités réalisées} & \textbf{Durée} \\
+        \midrule
+        Sprint 0 &
+        - Étude de l'état de l'art sur l'orchestration du continuum \newline
+        - Analyse du cahier des charges \newline
+        - Préparation de l'environnement de développement &
+        16 février -- 1\textsuperscript{er} mars 2026 \\
+        \midrule
+        Sprint 1 &
+        - Mise en place du hub central et des microservices \newline
+        - Collecte des métriques système et réseau \newline
+        - Persistance des données &
+        2 mars -- 22 mars 2026 \\
+        \midrule
+        Sprint 2 &
+        - Traduction des intentions en langage naturel vers des SLO \newline
+        - Intégration d'un modèle de langage local \newline
+        - Fusion des intentions successives &
+        23 mars -- 12 avril 2026 \\
+        \midrule
+        Sprint 3 &
+        - Détection des violations de SLO \newline
+        - Prédiction des dégradations à venir \newline
+        - Déclenchement proactif des migrations &
+        13 avril -- 3 mai 2026 \\
+        \midrule
+        Sprint 4 &
+        - Évaluation multicritère des cibles candidates \newline
+        - Sélection de la cible de migration \newline
+        - Prévention des migrations en cascade &
+        4 mai -- 24 mai 2026 \\
+        \midrule
+        Sprint 5 &
+        - Diffusion des intentions entre fournisseurs \newline
+        - Collecte et comparaison des offres \newline
+        - Attribution au fournisseur retenu &
+        25 mai -- 14 juin 2026 \\
+        \midrule
+        Sprint 6 &
+        - Passage de relais entre fournisseurs \newline
+        - Protection contre les boucles de transmission \newline
+        - Validation des scénarios multi-provider &
+        15 juin -- 5 juillet 2026 \\
+        \midrule
+        Sprint 7 &
+        - Tableau de bord d'observabilité \newline
+        - Traçabilité des décisions prises \newline
+        - Tests d'intégration &
+        6 juillet -- 26 juillet 2026 \\
+        \midrule
+        Sprint 8 &
+        - Rédaction du rapport \newline
+        - Préparation de la soutenance &
+        27 juillet -- 16 août 2026 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+\section{Conclusion}
+Ce premier chapitre a posé le cadre du travail présenté dans ce rapport. Après avoir présenté le LAAS-CNRS et l'équipe SARA au sein de laquelle s'est déroulé ce stage, nous avons défini les notions qui reviennent tout au long du document : le continuum cloud-edge-fog, la chaîne QoS-SLI-SLO-SLA, et le principe de l'orchestration pilotée par l'intention.
+
+Ces notions nous ont permis de formuler la problématique : dans un continuum réparti entre plusieurs fournisseurs indépendants, où aucun ne commande aux autres, comment faire coopérer ces acteurs autour d'une même intention — la leur transmettre, comparer ce que chacun peut offrir, désigner le mieux placé, puis passer le relais lorsque les conditions changent ?
+
+L'étude des solutions existantes a confirmé que cette question reste ouverte : Kubernetes, ONAP et IntentContinuum reposent toutes, sous des formes différentes, sur un décideur unique disposant d'une vue complète des ressources. Nous avons alors présenté xQoS, le prototype développé durant ce stage, ainsi que la méthodologie de travail suivie.

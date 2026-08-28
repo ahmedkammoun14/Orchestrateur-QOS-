@@ -1,0 +1,73 @@
+% Figure 3 --- why a pool-relative score cannot cross a provider boundary,
+% and what replaces it. Values are those of the run of Section V.
+% Included from paper.tex.
+
+\begin{tikzpicture}[
+    font=\scriptsize,
+    ax/.style   = {-{Latex[length=1.5mm]}, draw=black!70},
+    tick/.style = {draw=black!60},
+    p1/.style   = {circle, fill=blue!55, inner sep=1.05pt},
+    p2/.style   = {circle, fill=orange!85!black, inner sep=1.05pt},
+    win/.style  = {circle, draw=black!75, thick, inner sep=2.1pt},
+    lbl/.style  = {font=\scriptsize, text=black!75},
+    box/.style  = {draw=black!45, rounded corners=2pt, inner sep=2.4mm},
+]
+
+%======== TOP: two pool-relative TOPSIS axes ========
+% --- Provider 1
+\draw[ax] (0,0) -- (4.2,0);
+\foreach \x/\t in {0/0, 2.1/0.5, 4.0/1} \draw[tick] (\x,-0.6mm) -- (\x,0.6mm)
+    node[below=1.2mm, lbl] at (\x,-0.6mm) {\t};
+\node[p1] at (0.55,0) {};
+\node[p1] at (1.70,0) {};
+\node[p1] at (2.60,0) {};
+\node[p1, win] (w1) at (4.00,0) {};
+\node[lbl, above=1.6mm] at (4.00,0) {$0.98$};
+\node[font=\scriptsize\bfseries, above=5.5mm] at (2.1,0) {Provider 1 --- TOPSIS};
+
+% --- Provider 2
+\begin{scope}[xshift=5.6cm]
+\draw[ax] (0,0) -- (4.2,0);
+\foreach \x/\t in {0/0, 2.1/0.5, 4.0/1} \draw[tick] (\x,-0.6mm) -- (\x,0.6mm)
+    node[below=1.2mm, lbl] at (\x,-0.6mm) {\t};
+\node[p2] at (0.40,0) {};
+\node[p2] at (1.30,0) {};
+\node[p2] at (2.90,0) {};
+\node[p2, win] (w2) at (4.00,0) {};
+\node[lbl, above=1.6mm] at (4.00,0) {$0.96$};
+\node[font=\scriptsize\bfseries, above=5.5mm] at (2.1,0) {Provider 2 --- TOPSIS};
+\end{scope}
+
+\node[box, fit={(-0.4,-0.9) (10.2,0.95)}] (topbox) {};
+\node[lbl, anchor=north] at (4.9,-1.0)
+  {\itshape min--max normalised over its own pool: both winners score $\approx 1$};
+
+%======== BOTTOM: one absolute Gap Grade axis ========
+\begin{scope}[yshift=-3.5cm]
+\draw[ax] (0,0) -- (10.2,0);
+\node[lbl, anchor=west] at (10.3,0) {$G$};
+
+\foreach \x/\t in {0.4/-1.0, 2.85/-0.6, 5.30/-0.2, 7.75/0.2, 9.6/0.5}
+    \draw[tick] (\x,-0.7mm) -- (\x,0.7mm) node[below=1.4mm, lbl] at (\x,-0.7mm) {\t};
+
+% dead-band around the incumbent (provider 1)
+\fill[black!10] (6.71,-0.32) rectangle (7.32,0.32);
+\node[lbl, anchor=south, align=center] at (7.02,0.36) {dead-band\\$\pm 0.05$};
+
+\node[p2, win] (g2) at (2.24,0) {};
+\node[lbl, anchor=south] at (2.24,0.5) {edge$_{2b}$};
+\node[lbl, anchor=north] at (2.24,-0.5) {$-0.713$};
+
+\node[p1, win] (g1) at (7.02,0) {};
+\node[lbl, anchor=south] at (7.02,0.5) {cloud$_1$};
+\node[lbl, anchor=north] at (7.02,-0.5) {$-0.076$};
+
+\draw[{Latex[length=1.5mm]}-{Latex[length=1.5mm]}, draw=black!60]
+      (2.24,-0.95) -- node[below, lbl] {challenger wins: gap $\gg$ dead-band} (7.02,-0.95);
+
+\node[font=\scriptsize\bfseries, anchor=west] at (-0.4,1.15)
+  {Gap Grade --- measured against the shared SLO thresholds};
+\node[lbl, anchor=west] at (-0.4,0.75) {lower is better};
+\end{scope}
+
+\end{tikzpicture}

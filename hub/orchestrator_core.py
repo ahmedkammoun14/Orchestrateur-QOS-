@@ -303,11 +303,12 @@ def _zip_histories(histories, thresholds):
 def _all_vals(histories):
     return {m: [h["value"] for h in histories[m]] for m in config.METRICS_REGISTRY if m in histories}
 
-def _ml_payload(histories: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+def _ml_payload(histories: Dict[str, List[Dict[str, Any]]], vm_id: str = "") -> Dict[str, Any]:
     payload = {"latency_history": [{"value": h["value"]} for h in histories.get("latency", [])]}
     for m, f in {"cpu_usage": "cpu_history", "ram_usage": "ram_history"}.items():
         if m in histories and histories[m]:
             payload[f] = [{"value": h["value"]} for h in histories[m]]
+    payload["vm_id"] = vm_id
     return payload
 
 def _extract_predictions(res: Dict[str, Any]) -> Dict[str, Any]:
@@ -835,7 +836,7 @@ async def _step7_predict(client: httpx.AsyncClient, ctx: _FlowContext) -> None:
 
     p_responses = await asyncio.gather(*[
         _post(client, f"{_URLS['ml_predictor']}/predict",
-              _ml_payload(ctx.vm_histories.get(vid, {})))
+              _ml_payload(ctx.vm_histories.get(vid, {}), vid))
         for vid in ctx.vm_ids
     ])
     for vid, res in zip(ctx.vm_ids, p_responses):

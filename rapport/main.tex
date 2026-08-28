@@ -1,0 +1,78 @@
+%======================================================================
+%  Rapport de Projet de Fin d'Etudes -- xQoS
+%  Orchestration pilotee par l'intention dans un continuum
+%  cloud-edge multi-fournisseurs
+%
+%  Compilation :  pdflatex main.tex && bibtex main && pdflatex main.tex x2
+%  (ou : latexmk -pdf main.tex)
+%
+%  Fichiers utilises (voir rapport/README.md pour le detail du tri) :
+%    main.tex          -- ce fichier, le document maitre
+%    1_contexte.tex     -- Chapitre 1, contenu original : aaa.tex
+%    2_architecture.tex -- Chapitre 2, contenu original : CHAPITRE2.tex
+%    references.bib     -- bibliographie, sous-ensemble utilise de Bib.bib
+%======================================================================
+\documentclass[a4paper,12pt]{report}
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+%--- Encodage et langue ------------------------------------------------
+\usepackage[utf8]{inputenc}
+\DeclareUnicodeCharacter{202F}{\,}
+\usepackage[french]{babel}
+\usepackage{indentfirst}
+
+%--- Mise en page --------------------------------------------------------
+\usepackage[margin=2.5cm]{geometry}
+\linespread{1.3}
+\setcounter{tocdepth}{4}
+\setcounter{secnumdepth}{4}
+
+%--- Chapitres avec mini-sommaire (le bloc "Plan" en tete de chapitre) ---
+\usepackage{minitoc}
+\mtcsettitle{minitoc}{Plan}
+\mtcsetrules{minitoc}{off}
+\mtcsetfeature{minitoc}{before}{\vspace{-20pt}}
+\dominitoc
+
+%--- En-tetes de page (utilise par \lhead dans chaque chapitre) ---------
+\usepackage{fancyhdr}
+
+%--- Figures, tableaux, flottants ----------------------------------------
+\usepackage{graphicx}
+\graphicspath{{images/}}
+\usepackage{booktabs}
+\usepackage{float}
+\usepackage[font={small,it}]{caption}
+
+%--- Symboles de comparaison (tableau 1.1, comparatif de l'existant) ----
+\usepackage{pifont}
+\usepackage{xcolor}
+\newcommand{\cmark}{\textcolor{green!60!black}{\ding{51}}}
+\newcommand{\xmark}{\textcolor{red}{\ding{55}}}
+\newcommand{\pmark}{\textcolor{orange}{$\sim$}}
+
+%--- Liens et bibliographie ----------------------------------------------
+\usepackage{url}
+\usepackage[colorlinks=true]{hyperref}
+
+\begin{document}
+
+\rhead{\emph{}}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\input{1_contexte}
+\input{2_architecture}
+\input{3_conception}
+\input{4_réalisation}
+\input{5_tests}
+
+\renewcommand\bibname{Webography}
+\clearpage
+\addcontentsline{toc}{chapter}{Webographie}
+\bibliographystyle{ieeetr}
+\bibliography{references}
+
+\end{document}

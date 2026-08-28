@@ -50,6 +50,22 @@ def _setup_logger() -> logging.Logger:
 
 logger = _setup_logger()
 
+# ── Client HTTP partagé (essai phase 1 — retard de negociation) ─────────
+# httpx.AsyncClient() ouvre une connexion neuve a chaque instanciation.
+# Avant ce changement, /broadcast et /inbound/evaluate en recreaient une a
+# CHAQUE negociation (74 a 165 fois par run) au lieu de reutiliser une
+# connexion existante. Un seul client, cree une fois, reutilise partout.
+# Pour revenir en arriere : git checkout -- services/provider_relay/app.py
+_shared_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _shared_client
+    if _shared_client is None:
+        _shared_client = httpx.AsyncClient()
+    return _shared_client
+
+
 app = FastAPI(title="Provider Relay", version="1.0.0")
 
 _peer_lines = "\n".join(
@@ -294,9 +310,9 @@ async def broadcast(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     # fonctionnellement identique mais ferait grandir le temps de cycle
     # linéairement avec le nombre de providers (3 pairs à 800 ms : ~800 ms en
     # parallèle contre ~2400 ms en séquentiel).
-    async with httpx.AsyncClient() as client:
-        tasks   = [_call(url, client) for _pid, url in target_items]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+    client  = _get_client()
+    tasks   = [_call(url, client) for _pid, url in target_items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     bids:   List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -359,8 +375,8 @@ async def inbound_evaluate(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any
     logger.info(f"📥 /inbound/evaluate — relais pair → hub local ({local_hub})")
 
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(local_hub, json=payload, timeout=config.POST_TIMEOUT)
+        client = _get_client()
+        resp   = await client.post(local_hub, json=payload, timeout=config.POST_TIMEOUT)
     except Exception as exc:
         logger.error(f"❌ /inbound/evaluate — hub local injoignable : {exc}")
         raise HTTPException(

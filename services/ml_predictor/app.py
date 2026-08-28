@@ -36,6 +36,12 @@ logger.info(
     f"  {'CPU API':<16}: {C.CYAN}{config.ML_CPU_URL}{C.RESET}\n"
     f"  {'RAM API':<16}: {C.CYAN}{config.ML_RAM_URL}{C.RESET}\n"
     f"  {'Horizon':<16}: {C.CYAN}7 pas{C.RESET}\n"
+    # Tracé au démarrage : sans cette ligne, impossible de savoir a posteriori
+    # sur quel prédicteur une exécution a tourné — et donc si elle est
+    # comparable à la campagne de référence.
+    f"  {'Extrapolation':<16}: {C.CYAN}"
+    f"{'ACTIVE (GRU + linéaire, meilleure erreur récente)' if config.ML_LINEAR_EXTRAPOLATION else 'désactivée — GRU seul (référence campagne)'}"
+    f"{C.RESET}\n"
     f"{'═'*60}"
 )
 
